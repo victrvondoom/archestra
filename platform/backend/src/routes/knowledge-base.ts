@@ -73,6 +73,10 @@ import {
 } from "@/knowledge-base/connectors/gdrive/gdrive-oauth";
 import { reconcileP4ShimForConnector } from "@/knowledge-base/connectors/perforce/p4-shim-service";
 import { getConnector } from "@/knowledge-base/connectors/registry";
+import {
+  githubRepositorySettingsWriteError,
+  githubSyncConfigurationChanged,
+} from "@/knowledge-base/github-settings-compatibility";
 import { invalidateGroupTokenCache } from "@/knowledge-base/group-token-cache";
 import {
   deleteConnector,
@@ -85,6 +89,7 @@ import {
   mfilesConnectorGateViolation,
 } from "@/knowledge-base/mfiles-gates";
 import { nextPermissionSyncDueAt } from "@/knowledge-base/permission-sync-schedule";
+import { salesforceAuthPolicyViolation } from "@/knowledge-base/salesforce-auth-policy";
 import logger from "@/logging";
 import {
   AgentConnectorAssignmentModel,
@@ -1200,6 +1205,11 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
         // SPDX-SnippetEnd
       }
 
+      const salesforceViolation = salesforceAuthPolicyViolation({
+        connectorType: body.connectorType,
+        nextConfig: body.config,
+      });
+      if (salesforceViolation) throw new ApiError(400, salesforceViolation);
       // Validate connector config
       const connectorImpl = getConnector(body.connectorType);
       const validation = await connectorImpl.validateConfig(body.config);
@@ -1208,6 +1218,13 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
           400,
           `Invalid connector configuration: ${validation.error}`,
         );
+      }
+
+      if (
+        body.connectorType === "salesforce" &&
+        !body.credentials?.apiToken.trim()
+      ) {
+        throw new ApiError(400, "Salesforce OAuth consumer secret is required");
       }
 
       // Validate knowledge base IDs if provided
@@ -1712,6 +1729,33 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // resolve the connector's auth shape after this update so credential
       // storage stays consistent across App <-> inline-secret transitions
       const nextConfig = body.config ?? connector.config;
+      if (
+        connector.config.type === "github" &&
+        body.config?.type === "github"
+      ) {
+        const compatibilityError = githubRepositorySettingsWriteError(
+          connector.config,
+          body.config,
+        );
+        if (compatibilityError) throw new ApiError(409, compatibilityError);
+      }
+      const salesforceViolation = salesforceAuthPolicyViolation({
+        connectorType: connector.connectorType,
+        nextConfig: body.config,
+        existingConfig: connector.config,
+        hasNewSecret: Boolean(body.credentials?.apiToken?.trim()),
+      });
+      if (salesforceViolation) throw new ApiError(400, salesforceViolation);
+      if (connector.connectorType === "salesforce" && body.config) {
+        const validation = await getConnector("salesforce").validateConfig(
+          body.config,
+        );
+        if (!validation.valid)
+          throw new ApiError(
+            400,
+            `Invalid connector configuration: ${validation.error}`,
+          );
+      }
       const appConfigRef = await resolveGithubAppConfigReference({
         config: nextConfig,
         organizationId,
@@ -1862,12 +1906,17 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
 
-      // Reset checkpoint when config changes to force a full re-sync
-      // (filters, queries, inclusion/exclusion criteria affect which items get synced)
+      const configAffectsSync =
+        updateData.config !== undefined &&
+        (connector.config.type !== "github" ||
+          updateData.config.type !== "github" ||
+          githubSyncConfigurationChanged(connector.config, updateData.config));
+      // GitHub representation-only changes retain their cursor and corpus.
+      // Other connector types keep their existing full-resync behavior.
       const updated = await KnowledgeBaseConnectorModel.update(id, {
         ...updateData,
         secretId: nextSecretId,
-        ...(updateData.config ? { checkpoint: null } : {}),
+        ...(configAffectsSync ? { checkpoint: null } : {}),
       });
       if (!updated) {
         throw new ApiError(404, "Connector not found");
@@ -1928,13 +1977,12 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const nextEnabled = updateData.enabled ?? connector.enabled;
       if (
         connector.syncPermissionsFromSource &&
-        (updateData.config !== undefined ||
+        (configAffectsSync ||
           body.credentials !== undefined ||
           !nextSync ||
           nextEnabled !== connector.enabled)
       ) {
-        // A submitted config counts as changed without a field-by-field
-        // comparison, matching the checkpoint reset above.
+        // A format-only GitHub save needs no replacement permission pass.
         await supersedePermissionSyncAfterSettingsChange({
           connectorId: id,
           syncPermissionsFromSource: nextSync,
@@ -2149,6 +2197,7 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
               id,
               organizationId,
               userId: user.id,
+              action: "delete",
             }).catch(() => null);
             if (connector) found.set(id, connector);
           }
@@ -2184,6 +2233,7 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
         id,
         organizationId,
         userId: user.id,
+        action: "delete",
       });
 
       // Soft-delete via the shared service: cancels queued syncs (they no longer
@@ -3550,7 +3600,7 @@ async function findConnectorOrThrow(params: {
   id: string;
   organizationId: string;
   userId: string;
-  action?: "read" | "update";
+  action?: "read" | "update" | "delete";
 }) {
   const connector = await KnowledgeBaseConnectorModel.findById(params.id);
   if (!connector || connector.organizationId !== params.organizationId) {
@@ -3567,10 +3617,15 @@ async function findConnectorOrThrow(params: {
           access,
           connector,
         )
-      : knowledgeSourceAccessControlService.canAccessConnector(
-          access,
-          connector,
-        );
+      : params.action === "delete"
+        ? knowledgeSourceAccessControlService.canDeleteConnector(
+            access,
+            connector,
+          )
+        : knowledgeSourceAccessControlService.canAccessConnector(
+            access,
+            connector,
+          );
   if (!permitted) {
     throw new ApiError(404, "Connector not found");
   }

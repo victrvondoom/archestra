@@ -645,7 +645,10 @@ describe("McpCatalogItemDetailPage overview", () => {
     });
 
     expect(initiateOAuth).toHaveBeenCalledTimes(1);
-    expect(initiateOAuth).toHaveBeenCalledWith({ catalogId: "cat-1" });
+    expect(initiateOAuth).toHaveBeenCalledWith({
+      catalogId: "cat-1",
+      serverId: "srv-own",
+    });
     expect(screen.getByText("Redirecting to sign in…")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
   });
@@ -743,7 +746,6 @@ describe("McpCatalogItemDetailPage overview", () => {
         name: "internal-tools",
         environmentValues: { API_TOKEN: "new-token" },
         userConfigValues: {},
-        isByosVault: false,
       }),
     );
     expect(replace).toHaveBeenCalledWith(
@@ -1247,6 +1249,12 @@ function sharedWith(
         : { type: "organization", id: "org" };
   useResourcePermissions.mockReturnValue({
     data: {
+      resource: "mcpRegistry",
+      scope: "cat-1",
+      name: "Example server",
+      ownerId: "u1",
+      revision: 1,
+      canShareOrganizationWide: true,
       grants: [{ subject, actions: ["read", "use"] }],
       inheritedGrants: [],
       actorSubjects: [],

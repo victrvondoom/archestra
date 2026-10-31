@@ -34,6 +34,11 @@ import type {
   SupportedProvider,
   SupportedProviderDiscriminator,
 } from "@archestra/shared";
+import type {
+  BillingUsage,
+  PricedBillingUsage,
+  PricingQuote,
+} from "@/utils/billable-usage";
 
 import type { GatewayAgent } from "./agent";
 
@@ -67,6 +72,8 @@ export type HostedToolCall = {
  * Options for creating an LLM provider client
  */
 export interface CreateClientOptions {
+  /** Request-local native Azure SDK deployment and original query. */
+  azureRequest?: Readonly<{ deployment?: string; rawQuery: string }>;
   /** Base URL override for the provider API */
   baseUrl?: string;
   /**
@@ -402,6 +409,13 @@ export interface LLMStreamAdapter<TChunk, TResponse> {
   /** Current accumulated state */
   readonly state: StreamAccumulatorState;
 
+  /**
+   * The id and model of the response the client sees, when they differ from
+   * `state`: a wrapper that serves another wire format keeps the inner
+   * provider's values there.
+   */
+  readonly clientResponse?: { id: string; model: string };
+
   // ---------------------------------------------------------------------------
   // Chunk Processing
   // ---------------------------------------------------------------------------
@@ -525,11 +539,32 @@ export interface LLMStreamAdapter<TChunk, TResponse> {
    * which is needed for saving the interaction to the database.
    */
   toProviderResponse(): TResponse;
+
+  /**
+   * The response as its log row stores it, when that holds more than plugins
+   * should receive: the audio a speech or audio-chat stream returned, kept up
+   * to a size limit so the Logs page can play it. Defaults to
+   * `toProviderResponse()`.
+   */
+  toLoggedResponse?(): TResponse;
 }
 
 // =============================================================================
 // ADAPTER FACTORY INTERFACE
 // =============================================================================
+
+/** What the handler knows about a stream when it ends it with an error. */
+export interface StreamErrorFrameContext {
+  /** The id of the response the client has open, when known. */
+  responseId?: string;
+  /** The model that answered, when known. */
+  model?: string;
+  /**
+   * True when the client already received a terminal event for the
+   * response, so the error frame must not end it a second time.
+   */
+  terminalSent?: boolean;
+}
 
 /**
  * Factory for creating adapters for a specific provider
@@ -546,6 +581,25 @@ export interface LLMStreamAdapter<TChunk, TResponse> {
 export interface LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
   /** Provider name */
   readonly provider: SupportedProvider;
+
+  /** This operation cannot provide authoritative usage/pricing for enforced accounting. */
+  readonly unavailableUsageAccounting?: boolean;
+  /**
+   * For a media operation: whether its response will carry what the
+   * provider's published media tariff prices, so its cost is authoritative.
+   */
+  mediaTariffCovers?(request: TRequest): boolean;
+  /**
+   * The request as its log row keeps it, when that differs from what the
+   * provider and plugins receive: an image edit adds its uploaded images, so
+   * the Logs page can show what was edited. Typed loosely so an adapter that
+   * spreads another provider's factory does not inherit its request type.
+   */
+  toLoggedRequest?(request: unknown): unknown;
+  /** Propagate downstream disconnection to upstream work. */
+  readonly cancelOnDisconnect?: boolean;
+  /** End failed binary streams by closing the transport, never injecting SSE bytes. */
+  readonly binaryStream?: boolean;
 
   /** Interaction type for database storage */
   readonly interactionType: SupportedProviderDiscriminator;
@@ -571,7 +625,17 @@ export interface LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
    * error at the client, which reports the framing problem instead of the real
    * upstream cause.
    */
-  readonly formatStreamErrorFrame?: (event: unknown) => string;
+  readonly formatStreamErrorFrame?: (
+    event: unknown,
+    context?: StreamErrorFrameContext,
+  ) => string;
+
+  /**
+   * Whether a write to the client carries a terminal event of this stream.
+   * Set when `formatStreamErrorFrame` ends the response itself, so the
+   * handler can tell it that the client already has a terminal.
+   */
+  readonly carriesStreamTerminal?: (data: string | Uint8Array) => boolean;
 
   /**
    * Set by adapters that serve a client wire format different from the
@@ -644,6 +708,9 @@ export interface LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
   executeStream(
     client: unknown,
     request: TRequest,
+    /** Signal only after a successful upstream HTTP response, never merely
+     * after constructing a lazy iterator. Implementations may omit it. */
+    onAccepted?: () => void,
   ): Promise<AsyncIterable<TChunk>>;
 
   /**
@@ -669,6 +736,17 @@ export interface LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
  * Token usage from response
  */
 export interface UsageView {
+  /** Disjoint provider billing components; primary token fields remain unchanged. */
+  billingUsage?: BillingUsage;
+  /** Internal quote attached to this normalized request snapshot, never forwarded. */
+  billingQuote?: {
+    pricing: PricingQuote;
+    priced?: PricedBillingUsage;
+  };
+  /** Missing provider counts; persist null instead of inventing zero usage. */
+  usageUnavailable?: boolean;
+  /** Token counts exist but this operation cannot be priced by token tariffs. */
+  costUnavailable?: boolean;
   /** Uncached input tokens only (normalized across providers). */
   inputTokens: number;
   outputTokens: number;
@@ -682,8 +760,12 @@ export interface UsageView {
   reasoningTokens?: number;
   /** True when inputTokens is a locally-computed estimate, not a provider-reported count (see applyInputTokenFallback). Absent/false = provider-measured. */
   inputTokensEstimated?: boolean;
-  /** USD the provider reports it billed for this response (OpenRouter's `usage.cost`). When present it is the recorded cost instead of a token-price estimate. */
+  /** True for locally synthesized output metrics; excluded from token quotas. */
+  outputTokensEstimated?: boolean;
+  /** USD the provider reports it billed for this response (OpenRouter's `usage.cost`), or the cost of a media operation priced from the provider's published media tariff (see `mediaTariff`). When present it is the recorded cost instead of a token-price estimate. */
   providerReportedCost?: number;
+  /** The cost is a media operation's, priced per image token, character or second from the provider's published tariff (`services/media-pricing`), which per-token chat prices cannot express. */
+  mediaTariff?: boolean;
 }
 
 /**

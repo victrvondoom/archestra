@@ -22,6 +22,8 @@ export const REDACTED_LOG_PATHS = [
   "access_token",
   "refresh_token",
   "id_token",
+  "github_token",
+  "githubToken",
   "clientSecret",
   "client_secret",
   "secret",
@@ -29,6 +31,13 @@ export const REDACTED_LOG_PATHS = [
 ]
   .flatMap((key) => [key, `*.${key}`, `*.headers.${key}`])
   .concat([
+    ...[
+      "api-key",
+      "Api-Key",
+      "API-Key",
+      "x-api-key",
+      "x-archestra-virtual-key",
+    ].flatMap((key) => [`["${key}"]`, `*["${key}"]`, `*.headers["${key}"]`]),
     // The browser-held encrypted chat key rides this request header;
     // the server must never persist it, logs included. Hyphenated keys need
     // fast-redact's bracket syntax (same three shapes as above).
@@ -39,6 +48,9 @@ export const REDACTED_LOG_PATHS = [
     '*["x-archestra-encrypted-chat-key"]',
     '*.headers["x-archestra-encrypted-chat-key"]',
     '["x-archestra-internal-call"]',
+    '["x-archestra-a2a-oauth-execution"]',
+    '*["x-archestra-a2a-oauth-execution"]',
+    '*.headers["x-archestra-a2a-oauth-execution"]',
     '*["x-archestra-internal-call"]',
     '*.headers["x-archestra-internal-call"]',
     '["x-archestra-guardrail-call"]',

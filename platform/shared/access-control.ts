@@ -28,11 +28,12 @@ export const allAvailableActions: Record<Resource, Action[]> = {
   ...(defaultStatements as unknown as Record<string, Action[]>),
 
   // Agents
-  agent: ["read", "create", "delete"],
+  agent: ["read", "create", "delete", "configure-runtime"],
   skill: ["read", "create", "delete"],
   plugin: ["read", "create", "update", "delete"],
   app: ["read", "create"],
   guardrailsPolicy: ["read", "update"],
+  sre: ["read"],
 
   // LLM
   llmProxy: ["read", "update"],
@@ -93,6 +94,7 @@ export const editorPermissions: Record<Resource, Action[]> = {
   plugin: ["read", "create", "update", "delete"],
   app: ["read", "create"],
   guardrailsPolicy: ["read", "update"],
+  sre: [],
 
   // LLM
   llmProxy: ["read", "update"],
@@ -149,6 +151,7 @@ export const memberPermissions: Record<Resource, Action[]> = {
   // Members do not see the Guardrails pages or read the policy. Enforcement,
   // yells, and remedies do not depend on this permission.
   guardrailsPolicy: [],
+  sre: [],
 
   // LLM
   llmProxy: ["read"],
@@ -250,7 +253,8 @@ export const adminPermissions: Record<Resource, Action[]> = {
 
 /**
  * Platform Admin: runs the deployment — full user, role, and settings
- * management — while org-wide log visibility and impersonation stay withheld.
+ * management — while org-wide log visibility, impersonation, and the SRE
+ * agent (which reads pod specs that can carry credentials) stay withheld.
  * They keep log:read / auditLog:read, so their OWN activity stays visible to
  * them. Combined with the no-escalation rule (a role can only be granted by
  * someone holding every permission it carries), holders cannot hand
@@ -260,6 +264,7 @@ export const platformAdminPermissions: Record<Resource, Action[]> = {
   ...allAvailableActions,
   log: ["read"],
   auditLog: ["read"],
+  sre: [],
   member: allAvailableActions.member.filter((a) => a !== "impersonate"),
 };
 
@@ -334,6 +339,8 @@ export const permissionDescriptions: Record<string, string> = {
   "agent:read":
     "Open Agents, and use the code sandboxes and files of agents you can use",
   "agent:create": "Create new agents",
+  "agent:configure-runtime":
+    "Create runtime-backed agents and change or remove their runtime configuration",
   "agent:delete": "Open the trash of deleted agents",
   "skill:read": "Open Skills",
   "skill:create": "Create new agent skills",
@@ -431,6 +438,8 @@ export const permissionDescriptions: Record<string, string> = {
     "View every audit event in your organization (also requires Read)",
   "log:admin":
     "View every LLM, MCP, and Guardrails consult log in your organization (also requires Read)",
+  "sre:read":
+    "Use the SRE agent and its Kubernetes tools, which read this installation's pods, logs, and specs",
   "accessPolicies:read": "View access policies for all resource types",
   "accessPolicies:update":
     "Edit access policies and grant access across all resource types",
@@ -460,6 +469,48 @@ export const permissionDescriptions: Record<string, string> = {
 export const requiredEndpointPermissionsMap: Partial<
   Record<RouteId, Permissions>
 > = {
+  [RouteId.AzureRealtimeTurnWithDefaultAgent]: {},
+  [RouteId.AzureRealtimeTurnWithAgent]: {},
+  [RouteId.AzureAudioSpeechWithDefaultAgent]: {},
+  [RouteId.AzureAudioSpeechWithAgent]: {},
+  [RouteId.AzureAudioTranscriptionsWithDefaultAgent]: {},
+  [RouteId.AzureAudioTranscriptionsWithAgent]: {},
+  [RouteId.AzureAudioTranslationsWithDefaultAgent]: {},
+  [RouteId.AzureAudioTranslationsWithAgent]: {},
+  [RouteId.OpenAiAudioSpeechWithDefaultAgent]: {},
+  [RouteId.OpenAiAudioSpeechWithAgent]: {},
+  [RouteId.OpenAiAudioTranscriptionsWithDefaultAgent]: {},
+  [RouteId.OpenAiAudioTranscriptionsWithAgent]: {},
+  [RouteId.OpenAiAudioTranslationsWithDefaultAgent]: {},
+  [RouteId.OpenAiAudioTranslationsWithAgent]: {},
+  [RouteId.AzureImagesWithDefaultAgent]: {},
+  [RouteId.AzureImagesWithAgent]: {},
+  [RouteId.OpenAiImagesWithDefaultAgent]: {},
+  [RouteId.OpenAiImagesWithAgent]: {},
+  [RouteId.OpenAiImageEditsWithDefaultAgent]: {},
+  [RouteId.OpenAiImageEditsWithAgent]: {},
+  [RouteId.ModelRouterImagesWithDefaultAgent]: {},
+  [RouteId.ModelRouterImagesWithAgent]: {},
+  [RouteId.ModelRouterImageEditsWithDefaultAgent]: {},
+  [RouteId.ModelRouterImageEditsWithAgent]: {},
+  [RouteId.ModelRouterAudioSpeechWithDefaultAgent]: {},
+  [RouteId.ModelRouterAudioSpeechWithAgent]: {},
+  [RouteId.ModelRouterAudioTranscriptionsWithDefaultAgent]: {},
+  [RouteId.ModelRouterAudioTranscriptionsWithAgent]: {},
+  [RouteId.ModelRouterAudioTranslationsWithDefaultAgent]: {},
+  [RouteId.ModelRouterAudioTranslationsWithAgent]: {},
+  [RouteId.AzureImageEditsWithDefaultAgent]: {},
+  [RouteId.AzureImageEditsWithAgent]: {},
+  [RouteId.AzureCreateFile]: {},
+  [RouteId.AzureCreateFileWithAgent]: {},
+  [RouteId.AzureListFiles]: {},
+  [RouteId.AzureListFilesWithAgent]: {},
+  [RouteId.AzureRetrieveFile]: {},
+  [RouteId.AzureRetrieveFileWithAgent]: {},
+  [RouteId.AzureFileContent]: {},
+  [RouteId.AzureFileContentWithAgent]: {},
+  [RouteId.AzureDeleteFile]: {},
+  [RouteId.AzureDeleteFileWithAgent]: {},
   // Public, stateless APPA endpoint. Returns only an empty annotation.
   [RouteId.AnnotateGuardrailsTool]: {},
   [RouteId.GetOpenAppaPolicyTests]: { guardrailsPolicy: ["read"] },
@@ -490,6 +541,12 @@ export const requiredEndpointPermissionsMap: Partial<
    * authenticated but no specific permission.
    */
   [RouteId.GetOrganization]: {},
+  [RouteId.ListAgentRuntimeTemplates]: {},
+  [RouteId.GetAgentRuntimeTemplate]: {}, // Scoped create/update check in the handler.
+  [RouteId.GetRuntimeTemplateSettings]: { organizationSettings: ["update"] },
+  [RouteId.SaveRuntimeTemplateSettings]: { organizationSettings: ["update"] },
+  /** Names the default model for every member, so "Organization default" reads the same for all. */
+  [RouteId.GetOrganizationDefaultModel]: {},
 
   // Agent Runtime belongs to Agents. Read access is enough to view
   // runs and manage one's own declared credentials; shared credential writes
@@ -507,6 +564,9 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.ListRuntimeCredentials]: { credential: ["read"] },
   [RouteId.StartGitHubUserConnection]: {},
   [RouteId.CompleteGitHubUserConnection]: { credential: ["read"] },
+  // Public: a GitHub Actions OIDC token is the proof, checked in the handler
+  // against the gateway's GitHub Actions setting. The authnz layer exempts it.
+  [RouteId.ExchangeGitHubActionsToken]: {},
   // A credential just for you is self-service; the route requires
   // credential:create for organization and shared ones.
   [RouteId.CreateRuntimeCredential]: {},
@@ -577,6 +637,7 @@ export const requiredEndpointPermissionsMap: Partial<
    * Note: Auth is skipped in middleware for this route.
    */
   [RouteId.GetConnectionHealth]: {},
+  [RouteId.RenderStartupGuard]: {},
   // Installation credential and live access are checked by the refresh handler.
   [RouteId.GetConnectionInstructions]: {},
   [RouteId.GetConnectionRuntime]: {},
@@ -664,6 +725,20 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.UpdateLlmProxy]: {
     llmProxy: ["update"],
   },
+  [RouteId.GetAutoRoutingSettings]: { llmProxy: ["read"] },
+  [RouteId.UpdateAutoRoutingSettings]: { llmProxy: ["update"] },
+  [RouteId.GetAutoRoutingPlans]: { llmProxy: ["read"] },
+  [RouteId.GetAutoRoutingPlan]: { llmProxy: ["read"] },
+  [RouteId.ReplanAutoRouting]: { llmProxy: ["update"] },
+  // Preview spends on the scorer, so it needs the same right as changing settings.
+  [RouteId.PreviewAutoRouting]: { llmProxy: ["update"] },
+  [RouteId.SimulateAutoRouting]: { llmProxy: ["read"] },
+  [RouteId.GetAutoRoutingDiagnostics]: { llmProxy: ["read"] },
+  [RouteId.GetAutoRoutingBackfill]: { llmProxy: ["read"] },
+  [RouteId.ScanAutoRoutingBackfill]: { llmProxy: ["update"] },
+  // Scoring sends past prompts to the scorer and spends on it.
+  [RouteId.ScoreAutoRoutingBackfill]: { llmProxy: ["update"] },
+  [RouteId.CancelAutoRoutingBackfill]: { llmProxy: ["update"] },
   // Agent-tool routes: agent-type and scope checks are handled dynamically in the route handlers
   [RouteId.GetAgentTools]: {},
   [RouteId.GetAllAgentTools]: {},
@@ -874,26 +949,6 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.RemoveTeamExternalGroup]: {
     team: ["read"],
   },
-  // Team Vault Folder Routes (BYOS - Bring Your Own Secrets)
-  // Note: Route handlers check team membership for non-admin users
-  [RouteId.GetTeamVaultFolder]: {
-    team: ["read"],
-  },
-  [RouteId.SetTeamVaultFolder]: {
-    team: ["update"],
-  },
-  [RouteId.DeleteTeamVaultFolder]: {
-    team: ["update"],
-  },
-  [RouteId.CheckTeamVaultFolderConnectivity]: {
-    team: ["update"],
-  },
-  [RouteId.ListTeamVaultFolderSecrets]: {
-    team: ["read"],
-  },
-  [RouteId.GetTeamVaultSecretKeys]: {
-    team: ["read"],
-  },
   // Resource actions and delegation authority are checked against the target.
   [RouteId.SearchInitialPermissionSubjects]: {},
   [RouteId.GetScopedCapabilities]: {},
@@ -1003,6 +1058,12 @@ export const requiredEndpointPermissionsMap: Partial<
     chat: ["read"],
   },
   [RouteId.GetLlmModels]: {},
+  [RouteId.GetModelPools]: { llmModel: ["read"] },
+  // The same gate as the keys a user can pick in chat, which decide the pools.
+  [RouteId.GetAvailableModelPools]: { llmProviderApiKey: ["read"] },
+  [RouteId.CreateModelPool]: { llmModel: ["update"] },
+  [RouteId.UpdateModelPool]: { llmModel: ["update"] },
+  [RouteId.DeleteModelPool]: { llmModel: ["update"] },
   [RouteId.GetLlmProviderModelLabelKeys]: { llmModel: ["read"] },
   [RouteId.GetLlmProviderModelLabelValues]: { llmModel: ["read"] },
   [RouteId.SyncLlmModels]: {
@@ -1143,6 +1204,10 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.GetLlmModelOptions]: {},
   [RouteId.BulkUpdateModels]: {},
   [RouteId.UpdateModel]: {},
+  // Cost backfill: scoped llmModel:update checked in the handler
+  [RouteId.PreviewModelCostBackfill]: {},
+  [RouteId.StartModelCostBackfill]: {},
+  [RouteId.GetModelCostBackfill]: {},
   // Delegation routes: agent-type permission checked dynamically in handler
   [RouteId.GetAgentDelegations]: {},
   [RouteId.SyncAgentDelegations]: {},
@@ -1151,26 +1216,16 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.GetAgentA2aDelegations]: {},
   [RouteId.SyncAgentA2aDelegations]: {},
   [RouteId.GetAllDelegationConnections]: {},
-  [RouteId.GetLimits]: {
-    llmLimit: ["read"],
-  },
-  [RouteId.GetLimitLabelKeys]: { llmLimit: ["read"] },
-  [RouteId.GetLimitLabelValues]: { llmLimit: ["read"] },
-  [RouteId.CreateLimit]: {
-    llmLimit: ["create"],
-  },
-  [RouteId.GetLimit]: {
-    llmLimit: ["read"],
-  },
-  [RouteId.UpdateLimit]: {
-    llmLimit: ["update"],
-  },
-  [RouteId.DeleteLimit]: {
-    llmLimit: ["delete"],
-  },
-  [RouteId.BulkDeleteLimits]: {
-    llmLimit: ["delete"],
-  },
+  // Handlers also allow a team admin for only their own team's limits.
+  [RouteId.GetLimits]: {},
+  [RouteId.GetLimitLabelKeys]: {},
+  [RouteId.GetLimitLabelValues]: {},
+  [RouteId.CreateLimit]: {},
+  [RouteId.GetLimit]: {},
+  [RouteId.UpdateLimit]: {},
+  [RouteId.ResetLimitUsage]: {},
+  [RouteId.DeleteLimit]: {},
+  [RouteId.BulkDeleteLimits]: {},
   [RouteId.ListDefaultUserLimits]: {
     llmLimit: ["read"],
   },
@@ -1178,6 +1233,12 @@ export const requiredEndpointPermissionsMap: Partial<
     llmLimit: ["create"],
   },
   [RouteId.UpdateDefaultUserLimit]: {
+    llmLimit: ["update"],
+  },
+  [RouteId.ListUserLimitUsage]: {
+    llmLimit: ["read"],
+  },
+  [RouteId.ResetUserLimitUsage]: {
     llmLimit: ["update"],
   },
   [RouteId.DeleteDefaultUserLimit]: {
@@ -1329,7 +1390,7 @@ export const requiredEndpointPermissionsMap: Partial<
   },
   // Returns only the CALLER'S own decoded token claims (never another user's,
   // never provider configuration), so team admins can find their group value
-  // while configuring external group sync.
+  // while linking groups in Team Sync.
   [RouteId.GetIdentityProviderLatestIdTokenClaims]: {
     team: ["read"],
   },
@@ -1356,7 +1417,6 @@ export const requiredEndpointPermissionsMap: Partial<
     organizationSettings: ["update"],
   }, // First-login survey - admins only (same gate as appearance settings)
   [RouteId.SubmitOnboardingSurvey]: { organizationSettings: ["update"] }, // First-login survey - admins only
-  [RouteId.GetFeedbackPopupActivation]: { organizationSettings: ["update"] }, // Feedback pop-up activation signal - admins only (the pop-up is admin-only)
   [RouteId.GetMemberSignupStatus]: {}, // Member signup status - available to all authenticated users
   [RouteId.GetMembers]: { member: ["read"] }, // List organization members (paginated)
   [RouteId.BulkDeleteMembers]: { member: ["delete"] },
@@ -1377,8 +1437,6 @@ export const requiredEndpointPermissionsMap: Partial<
   // Member default routes - available to all authenticated users (manages their own defaults)
   [RouteId.GetMemberDefaultAgent]: {},
   [RouteId.UpdateMemberDefaultAgent]: {},
-  [RouteId.GetMemberDefaultModel]: {},
-  [RouteId.UpdateMemberDefaultModel]: {},
 
   // User token routes - available to all authenticated users (manages their own personal token)
   [RouteId.GetUserToken]: {},
@@ -1450,12 +1508,6 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.CheckSecretsConnectivity]: {
     organizationSettings: ["update"],
   },
-  // Only returns Vault references (never values), for prefilling the MCP
-  // catalog form in BYOS mode. The handler requires an update grant on the
-  // registry entry whose configuration the secret is.
-  [RouteId.GetSecret]: {},
-
-  // Incoming Email Routes
   [RouteId.GetIncomingEmailStatus]: {
     organizationSettings: ["read"],
   },
@@ -1471,6 +1523,13 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.GetAgentEmailAddress]: {}, // Any authenticated user can view agent email addresses
 
   // ChatOps Routes
+  [RouteId.GetJiraChatOpsConfig]: { organizationSettings: ["read"] },
+  [RouteId.UpdateJiraChatOpsConfig]: { organizationSettings: ["update"] },
+  [RouteId.CreateJiraChatOpsBot]: { organizationSettings: ["update"] },
+  [RouteId.UpdateJiraChatOpsBot]: { organizationSettings: ["update"] },
+  [RouteId.DeleteJiraChatOpsBot]: { organizationSettings: ["update"] },
+  [RouteId.ListJiraChatOpsProjects]: { organizationSettings: ["read"] },
+  [RouteId.CreateJiraChatOpsBinding]: { organizationSettings: ["update"] },
   [RouteId.GetChatOpsStatus]: {
     organizationSettings: ["read"],
   },
@@ -1498,6 +1557,13 @@ export const requiredEndpointPermissionsMap: Partial<
   },
   [RouteId.UpdateSlackChatOpsConfig]: {
     organizationSettings: ["update"],
+  },
+  // Config reads return no secret, only what GetChatOpsStatus shows at read.
+  [RouteId.GetSlackChatOpsConfig]: {
+    organizationSettings: ["read"],
+  },
+  [RouteId.GetMsTeamsChatOpsConfig]: {
+    organizationSettings: ["read"],
   },
   [RouteId.ListSlackAgentBots]: {
     organizationSettings: ["read"],
@@ -1537,6 +1603,9 @@ export const requiredEndpointPermissionsMap: Partial<
   },
   [RouteId.UpdateTelegramChatOpsConfig]: {
     organizationSettings: ["update"],
+  },
+  [RouteId.GetTelegramChatOpsConfig]: {
+    organizationSettings: ["read"],
   },
   // Any authenticated user can link or unlink their own Telegram account
   [RouteId.LinkTelegramChatOpsAccount]: {},
@@ -1694,6 +1763,22 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.CreateAppaGithubRepository]: { organizationSettings: ["update"] },
   [RouteId.StartAppaGithubApp]: { organizationSettings: ["update"] },
   [RouteId.CompleteAppaGithubApp]: { organizationSettings: ["update"] },
+  [RouteId.StartCopilotGithubApp]: { llmProviderApiKey: ["create"] },
+  [RouteId.ConnectCopilotGithubAppCredential]: {
+    llmProviderApiKey: ["create"],
+  },
+  [RouteId.GetPendingCopilotGithubApp]: { llmProviderApiKey: ["create"] },
+  [RouteId.DiscardCopilotGithubApp]: { llmProviderApiKey: ["create"] },
+  [RouteId.InstallCopilotGithubApp]: { llmProviderApiKey: ["create"] },
+  [RouteId.ValidateExistingCopilotGithubApp]: {
+    llmProviderApiKey: ["create"],
+  },
+  [RouteId.ConnectExistingCopilotGithubApp]: { llmProviderApiKey: ["create"] },
+  [RouteId.CheckCopilotGithubOrganization]: { llmProviderApiKey: ["create"] },
+  // The service checks the key's own grants, like the key's read and update.
+  [RouteId.GetCopilotGithubAppKeySummary]: {},
+  // The setup checks its own permissions when it completes.
+  [RouteId.CompleteCopilotGithubApp]: {},
   [RouteId.GetPendingAppaGithubApp]: { organizationSettings: ["update"] },
   [RouteId.DiscardAppaGithubApp]: { organizationSettings: ["update"] },
   [RouteId.InstallAppaGithubApp]: { organizationSettings: ["update"] },
@@ -1705,6 +1790,7 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.GetOpenappaBatteryPolicySource]: { guardrailsPolicy: ["read"] },
   [RouteId.GetOpenappaEffectivePolicy]: { guardrailsPolicy: ["read"] },
   [RouteId.GetOpenappaBatteryMatches]: { guardrailsPolicy: ["read"] },
+  [RouteId.GetOpenappaBatteryInstall]: { guardrailsPolicy: ["read"] },
   [RouteId.CreateOpenappaBatteryInstall]: { guardrailsPolicy: ["update"] },
   [RouteId.UpdateOpenappaBatteryInstall]: { guardrailsPolicy: ["update"] },
   [RouteId.DeleteOpenappaBatteryInstall]: { guardrailsPolicy: ["update"] },
@@ -1716,6 +1802,9 @@ export const requiredEndpointPermissionsMap: Partial<
   [RouteId.SetOpenappaCredentialBinding]: {
     guardrailsPolicy: ["update"],
   },
+  // The variable -> key pairs are readable through GetOpenappaPolicyDeclarations too.
+  [RouteId.GetOpenappaCredentialBindings]: { guardrailsPolicy: ["read"] },
+  [RouteId.GetOpenappaCredentialBinding]: { guardrailsPolicy: ["read"] },
   [RouteId.GetOpenappaPolicyDeclarations]: { guardrailsPolicy: ["read"] },
   // Publishing a held pull is a policy write; each reason it names carries its
   // own permission on top, checked where the pull's changes are known.
@@ -1899,6 +1988,18 @@ export const requiredEndpointPermissionsMap: Partial<
   // Same trust model as diagnostics: the host page posts the viewer's render
   // screenshot, the handler re-checks app-visibility.
   [RouteId.PostAppRenderScreenshot]: {},
+  // Internal UI feedback overlay: any signed-in user, and only on deployments
+  // that turn it on (the handlers 404 otherwise). Picking its Slack bot and
+  // channel is the same permission as configuring chatops Slack itself.
+  [RouteId.GetDevFeedbackSetup]: {},
+  [RouteId.ListDevFeedbackBots]: { organizationSettings: ["update"] },
+  [RouteId.ListDevFeedbackChannels]: { organizationSettings: ["update"] },
+  [RouteId.SaveDevFeedbackSetup]: { organizationSettings: ["update"] },
+  [RouteId.GetDevFeedbackComments]: {},
+  [RouteId.CreateDevFeedbackComment]: {},
+  [RouteId.GetDevFeedbackReplies]: {},
+  [RouteId.CreateDevFeedbackReply]: {},
+  [RouteId.ResolveDevFeedbackComment]: {},
   // Config endpoint - any authenticated user can access
   [RouteId.GetConfig]: {},
   // Bundles the signed-in user's own startup reads; each part is self-scoped.
@@ -2030,10 +2131,14 @@ export const requiredPagePermissionsMap: Record<string, Permissions> = {
   "/llm/proxy/virtual-keys": { llmVirtualKey: ["read"] },
   "/llm/model-providers": { llmProviderApiKey: ["read"] },
   "/llm/models": { llmModel: ["read"] },
+  "/llm/model-pools": { llmModel: ["read"] },
   // Intentionally ungated: this page is fixed to the caller's own usage.
   "/llm/usage": {},
   "/llm/costs": { llmCost: ["read"] },
   "/llm/limits": { llmLimit: ["read"] },
+  "/llm/auto-routing": { llmProxy: ["read"] },
+  "/llm/auto-routing/plans": { llmProxy: ["read"] },
+  "/llm/auto-routing/diagnostics": { llmProxy: ["read"] },
 
   // MCP
   "/mcp/registry": { mcpRegistry: ["read"] },
@@ -2088,6 +2193,7 @@ export const requiredPagePermissionsMap: Record<string, Permissions> = {
   "/settings/credentials": { credential: ["read"] },
   "/settings/guardrails": { organizationSettings: ["read"] },
   "/settings/appearance": { organizationSettings: ["read"] },
+  "/settings/appearance/[section]": { organizationSettings: ["read"] },
   "/settings/auth": { organizationSettings: ["read"] },
   "/settings/connection": { organizationSettings: ["read"] },
 };

@@ -4,8 +4,10 @@ import type {
   SupportedProvider,
   SupportedProviderEndpoint,
 } from "@archestra/shared";
+import type { AzureModelEvidence } from "@archestra/shared/azure-models";
 import { ApiError } from "@/types/api";
 import type { ModelDefaultParameters } from "@/types/model";
+import type { ProviderModelPricing } from "@/types/provider-model-pricing";
 
 export const PLACEHOLDER_API_KEY = "EMPTY";
 export const PLACEHOLDER_BEARER_TOKEN = `Bearer ${PLACEHOLDER_API_KEY}`;
@@ -30,10 +32,13 @@ export function modelFetchError(
  * Capabilities a fetcher can read straight from a provider's models endpoint.
  * Kept minimal and separate from the API-facing `ModelCapabilities`: a fetcher
  * only reports raw provider facts, not computed/price-source fields. Fed into
- * `resolveModelCapabilities` as the highest-priority tier during model sync.
+ * `resolveModelCapabilities` as the highest-priority tier during model sync,
+ * except output limits, which are stored on the API-key/model link.
  */
 export interface FetchedModelCapabilities {
   contextLength?: number | null;
+  /** Maximum generation length published by the serving endpoint. */
+  outputLength?: number | null;
   supportsToolCalling?: boolean | null;
   /**
    * What the model accepts / emits, when the provider publishes it per model
@@ -45,6 +50,13 @@ export interface FetchedModelCapabilities {
    */
   inputModalities?: ModelInputModality[] | null;
   outputModalities?: ModelOutputModality[] | null;
+  /**
+   * The fetcher classified this model from its id (OpenAI's media, audio
+   * chat and search models), so sync overwrites what an earlier sync stored
+   * instead of keeping it: a realtime model synced as a chat model by an
+   * older build would otherwise stay one.
+   */
+  authoritative?: boolean;
   promptPricePerToken?: string | null;
   completionPricePerToken?: string | null;
   /** Per-token cache-read price (USD), when the provider reports one. */
@@ -86,6 +98,9 @@ export interface FetchedModelCapabilities {
 }
 
 export interface ModelInfo {
+  azureCapabilities?: AzureModelEvidence | null;
+  /** Instance-local prices; never written to the shared model catalog. */
+  providerPricing?: ProviderModelPricing;
   id: string;
   displayName: string;
   provider: SupportedProvider;

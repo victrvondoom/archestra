@@ -17,6 +17,7 @@ import { unwrapCompactionCarriersFromRequest } from "@/openappa/compaction-carri
 import {
   type AppaDelegationMarker,
   collectDelegationMarkers,
+  collectReleasedSpawnCalls,
   stripDelegationMarkers,
 } from "@/openappa/delegation";
 import {
@@ -92,6 +93,9 @@ export function scrubOpenappaIngress(params: {
       ? { delegationMarkers: scrubbed.delegationMarkers }
       : {}),
     ...(scrubbed?.childReturns ? { childReturns: scrubbed.childReturns } : {}),
+    ...(scrubbed && scrubbed.releasedSpawnCalls.length > 0
+      ? { releasedSpawnCalls: scrubbed.releasedSpawnCalls }
+      : {}),
     ...(scrubbed && scrubbed.childTrajectoryReceipts.length > 0
       ? { childTrajectoryReceipts: scrubbed.childTrajectoryReceipts }
       : {}),
@@ -210,6 +214,7 @@ function scrubFamilyWire(params: {
   const delegationMarkers =
     collectedDelegationMarkers(request) ??
     collectDelegationMarkers({ family, body });
+  const releasedSpawnCalls = collectReleasedSpawnCalls({ family, body });
   stripDelegationMarkers({ family, body });
   const nativeClient = APPA_CLIENT_ADAPTERS.find((adapter) =>
     adapter.matches({ headers, requestBody: body }),
@@ -235,6 +240,7 @@ function scrubFamilyWire(params: {
     strippedReceiptCodes,
     childTrajectoryReceipts,
     delegationMarkers,
+    releasedSpawnCalls,
     childReturns,
     ...(childReturnRefusal ? { childReturnRefusal } : {}),
   };
@@ -255,6 +261,8 @@ export type OpenappaIngress = {
   trajectoryStamps: TrajectoryStamp[];
   childReturnRefusal?: ApiError;
   delegationMarkers?: AppaDelegationMarker[];
+  /** The spawn calls APPA released, as the markers in the history name them. */
+  releasedSpawnCalls?: string[];
   childReturns?: CollectedChildReturns;
   childTrajectoryReceipts?: AppaChildTrajectoryReceipt[];
   /**
@@ -268,6 +276,7 @@ type ScrubbedClientWire = {
   strippedReceiptCodes: string[];
   childTrajectoryReceipts: AppaChildTrajectoryReceipt[];
   delegationMarkers: AppaDelegationMarker[];
+  releasedSpawnCalls: string[];
   childReturns: CollectedChildReturns;
   childReturnRefusal?: ApiError;
 };
@@ -283,8 +292,8 @@ interface RequestWithClientWire extends FastifyRequest {
 }
 
 /**
- * Detects Claude Code compaction summary requests. Claude Code puts the
- * instruction on a user turn (sometimes also in `system`); scan those text
+ * Detects Claude Code and Kimi Code compaction summary requests. Both put the
+ * instruction on a user turn (Claude Code sometimes also in `system`); scan those text
  * sites only so a large tool result cannot trigger a false re-issue and so
  * the body is never serialized just to search it.
  */
@@ -356,7 +365,8 @@ function containsCompactionInstruction(value: unknown): boolean {
       text.startsWith(CLAUDE_COMPACTION_INSTRUCTION) ||
       text.startsWith(
         `CRITICAL: Respond with TEXT ONLY. ${CLAUDE_COMPACTION_INSTRUCTION}`,
-      )
+      ) ||
+      text.startsWith(KIMI_CODE_COMPACTION_INSTRUCTION)
     );
   }
   if (!Array.isArray(value)) return false;
@@ -372,3 +382,5 @@ function containsCompactionInstruction(value: unknown): boolean {
 
 const CLAUDE_COMPACTION_INSTRUCTION =
   "Your task is to create a detailed summary of the conversation so far";
+const KIMI_CODE_COMPACTION_INSTRUCTION =
+  "You are about to run out of context. Create a handoff summary for the\nmodel that will resume this task after the earlier conversation is cleared.";

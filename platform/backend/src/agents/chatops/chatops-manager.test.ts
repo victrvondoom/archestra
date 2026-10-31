@@ -21,7 +21,13 @@ vi.mock("./channel-activation", async (importOriginal) => {
   };
 });
 
-import { ChatErrorCode, ChatErrorMessages } from "@archestra/shared";
+import {
+  ChatErrorCode,
+  ChatErrorMessages,
+  SUBSCRIPTION_CREDENTIAL_KINDS,
+  SUBSCRIPTION_CREDENTIALS,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
 import { eq } from "drizzle-orm";
 import { A2AManager } from "@/agents/a2a/a2a-manager";
 import * as a2aExecutor from "@/agents/a2a-executor";
@@ -653,13 +659,163 @@ describe("ChatOpsManager security validation", () => {
     );
     expect(sendReplySpy).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("/settings"),
+        text: expect.stringContaining(
+          "/llm/model-providers?reconnect=github-copilot",
+        ),
       }),
     );
     // Even the connect-prompt reply carries the agent footer.
     expect(sendReplySpy).toHaveBeenCalledWith(
       expect.objectContaining({
         footer: `🤖 ${agent.name}`,
+      }),
+    );
+  });
+
+  test.for(
+    SUBSCRIPTION_CREDENTIAL_KINDS,
+  )("expired %s sign-in links to its reconnect dialog", async (kind, {
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const definition = SUBSCRIPTION_CREDENTIALS[kind];
+    vi.spyOn(a2aExecutor, "executeA2AMessage").mockRejectedValue(
+      new ProviderError({
+        code: ChatErrorCode.ProviderAuthRequired,
+        message: "Account sign-in expired. Reconnect to continue.",
+        isRetryable: false,
+        authAction: {
+          provider: definition.provider,
+          providerLabel: definition.label,
+        },
+      }),
+    );
+
+    const user = await makeUser({ email: "copilot@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+    const agent = await makeInternalAgent({
+      organizationId: org.id,
+    });
+    await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: agent.id,
+    });
+
+    const sendReplySpy = vi.fn().mockResolvedValue("reply-id");
+    const mockProvider = createMockProvider({
+      getUserEmail: async () => "copilot@example.com",
+      sendReply: sendReplySpy,
+    });
+
+    const manager = new ChatOpsManager();
+    (
+      manager as unknown as { msTeamsProvider: ChatOpsProvider }
+    ).msTeamsProvider = mockProvider;
+
+    const result = await manager.processMessage({
+      message: createMockMessage(),
+      provider: mockProvider,
+    });
+
+    expect(result.success).toBe(false);
+    // The reply names the provider and links the user to connect their account.
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Account sign-in expired."),
+      }),
+    );
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(`/llm/model-providers?reconnect=${kind}`),
+      }),
+    );
+    // Even the connect-prompt reply carries the agent footer.
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        footer: `🤖 ${agent.name}`,
+      }),
+    );
+  });
+
+  test.for(
+    SupportedProvidersSchema.options,
+  )("rejected %s key links to its setup dialog", async (providerId, {
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    vi.spyOn(a2aExecutor, "executeA2AMessage").mockRejectedValue(
+      new ProviderError({
+        code: ChatErrorCode.Authentication,
+        message: "Provider credential rejected.",
+        isRetryable: false,
+        originalError: { provider: providerId },
+      }),
+    );
+
+    const user = await makeUser({ email: "copilot@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+    const agent = await makeInternalAgent({
+      organizationId: org.id,
+    });
+    await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: agent.id,
+    });
+
+    const sendReplySpy = vi.fn().mockResolvedValue("reply-id");
+    const mockProvider = createMockProvider({
+      getUserEmail: async () => "copilot@example.com",
+      sendReply: sendReplySpy,
+    });
+
+    const manager = new ChatOpsManager();
+    (
+      manager as unknown as { msTeamsProvider: ChatOpsProvider }
+    ).msTeamsProvider = mockProvider;
+
+    const result = await manager.processMessage({
+      message: createMockMessage(),
+      provider: mockProvider,
+    });
+
+    expect(result.success).toBe(false);
+    // The reply names the provider and links the user to connect their account.
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("LLM provider rejected the API key"),
+      }),
+    );
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          `/llm/model-providers?create=${providerId}`,
+        ),
+      }),
+    );
+    // Even the connect-prompt reply carries the agent footer.
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        footer: expect.stringContaining(`🤖 ${agent.name}`),
       }),
     );
   });
@@ -1776,6 +1932,186 @@ describe("ChatOpsManager security validation", () => {
     expect(await ownerOf("C_UNCLAIMED")).toBe(marketing.id);
     expect(await ownerOf("C_NEW")).toBe(marketing.id);
     expect(await ownerOf("C_CODING")).toBe(coding.id);
+  });
+
+  test("a file the platform keeps off the message is read before the turn is answered", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const executeSpy = mockA2AExecutor();
+    const user = await makeUser({ email: "files@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+    const agent = await makeInternalAgent({ organizationId: org.id });
+    await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: agent.id,
+    });
+    const pdf = {
+      contentType: "application/pdf",
+      contentBase64: Buffer.from("%PDF-1.7").toString("base64"),
+      name: "spec.pdf",
+    };
+    const provider: ChatOpsProvider = {
+      ...createMockProvider({ getUserEmail: async () => user.email }),
+      downloadMessageFiles: async (message) =>
+        message.messageId === "msg-with-file"
+          ? [
+              { status: "delivered", attachment: pdf },
+              {
+                status: "skipped",
+                skipped: { name: "notes.docx", reason: "download_failed" },
+              },
+            ]
+          : [],
+    };
+    const manager = makeManagerWith(provider);
+    const messageIn = (messageId: string): IncomingChatMessage =>
+      createMockMessage({
+        messageId,
+        text: "",
+        senderEmail: user.email,
+        metadata: { conversationType: "channel" },
+      });
+
+    await manager.processMessage({
+      message: messageIn("msg-with-file"),
+      provider,
+    });
+    await manager.processMessage({ message: messageIn("msg-empty"), provider });
+
+    // The file-only message is answered with its file, and the unreadable one
+    // is named so the agent can say so; the empty one is not answered at all.
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    const [params] = executeSpy.mock.calls[0];
+    expect(params.attachments).toEqual([pdf]);
+    expect(params.message).toContain("notes.docx");
+  });
+
+  test("a file only its sender can open holds the message for their sign-in instead of answering it", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const executeSpy = mockA2AExecutor();
+    const user = await makeUser({ email: "group-files@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+    const agent = await makeInternalAgent({ organizationId: org.id });
+    await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: agent.id,
+    });
+    const screenshot = {
+      contentType: "image/png",
+      contentBase64: Buffer.from("png").toString("base64"),
+      name: "screenshot.png",
+    };
+    const sitePdf = {
+      contentType: "application/pdf",
+      contentBase64: Buffer.from("%PDF-1.7").toString("base64"),
+      name: "site.pdf",
+    };
+    const requestFileSignIn = vi.fn(
+      async (_params: { message: IncomingChatMessage; fileNames: string[] }) =>
+        true,
+    );
+    const provider: ChatOpsProvider = {
+      ...createMockProvider({ getUserEmail: async () => user.email }),
+      downloadMessageFiles: async () => [
+        { status: "delivered", attachment: sitePdf },
+        {
+          status: "skipped",
+          skipped: { name: "report.pdf", reason: "sign_in_required" },
+        },
+      ],
+      requestFileSignIn,
+    };
+    const manager = makeManagerWith(provider);
+
+    await manager.processMessage({
+      message: createMockMessage({
+        messageId: "msg-needs-sign-in",
+        text: "what does the report say?",
+        senderEmail: user.email,
+        attachments: [screenshot],
+        metadata: { conversationType: "groupChat" },
+      }),
+      provider,
+    });
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(requestFileSignIn).toHaveBeenCalledTimes(1);
+    const [{ message, fileNames }] = requestFileSignIn.mock.calls[0];
+    expect(fileNames).toEqual(["report.pdf"]);
+    // Held as it arrived: the replay reads the platform files again, so
+    // keeping these would hand the agent the same file twice.
+    expect(message.attachments).toEqual([screenshot]);
+    expect(message.skippedAttachments).toBeUndefined();
+  });
+
+  test("a file that needs sign-in is answered without it when no sign-in can be offered", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const executeSpy = mockA2AExecutor();
+    const user = await makeUser({ email: "no-sign-in@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+    const agent = await makeInternalAgent({ organizationId: org.id });
+    await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: agent.id,
+    });
+    const provider: ChatOpsProvider = {
+      ...createMockProvider({ getUserEmail: async () => user.email }),
+      downloadMessageFiles: async () => [
+        {
+          status: "skipped",
+          skipped: { name: "report.pdf", reason: "sign_in_required" },
+        },
+      ],
+      requestFileSignIn: async () => false,
+    };
+    const manager = makeManagerWith(provider);
+
+    await manager.processMessage({
+      message: createMockMessage({
+        messageId: "msg-sign-in-unavailable",
+        text: "what does the report say?",
+        senderEmail: user.email,
+        metadata: { conversationType: "groupChat" },
+      }),
+      provider,
+    });
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    const [params] = executeSpy.mock.calls[0];
+    expect(params.message).toContain("report.pdf");
+    expect(params.message).toContain("signs in");
   });
 
   test("'list' to the router bot names the agents a person can reach, without asking one", async ({
@@ -6066,6 +6402,8 @@ describe("ChatOpsManager per-channel instructions", () => {
     const sent = executorSpy.mock.calls[0][0].message;
     expect(sent).toContain(INSTRUCTIONS);
     expect(sent).toContain("take precedence");
+    // Ordinary chat agents do not receive runtime-only progress instructions.
+    expect(sent).not.toContain("proactively send brief updates");
     // Still the message the user actually sent — the framing rides along with
     // it rather than replacing it.
     expect(sent).toContain("the checkout page is broken");

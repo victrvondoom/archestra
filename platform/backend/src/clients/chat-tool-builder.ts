@@ -10,6 +10,7 @@ import {
   isBrowserMcpTool,
   MCP_EXECUTED_AS_META_KEY,
   MCP_HUMAN_RULING_META_KEY,
+  type ModelSelection,
   OPENAPPA_POLICY_CHANGE_TOOL_SHORT_NAMES,
   parseFullToolName,
   platformExecutedAs,
@@ -65,6 +66,7 @@ import {
 import { remedyCallNeedsHumanReview } from "@/openappa/a2a-hitl-review";
 import type { SubagentBinding } from "@/openappa/subagent-binding";
 import { TASK_TTL_MS } from "@/routes/mcp-gateway/tasks";
+import type { A2AOAuthExecution } from "@/routes/mcp-gateway/utils";
 import { isGuardrailsV2Active } from "@/services/guardrails-deployment";
 import type { Tool as CatalogTool } from "@/types";
 import { agentOwner } from "@/types";
@@ -79,6 +81,8 @@ export interface McpGatewayToken {
   isUserToken?: boolean;
   /** Set when the caller acts as a service account */
   serviceAccountId?: string;
+  oauthClientId?: string;
+  oauthExecution?: A2AOAuthExecution;
 }
 
 /**
@@ -161,6 +165,8 @@ export interface ChatToolContext {
   repeatTracker: ToolCallRepeatTracker;
   /** Keep rich UI media, but send it to the model only when its row allows it. */
   modelAcceptsImageToolResults: boolean;
+  /** The model and key this run is on, which a fork starts from. Rebound per run. */
+  parentLlm?: ModelSelection;
   /** A reviewed remedy call pauses the run until someone answers. */
   openappaReviewPause?: boolean;
 }
@@ -265,7 +271,11 @@ export function buildMcpGatewayTool(params: {
                 chatOpsBindingId: ctx.chatOpsBindingId,
                 chatOpsThreadId: ctx.chatOpsThreadId,
                 chatOpsPinnedAgentId: ctx.chatOpsPinnedAgentId,
-                userId: ctx.userId,
+                userId:
+                  ctx.mcpGwToken?.oauthClientId &&
+                  !ctx.mcpGwToken.serviceAccountId
+                    ? undefined
+                    : ctx.userId,
                 agentId: ctx.agentId,
                 organizationId: ctx.organizationId,
                 sessionId: ctx.sessionId,
@@ -285,6 +295,7 @@ export function buildMcpGatewayTool(params: {
                 // `run_tool` can dispatch a delegation tool, so this context
                 // needs the caller's ancestors for the executor's cycle check.
                 delegationChain: ctx.delegationChain,
+                parentLlm: ctx.parentLlm,
                 openappaSubagent: ctx.appaSubagent,
                 // Every runner that drives an agent lands here — web
                 // chat, A2A, ChatOps, schedule triggers, incoming email
@@ -428,7 +439,10 @@ export function buildAgentDelegationTool(params: {
     agent: { id: ctx.agentId, name: ctx.agentName },
     agentId: ctx.agentId,
     organizationId: ctx.organizationId,
-    userId: ctx.userId,
+    userId:
+      ctx.mcpGwToken?.oauthClientId && !ctx.mcpGwToken.serviceAccountId
+        ? undefined
+        : ctx.userId,
     conversationId: ctx.conversationId,
     isolationKey: ctx.scopeKey,
     chatOpsBindingId: ctx.chatOpsBindingId,
@@ -478,6 +492,7 @@ export function buildAgentDelegationTool(params: {
             // attributed to this delegation call (options.toolCallId).
             subagentToolStream: ctx.subagentToolStream,
             currentToolCallId: options.toolCallId,
+            parentLlm: ctx.parentLlm,
           });
 
           span.setAttribute(
@@ -976,7 +991,12 @@ interface ToolExecutionContext {
   isolationKey?: string;
   mcpGwToken: Pick<
     McpGatewayToken,
-    "tokenId" | "teamId" | "isOrganizationToken" | "serviceAccountId"
+    | "tokenId"
+    | "teamId"
+    | "isOrganizationToken"
+    | "serviceAccountId"
+    | "oauthClientId"
+    | "oauthExecution"
   > | null;
   abortSignal?: AbortSignal;
   elicitation?: ChatMcpElicitationBridge;
@@ -1114,8 +1134,10 @@ async function executeMcpTool(ctx: ToolExecutionContext): Promise<{
         teamId: mcpGwToken.teamId,
         isOrganizationToken: mcpGwToken.isOrganizationToken,
         serviceAccountId: mcpGwToken.serviceAccountId,
+        oauthClientId: mcpGwToken.oauthClientId,
+        oauthExecution: mcpGwToken.oauthExecution,
         organizationId,
-        userId,
+        userId: mcpGwToken.oauthClientId ? undefined : userId,
         // Exact links to the LLM turn: the run's own session id and the
         // model's id for this call (the row's tool_call.id stays our own).
         ...(llmSessionId && { llmSessionId }),
@@ -1483,6 +1505,8 @@ function buildTokenAuthContext({
     isUserToken: mcpGwToken.isUserToken,
     userId: mcpGwToken.isUserToken ? userId : undefined,
     serviceAccountId: mcpGwToken.serviceAccountId,
+    oauthClientId: mcpGwToken.oauthClientId,
+    oauthExecution: mcpGwToken.oauthExecution,
     ...(llmSessionId && { llmSessionId }),
     ...(llmToolCallId && { llmToolCallId }),
   };
@@ -1530,16 +1554,18 @@ function reportToolMetrics(params: {
 }
 
 /**
- * Context needed to fire the PreToolUse / PostToolUse lifecycle hooks against a
- * conversation's default sandbox. Hooks require a conversationId (the sandbox
- * session key) and the conversation's user id, so the caller passes both.
+ * Context needed to fire the PreToolUse / PostToolUse lifecycle hooks against
+ * the run's default sandbox: the conversation's in chat, the execution's
+ * (keyed by scopeKey) in headless runs.
  */
 interface ToolHookContext {
   agentId: string;
   organizationId: string;
-  /** Conversation user id — the default sandbox is keyed per org/user/conversation. */
+  /** Run user id — the default sandbox is keyed per org/user/run scope. */
   userId: string;
   conversationId?: string;
+  /** Per-run scope key; locates the execution's sandbox in headless runs. */
+  scopeKey?: string;
   /** Encrypted chats: hook dispatch is skipped (payloads persist). */
   suppressContentLogging?: boolean;
   /**
@@ -1554,7 +1580,7 @@ interface ToolHookContext {
  * Fires the PreToolUse lifecycle hook before a tool executes. Returns a block
  * reason string when a hook blocks (the caller must NOT execute the tool and
  * should return a tool-result describing the block); returns null to proceed.
- * Cheap no-op when no conversation context or no hooks. Fails open on error.
+ * Cheap no-op when the run has no sandbox scope or no hooks. Fails open on error.
  */
 async function firePreToolUseHook(params: {
   ctx: ToolHookContext;
@@ -1563,7 +1589,7 @@ async function firePreToolUseHook(params: {
   toolCallId?: string;
 }): Promise<string | null> {
   const { ctx, toolName, toolInput, toolCallId } = params;
-  if (!ctx.conversationId || ctx.suppressContentLogging) {
+  if ((!ctx.conversationId && !ctx.scopeKey) || ctx.suppressContentLogging) {
     // EncryptedChat: hook dispatch would hand tool args to the hook sandbox,
     // which persists its payloads into the durable replay log in plaintext.
     return null;
@@ -1572,6 +1598,7 @@ async function firePreToolUseHook(params: {
     const result = await hookDispatcherService.fire({
       event: "pre_tool_use",
       conversationId: ctx.conversationId,
+      isolationKey: ctx.scopeKey,
       agentId: ctx.agentId,
       organizationId: ctx.organizationId,
       userId: ctx.userId,
@@ -1674,7 +1701,7 @@ const POST_TOOL_USE_RESPONSE_CAP = 50_000;
  * Fires the PostToolUse lifecycle hook after a tool executes. When a hook blocks
  * and supplies a reason, returns hook feedback to append to the tool result;
  * otherwise returns null (return the result unchanged). Cheap no-op without
- * conversation context or hooks. Fails open on error.
+ * a run scope or hooks. Fails open on error.
  */
 async function firePostToolUseHook(params: {
   ctx: ToolHookContext;
@@ -1684,7 +1711,7 @@ async function firePostToolUseHook(params: {
   toolCallId?: string;
 }): Promise<string | null> {
   const { ctx, toolName, toolInput, toolResponse, toolCallId } = params;
-  if (!ctx.conversationId || ctx.suppressContentLogging) {
+  if ((!ctx.conversationId && !ctx.scopeKey) || ctx.suppressContentLogging) {
     // EncryptedChat: see firePreToolUseHook — hook payloads persist in plaintext.
     return null;
   }
@@ -1692,6 +1719,7 @@ async function firePostToolUseHook(params: {
     const result = await hookDispatcherService.fire({
       event: "post_tool_use",
       conversationId: ctx.conversationId,
+      isolationKey: ctx.scopeKey,
       agentId: ctx.agentId,
       organizationId: ctx.organizationId,
       userId: ctx.userId,
@@ -1838,7 +1866,12 @@ function ensureExplicitSchemaTypes(
   for (const key of SINGLE_SUBSCHEMA_KEYS) {
     const sub = result[key];
     if (isRecord(sub)) {
-      result[key] = ensureExplicitSchemaTypes(sub);
+      // `{}` and `true` both accept any member value; typing the bare node
+      // would narrow every map value to an object.
+      result[key] =
+        key === "additionalProperties" && Object.keys(sub).length === 0
+          ? true
+          : ensureExplicitSchemaTypes(sub);
     }
   }
 

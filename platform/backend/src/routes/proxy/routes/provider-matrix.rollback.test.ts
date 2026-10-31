@@ -21,6 +21,8 @@ import {
   ModelModel,
   ToolModel,
 } from "@/models";
+import LimitModel from "@/models/limit";
+import LlmThroughputModel from "@/models/llm-throughput";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import { makePassthroughCredential } from "@/test/llm-proxy-credentials";
 import type { Agent } from "@/types";
@@ -37,6 +39,7 @@ import { githubCopilotAdapterFactory } from "../adapters/github-copilot";
 import { githubCopilotResponsesAdapterFactory } from "../adapters/github-copilot-responses";
 import { groqAdapterFactory } from "../adapters/groq";
 import { kimiAdapterFactory } from "../adapters/kimi";
+import { kimiCodeAdapterFactory } from "../adapters/kimi-code";
 import { microsoft365CopilotAdapterFactory } from "../adapters/microsoft-365-copilot";
 import { minimaxAdapterFactory } from "../adapters/minimax";
 import { mistralAdapterFactory } from "../adapters/mistral";
@@ -60,6 +63,7 @@ import geminiProxyRoutes from "./gemini";
 import githubCopilotProxyRoutes from "./github-copilot";
 import groqProxyRoutes from "./groq";
 import kimiProxyRoutes from "./kimi";
+import kimiCodeProxyRoutes from "./kimi-code";
 import microsoft365CopilotProxyRoutes from "./microsoft-365-copilot";
 import minimaxProxyRoutes from "./minimax";
 import mistralProxyRoutes from "./mistral";
@@ -1928,6 +1932,23 @@ const providerConfigsByProvider = {
     supportsDeclaredTools: true,
     supportsStreamingToolCalls: true,
   }),
+  "kimi-code": makeConfig({
+    providerName: "Kimi Code",
+    providerSlug: "kimi-code",
+    provider: "kimi-code",
+    family: "openai",
+    routePlugin: kimiCodeProxyRoutes,
+    adapterFactory: kimiCodeAdapterFactory,
+    endpoint: (agentId) => `/v1/kimi-code/${agentId}/chat/completions`,
+    headers: () => ({
+      Authorization: "Bearer test-key",
+      "Content-Type": "application/json",
+    }),
+    requestBuilder: makeOpenAiCompatibleBuilder("k3.1-pro"),
+    model: "k3.1-pro",
+    supportsDeclaredTools: true,
+    supportsStreamingToolCalls: true,
+  }),
   minimax: makeConfig({
     providerName: "Minimax",
     providerSlug: "minimax",
@@ -2516,6 +2537,52 @@ describe("LLM proxy provider matrix", () => {
           }
         }
         expect(foundOriginalResult).toBe(true);
+      });
+
+      test("enforces shared throughput storage before native inference", async ({
+        makeAgent,
+        makeMember,
+        makeUser,
+      }) => {
+        const agent = await makeAgent({ name: "Throughput test" });
+        const owner = await makeUser();
+        await makeMember(owner.id, agent.organizationId);
+        await LimitModel.create({
+          entityType: "organization",
+          entityId: agent.organizationId,
+          limitType: "tokens_per_minute",
+          limitValue: 1,
+        });
+        const admitted = await LlmThroughputModel.admit({
+          entities: [
+            { entityType: "organization", entityId: agent.organizationId },
+          ],
+          model: config.model,
+        });
+        if (!("reservation" in admitted) || !admitted.reservation)
+          throw new Error("Expected token accounting receipt");
+        await LlmThroughputModel.reconcile({
+          reservation: admitted.reservation,
+          tokens: 10,
+        });
+        await setupRoute(agent);
+        const response = await app.inject({
+          method: "POST",
+          url: config.endpoint(agent.id),
+          headers: await providerHeaders(config, agent, owner.id),
+          payload: config.requestBuilder.buildTextRequest({
+            model: config.model,
+            content: "Quota test",
+          }),
+        });
+        expect(response.statusCode).toBe(429);
+        expect(Number(response.headers["retry-after"])).toBeGreaterThan(0);
+        expect(response.json()).toMatchObject({
+          error: {
+            code: "archestra_quota_exceeded",
+            quota: { oversized: false, retryAfter: expect.any(Number) },
+          },
+        });
       });
 
       test("blocks requests when token cost limits are exceeded", async ({

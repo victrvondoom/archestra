@@ -139,23 +139,21 @@ describe("renderStartupGuardPowerShell (Claude Code)", () => {
     );
     // reads the live integer off the same health body and only flags -gt
     expect(script).toContain(`'"guardVersion":([0-9]+)'`);
-    expect(script).toContain("[int]$Matches[1] -gt $GuardFormatVersion");
-    expect(script).toContain("Test-ArchVersionStale");
-    // both the interactive notice and the non-interactive stderr advisory
-    expect(script).toContain("Show-ArchVersionUpdate");
-    expect(script).toContain("a newer ' + $AppName + ' setup");
-    // non-interactive stays advisory-only
-    expect(script).toContain("re-run the setup from the ");
-    // Steps are unconditional once stale, with a bounded reading window.
-    expect(script).not.toContain("'[U]'");
-    expect(script).toContain("/connection page and pick");
     expect(script).toContain(
-      "Your installed startup check is older than this deployment.",
+      "$Script:ArchUpdateVersion -gt $GuardFormatVersion",
     );
-    expect(script).toContain("UtcNow.AddMilliseconds(6000)");
-    // a guard that removed itself this run must not advertise an update for a
-    // startup check that no longer exists
+    expect(script).toContain("Invoke-ArchVersionRefresh");
+    expect(script).not.toContain("/connection page and pick");
+    expect(script).not.toContain("UtcNow.AddMilliseconds(6000)");
     expect(script).toContain("if ($Script:GuardUninstalled) { return }");
+    expect(script).toContain("$env:ARCHESTRA_GUARD_REFRESHED -eq '1'");
+    expect(script).toContain(
+      "-NoLogo -NoProfile -File $GuardPath @ArchLaunchArgs",
+    );
+    expect(script).toContain("--rollback");
+    expect(script).toContain(
+      "$env:ARCHESTRA_GUARD_REFRESHED = $previousMarker",
+    );
   });
 
   test("every down remote gets the failure copy; ONE prompt then covers them all", () => {
@@ -172,7 +170,15 @@ describe("renderStartupGuardPowerShell (Claude Code)", () => {
     expect(script).toContain(
       "'Disconnect all ' + $downRemotes.Count + ' unreachable resources from Claude now? (Y/n) '",
     );
-    // Enter accepts the (Y/n) default: remove
+    // Transport failure must not enter the persistent removal branch, even
+    // for Enter/a buffered yes. Explicit reconfiguration remains available.
+    expect(script).toContain(
+      "$transportOutage = $Script:HealthState -eq 'down' -or -not $HealthUrl",
+    );
+    expect(script).toContain("if ($choice -eq 'y' -and -not $transportOutage)");
+    expect(script).not.toContain("$Script:DiscAll");
+    expect(script).toContain("{ $Script:SkipAll = $true; break }");
+    // An explicit health down marker retains the established Enter default.
     expect(script).toContain("$k.Key -eq 'Enter'");
     expect(script).toContain("Show-ArchDownSummaryPrompt $DownRemotes");
   });
@@ -243,19 +249,19 @@ describe("renderStartupGuardPowerShell (Claude Code)", () => {
     expect(script).toContain("if ($Script:SkipNow) { break }");
   });
 
-  test("encodes the retry contract on the single request: 15s budget, notice at 3s, hang-tight at 10s, own-line (Y/n) offer", () => {
+  test("encodes the retry contract on the single request: 15s budget, notice at 3s, hang-tight at 10s, own-line session skip offer", () => {
     const script = renderStartupGuardPowerShell(CTX, CLAUDE_CODE_GUARD_CLIENT);
     expect(script).toContain("$RetryTotalSeconds = 15");
     expect(script).toContain("$NoticeAfterSeconds = 3");
     expect(script).toContain("$HangTightAfterSeconds = 10");
     expect(script).toContain("few more seconds, hang tight...");
     expect(script).toContain("trying to connect...");
-    // the disconnect offer sits on its own line below the row (after a
+    // the session-only skip offer sits on its own line below the row (after a
     // blank line), drawn via cursor save/restore so the dots keep
     // appending to the row above it
     expect(script).toContain("function Show-ArchWaitPrompt");
     expect(script).toContain(
-      "'Disconnect all ' + $ActiveRemotes.Count + ' unreachable resources from Claude now? (Y/n) '",
+      "'Instance unreachable. Press [Enter] to skip checks for this session; connections stay configured. '",
     );
     expect(script).toContain("[Math]::Min($delay * 2, 4)");
     expect(script).toContain("Get-Random -Minimum 0 -Maximum 2");

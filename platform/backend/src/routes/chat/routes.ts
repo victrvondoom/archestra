@@ -10,6 +10,7 @@ import {
   collapseWhitespace,
   getModelReadableMimeTypes,
   hasPersistableAssistantContent,
+  isGeminiImageGenerationModel,
   isModelSelectionComplete,
   isThinkingEffortSelfHostedProvider,
   PROJECT_INSTRUCTIONS_MAX_LENGTH,
@@ -70,6 +71,7 @@ import {
   repeatCeilingStopCondition,
   type ToolCallRepeatTracker,
 } from "@/clients/tool-call-repeat-tracker";
+import { orderToolResultsByCall } from "@/clients/tool-result-order";
 import config from "@/config";
 import type { EncryptedChatAuditContext } from "@/content-encryption/encrypted-chat";
 import db, { withDbTransaction } from "@/database";
@@ -96,6 +98,7 @@ import {
   ConversationEnabledToolModel,
   ConversationModel,
   LlmProviderApiKeyModel,
+  LlmProviderApiKeyModelLinkModel,
   McpGatewayTaskModel,
   MessageModel,
   ModelModel,
@@ -123,6 +126,8 @@ import {
   type OpenedApp,
   resolveOpenedApp,
 } from "@/services/apps/opened-app-context";
+import { resolveAzureModelCapabilities } from "@/services/azure-model-capabilities";
+import { resolveChatModelPool } from "@/services/chat-model-pools";
 import { conversationFilesService } from "@/services/conversation-files";
 import {
   getGuardrailsDeployment,
@@ -154,7 +159,6 @@ import {
   UuidIdSchema,
 } from "@/types";
 import { ConversationFilesResponseSchema } from "@/types/conversation-file";
-import { NewSessionPolicySchema } from "@/types/guardrails-policy";
 import { SelectScheduleTriggerRunSchema } from "@/types/schedule-trigger";
 import {
   resolveAgentLlmOrDefault,
@@ -969,6 +973,14 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 organizationId,
                 modelAcceptsImageToolResults:
                   selected.inputModalities?.includes("image") === true,
+                // A per-user provider model has no stored key; the fork then
+                // re-resolves the acting user's own credential for it.
+                parentLlm: conversation.modelId
+                  ? {
+                      modelId: conversation.modelId,
+                      apiKeyId: conversation.chatApiKeyId,
+                    }
+                  : undefined,
                 hookSessionContext,
                 projectInstructions,
                 openedApp,
@@ -1074,22 +1086,12 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             const normalizedMessagesForLLM =
               normalizeChatMessages(messagesForLLM);
 
-            // For Gemini image generation models, enable image output via responseModalities
-            // Known image-capable model patterns:
-            // - gemini-2.0-flash-exp-image-generation
-            // - gemini-2.5-flash-preview-native-audio-dialog (supports image output)
-            // - gemini-2.5-flash-image
-            // - gemini-3-pro-image-preview (and similar Gemini 3 image models)
-            // - Any model with "image" in the name (covers current and future image models)
-            //
-            // TODO: Use output modalities from the models DB table instead of hardcoded
-            // pattern matching. The `models` table has capability info that would be more
-            // reliable, but some models (e.g. gemini-3-pro-image-preview) currently report
-            // "capabilities unknown", so that needs to be fixed first.
+            // Image output needs explicit responseModalities, including named
+            // Nano Banana releases whose ids contain no "image" suffix.
             const modelLower = selectedModel.toLowerCase();
             const isGeminiImageModel =
               provider === "gemini" &&
-              (modelLower.includes("image") ||
+              (isGeminiImageGenerationModel(selectedModel) ||
                 modelLower.includes("native-audio-dialog"));
 
             // Persist user's new messages immediately so they're visible on page reload.
@@ -1183,6 +1185,8 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                     sessionId: conversationId,
                     source: "chat",
                     agentLlmApiKeyId: agent.llmApiKeyId,
+                    modelPoolId: conversation.modelPoolId,
+                    autoRoutable: !conversation.modelPoolId,
                     // Lets the proxy store this turn's interaction encrypted
                     // rather than redacted. Only sent when an escrow record
                     // exists, since without one the row could never be reopened.
@@ -1300,11 +1304,11 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 // the breakdown would otherwise count only the system prompt and
                 // tools.
                 //
-                // After tool-call steps we re-emit an updated breakdown using the
+                // After each finished step we re-emit an updated breakdown using the
                 // provider's exact inputTokens so the visualizer headline stays
-                // accurate across multi-step turns. The category estimates stay
-                // proportional to the initial build; the ring and totals track
-                // the real prompt size.
+                // accurate across multi-step turns and the final response. The
+                // category estimates stay proportional to the initial build; the
+                // ring and totals track the real prompt size.
                 let latestBreakdown: ContextWindowBreakdown | null = null;
                 let breakdownPricePerToken: number | null = null;
                 try {
@@ -1380,19 +1384,22 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                       toolExecutionErrors.add(event.error);
                     }
                   },
-                  ...(usesStepPromptCache({
-                    provider,
-                    anthropicNativeEndpoint,
-                  }) && {
-                    prepareStep: ({ messages }) => ({
-                      messages: applyStepPromptCacheBreakpoint({
+                  prepareStep: ({ messages }) => {
+                    const ordered = orderToolResultsByCall(messages);
+                    return {
+                      messages: usesStepPromptCache({
                         provider,
-                        model: selectedModel,
                         anthropicNativeEndpoint,
-                        messages,
-                      }),
-                    }),
-                  }),
+                      })
+                        ? applyStepPromptCacheBreakpoint({
+                            provider,
+                            model: selectedModel,
+                            anthropicNativeEndpoint,
+                            messages: ordered,
+                          })
+                        : ordered,
+                    };
+                  },
                   ...(supportsToolCalling && { tools: mcpTools }),
                   stopWhen: buildChatStopConditions(repeatTracker, maxSteps),
                   abortSignal: chatAbortController.signal,
@@ -1418,6 +1425,8 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                           sessionId: conversationId,
                           source: "chat:tool_call_repair",
                           agentLlmApiKeyId: agent.llmApiKeyId,
+                          modelPoolId: conversation.modelPoolId,
+                          autoRoutable: !conversation.modelPoolId,
                           // A repair prompt carries the same conversation
                           // content as the turn it repairs.
                           encryptedChatKey: encryptedChatAudit?.dek ?? null,
@@ -1452,14 +1461,14 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                       } satisfies TokenUsage,
                     });
 
-                    // After a tool-call step the next model call will receive a
-                    // larger prompt (tool results appended). Re-emit the breakdown
-                    // with the provider's exact input-token count so the panel
-                    // headline stays accurate between steps. Category proportions
-                    // are kept from the initial estimate — they are still the best
-                    // available approximation of where tokens went.
+                    // Re-emit the breakdown with the provider's exact input-token
+                    // count on every finished step (both intermediate tool-call
+                    // steps and the final response step) so the panel headline and
+                    // composer ring stay in lockstep with `data-token-usage`.
+                    // Category proportions are kept from the initial estimate —
+                    // they are still the best available approximation of where
+                    // tokens went.
                     if (
-                      finishReason === "tool-calls" &&
                       latestBreakdown !== null &&
                       usage.inputTokens != null &&
                       usage.inputTokens > 0
@@ -1479,7 +1488,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                           // panel reads it from onData state, so keeping it out
                           // of the message list is what the client expects. A
                           // non-transient copy would be appended to the
-                          // assistant message once per tool step — persisted,
+                          // assistant message once per step — persisted,
                           // re-appended on every replay, and one more chance for
                           // the SDK to open a message of its own to hold it.
                           transient: true,
@@ -1487,7 +1496,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                       } catch (error) {
                         logger.warn(
                           { error, conversationId },
-                          "[ContextWindow] failed to refresh breakdown after tool step",
+                          "[ContextWindow] failed to refresh breakdown after step",
                         );
                       }
                     }
@@ -1667,9 +1676,11 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 const maxOutputTokens = resolveAgentMaxOutputTokens({
                   // Resolved, so an admin-set max-output override on a model
                   // whose provider reports no limit is what the turn asks for.
-                  outputLength: modelRow
-                    ? ModelModel.resolveEffectiveOutputLength(modelRow)
-                    : null,
+                  outputLength:
+                    await LlmProviderApiKeyModelLinkModel.resolveOutputLength(
+                      modelRow,
+                      chatApiKeyId,
+                    ),
                   ceiling: config.chat.maxOutputTokensCeiling,
                   rateMeteredCeiling:
                     config.chat.rateMeteredMaxOutputTokensCeiling,
@@ -2524,9 +2535,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             .object({
               trust: z.string(),
               audience: z.string(),
-              policyRevision: z.number().int().nullable(),
-              // `snapshot` while new sessions keep the policy they open with.
-              newSessionPolicy: NewSessionPolicySchema,
+              policyRevision: z.number().int(),
             })
             .nullable(),
         ),
@@ -2564,15 +2573,11 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         )
       )
         return reply.send(null);
-      const status = await getOpenappaStatus({
-        organizationId,
-        sessionId: id,
-      });
       return reply.send(
-        status && {
-          ...status,
-          newSessionPolicy: deployment.newSessionPolicy,
-        },
+        await getOpenappaStatus({
+          organizationId,
+          sessionId: id,
+        }),
       );
     },
   );
@@ -2934,6 +2939,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
           title: true,
           modelId: true,
           chatApiKeyId: true,
+          modelPoolId: true,
           projectId: true,
           encryptedChat: true,
           thinkingEffort: true,
@@ -2943,6 +2949,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             title: true,
             modelId: true,
             chatApiKeyId: true,
+            modelPoolId: true,
             projectId: true,
             encryptedChat: true,
             thinkingEffort: true,
@@ -2957,6 +2964,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
           title,
           modelId,
           chatApiKeyId,
+          modelPoolId,
           projectId,
           encryptedChat,
           thinkingEffort,
@@ -3010,21 +3018,30 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       // Validate chatApiKeyId if provided
       // Skip validation if it matches the agent's configured key (permission flows through agent access)
-      if (chatApiKeyId && chatApiKeyId !== agent.llmApiKeyId) {
+      if (!modelPoolId && chatApiKeyId && chatApiKeyId !== agent.llmApiKeyId) {
         await validateChatApiKeyAccess(chatApiKeyId, user.id, organizationId);
       }
 
       // Resolve the model via the priority chain:
-      // explicit pick -> member -> agent -> organization -> best available.
+      // pool -> explicit pick -> member -> agent -> organization -> best available.
       // The explicit pick is a (model, key) pair — both are carried so the
       // chosen key is honored instead of being re-derived.
-      const llmSelection = await resolveConversationLlmSelectionForAgent({
-        agent: { llmApiKeyId: agent.llmApiKeyId, modelId: agent.modelId },
-        organizationId,
-        userId: user.id,
-        explicitModelId: modelId,
-        explicitApiKeyId: chatApiKeyId,
-      });
+      const llmSelection = modelPoolId
+        ? {
+            ...(await resolveChatModelPool({
+              organizationId,
+              userId: user.id,
+              modelPoolId,
+            })),
+            selectedModel: null,
+          }
+        : await resolveConversationLlmSelectionForAgent({
+            agent: { llmApiKeyId: agent.llmApiKeyId, modelId: agent.modelId },
+            organizationId,
+            userId: user.id,
+            explicitModelId: modelId,
+            explicitApiKeyId: chatApiKeyId,
+          });
 
       logger.info(
         {
@@ -3068,6 +3085,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
           agentId,
           modelId: llmSelection.modelId,
           chatApiKeyId: llmSelection.chatApiKeyId,
+          modelPoolId: modelPoolId ?? null,
           projectId: projectId ?? null,
           thinkingEffort,
         }),
@@ -3137,10 +3155,30 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // configured key of the agent the conversation will run on after this
       // update (permission flows through agent access) — the new agent when
       // this request switches agents, not the one being left.
+      // Picking a pool stores one of its members as the conversation's key
+      // and model; picking a key or model, or another agent, leaves the pool.
+      if (body.modelPoolId) {
+        const pooled = await resolveChatModelPool({
+          organizationId,
+          userId: user.id,
+          modelPoolId: body.modelPoolId,
+        });
+        body.modelId = pooled.modelId;
+        body.chatApiKeyId = pooled.chatApiKeyId;
+      } else if (
+        body.modelPoolId === undefined &&
+        (body.modelId !== undefined ||
+          body.chatApiKeyId !== undefined ||
+          nextAgent)
+      ) {
+        body.modelPoolId = null;
+      }
+
       const effectiveAgentLlmApiKeyId = nextAgent
         ? nextAgent.llmApiKeyId
         : currentConversation.agent?.llmApiKeyId;
       if (
+        !body.modelPoolId &&
         body.chatApiKeyId &&
         body.chatApiKeyId !== effectiveAgentLlmApiKeyId
       ) {
@@ -3153,6 +3191,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       if (
         nextAgent &&
+        !body.modelPoolId &&
         body.modelId === undefined &&
         body.chatApiKeyId === undefined
       ) {
@@ -3167,6 +3206,13 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
         body.modelId = llmSelection.modelId;
         body.chatApiKeyId = llmSelection.chatApiKeyId;
+        // The new agent's pool comes with its model.
+        if (
+          nextAgent.modelPoolId &&
+          llmSelection.modelId === nextAgent.modelId
+        ) {
+          body.modelPoolId = nextAgent.modelPoolId;
+        }
       }
 
       // A conversation's model and API key are a pair: persist both or
@@ -3588,6 +3634,22 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const conversationModel = conversation.modelId
         ? await ModelModel.findById(conversation.modelId)
         : null;
+      // Media generation is an explicit user action. Never generate a second
+      // image or speech clip merely to name the conversation.
+      const azureTitleCapabilities =
+        conversationModel?.provider === "azure"
+          ? await resolveAzureModelCapabilities({
+              providerApiKeyId: conversation.agent?.llmApiKeyId ?? undefined,
+              modelId: conversationModel.modelId,
+            })
+          : undefined;
+      if (
+        azureTitleCapabilities &&
+        (azureTitleCapabilities.status !== "known" ||
+          azureTitleCapabilities.kind !== "text")
+      ) {
+        return reply.send(conversation);
+      }
       const titleLlm = await resolveAgentLlmOrDefault({
         agent: titleAgent,
         inheritFrom:
@@ -4932,6 +4994,7 @@ async function findScheduleRunConversationForAdmin(params: {
     id: params.conversationId,
     organizationId: params.organizationId,
     tail: params.tail,
+    viewer: { kind: "caller", ...params },
   });
 }
 

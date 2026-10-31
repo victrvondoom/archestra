@@ -219,6 +219,7 @@ function terminalLines(params: {
 const SIGNS_IN_FROM_INSTALLER: ReadonlySet<string> = new Set([
   "claude-code",
   "codex",
+  "kimi-code",
   "opencode",
   "kilo",
 ]);
@@ -228,12 +229,15 @@ const LAUNCHED_BINARIES: Record<string, string> = {
   "claude-code": "claude",
   codex: "codex",
   "copilot-cli": "copilot",
+  "kimi-code": "kimi",
   opencode: "opencode",
   kilo: "kilo",
 };
 
 /** Where the gateway sign-in happens for a client the installer cannot run it for. */
 function signInElsewhere(clientId: string, serverName: string): string {
+  if (clientId === "pi")
+    return `Run pi mcp login ${serverName}, then use the Pi launch command printed in your terminal.`;
   if (clientId === "cursor")
     return `In Cursor, open Customize > MCPs and sign in to "${serverName}".`;
   return "Copilot opens your browser to sign in the first time it uses these tools.";

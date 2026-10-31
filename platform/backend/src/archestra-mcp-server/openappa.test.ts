@@ -163,9 +163,9 @@ describe("OpenAPPA tool execution", () => {
       config.openappa = {
         enabled: true,
         yellEnabled: false,
+        yellForwardingEnabled: false,
         offerSigningSecret: TEST_SIGNING_SECRET,
         postgresMaxConnections: 10,
-        keptAnnotatorHorizonDays: 30,
       };
       vi.spyOn(guardrailsDeployment, "isGuardrailsV2Active").mockResolvedValue(
         true,

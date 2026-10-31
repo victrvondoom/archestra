@@ -1,4 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { Agent } from "node:https";
+import type { Duplex } from "node:stream";
 import {
   buildSlackSlashCommandsForCommand,
   getSlackSlashCommandAction,
@@ -7,7 +9,12 @@ import {
   TimeInMs,
 } from "@archestra/shared";
 import { SocketModeClient } from "@slack/socket-mode";
-import { type Button, type ColorScheme, WebClient } from "@slack/web-api";
+import {
+  type Button,
+  type ColorScheme,
+  WebClient,
+  type WebClientOptions,
+} from "@slack/web-api";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import {
   type AllowedCacheKey,
@@ -59,6 +66,7 @@ import {
 import {
   CHATOPS_ATTACHMENT_LIMITS,
   CHATOPS_THREAD_HISTORY,
+  SLACK_CONNECT_TIMEOUT_MS,
   SLACK_DEFAULT_CONNECTION_MODE,
 } from "./constants";
 import { slackAppFactory } from "./slack-app-factory";
@@ -136,10 +144,10 @@ class SlackProvider implements ChatOpsProvider {
     defaultTtl: 10 * TimeInMs.Minute,
   });
   /**
-   * Reads the channel description on the way to a reply, so it must fail fast:
-   * the default client retries for minutes, holding the reply back.
+   * Optional descriptions and startup acknowledgments must fail fast; the
+   * default client can retry for minutes and hold the final reply back.
    */
-  private descriptionClient: WebClient | null = null;
+  private bestEffortClient: WebClient | null = null;
   /**
    * Set once agents.sessions.setStatus is rejected (an app not yet on the
    * Agent messaging experience), so status updates go straight to the legacy
@@ -226,66 +234,100 @@ class SlackProvider implements ChatOpsProvider {
       return;
     }
 
-    await slackAppFactory.ensureManifestScopes(this.config);
-    const { botToken } = this.config;
-    this.client = new WebClient(botToken);
-    this.descriptionClient = new WebClient(botToken, {
+    const abortController = new AbortController();
+    const deadline = setTimeout(
+      () => abortController.abort(),
+      SLACK_CONNECT_TIMEOUT_MS,
+    );
+    const startupOptions: WebClientOptions = {
       retryConfig: { retries: 0 },
-      timeout: 3 * TimeInMs.Second,
-    });
-
-    // Single raw fetch to auth.test — reads both the JSON body (user/team info)
-    // and the x-oauth-scopes response header (scope validation) in one API call.
-    // The SDK's auth.test() doesn't expose response headers.
+      rejectRateLimitedCalls: true,
+      requestInterceptor: (request) => {
+        request.signal = abortController.signal;
+        return request;
+      },
+    };
     try {
-      const response = await fetch("https://slack.com/api/auth.test", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${botToken}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+      await slackAppFactory.ensureManifestScopes(this.config, startupOptions);
+      abortController.signal.throwIfAborted();
+      const { botToken } = this.config;
+      this.client = new WebClient(botToken, startupOptions);
+      this.bestEffortClient = new WebClient(botToken, {
+        retryConfig: { retries: 0 },
+        rejectRateLimitedCalls: true,
+        timeout: 3 * TimeInMs.Second,
       });
 
-      const body = await response.json();
-      if (!body.ok) {
-        throw new Error(body.error || "auth.test returned ok=false");
+      // Single raw fetch to auth.test — reads both the JSON body (user/team info)
+      // and the x-oauth-scopes response header (scope validation) in one API call.
+      // The SDK's auth.test() doesn't expose response headers.
+      try {
+        const response = await fetch("https://slack.com/api/auth.test", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${botToken}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          signal: abortController.signal,
+        });
+
+        const body = await response.json();
+        if (!body.ok) {
+          throw new Error(body.error || "auth.test returned ok=false");
+        }
+
+        this.botUserId = (body.user_id as string) || null;
+        this.botId = (body.bot_id as string) || null;
+        this.teamId = (body.team_id as string) || null;
+        this.teamName = (body.team as string) || null;
+        // Best-effort: without it the bot simply stops answering to its own name.
+        this.botDisplayName = this.botUserId
+          ? await this.getUserName(this.botUserId)
+          : null;
+        // auth.test's `user` is the bot's username and needs no scope, so a
+        // hand-made app without users:read still reports its real handle.
+        this.botHandle =
+          (this.botUserId
+            ? await this.fetchUserHandle(this.botUserId)
+            : null) ||
+          (body.user as string) ||
+          null;
+        logger.info(
+          {
+            botUserId: this.botUserId,
+            botDisplayName: this.botDisplayName,
+            teamId: this.teamId,
+          },
+          "[SlackProvider] Authenticated successfully",
+        );
+
+        // Check granted scopes from the same response (non-fatal)
+        this.parseGrantedScopes(response.headers.get("x-oauth-scopes"));
+      } catch (error) {
+        logger.error(
+          { error: errorMessage(error) },
+          "[SlackProvider] Failed to authenticate with Slack",
+        );
+        throw error;
       }
 
-      this.botUserId = (body.user_id as string) || null;
-      this.botId = (body.bot_id as string) || null;
-      this.teamId = (body.team_id as string) || null;
-      this.teamName = (body.team as string) || null;
-      // Best-effort: without it the bot simply stops answering to its own name.
-      this.botDisplayName = this.botUserId
-        ? await this.getUserName(this.botUserId)
-        : null;
-      // auth.test's `user` is the bot's username and needs no scope, so a
-      // hand-made app without users:read still reports its real handle.
-      this.botHandle =
-        (this.botUserId ? await this.fetchUserHandle(this.botUserId) : null) ||
-        (body.user as string) ||
-        null;
-      logger.info(
-        {
-          botUserId: this.botUserId,
-          botDisplayName: this.botDisplayName,
-          teamId: this.teamId,
-        },
-        "[SlackProvider] Authenticated successfully",
-      );
-
-      // Check granted scopes from the same response (non-fatal)
-      this.parseGrantedScopes(response.headers.get("x-oauth-scopes"));
+      if (this.isSocketMode()) {
+        await this.startSocketMode(abortController.signal);
+      }
+      abortController.signal.throwIfAborted();
+      this.client = new WebClient(botToken);
     } catch (error) {
-      logger.error(
-        { error: errorMessage(error) },
-        "[SlackProvider] Failed to authenticate with Slack",
+      abortController.abort();
+      await this.cleanup();
+      const hosts = this.isSocketMode()
+        ? "slack.com and wss-primary.slack.com"
+        : "slack.com";
+      throw new Error(
+        `Could not connect to Slack. Check that the platform can reach ${hosts} over HTTPS (port 443), then retry.`,
+        { cause: error },
       );
-      throw error;
-    }
-
-    if (this.isSocketMode()) {
-      await this.startSocketMode();
+    } finally {
+      clearTimeout(deadline);
     }
   }
 
@@ -316,6 +358,7 @@ class SlackProvider implements ChatOpsProvider {
     this.eventHandler = null;
     this.socketDedup.clear();
     this.client = null;
+    this.bestEffortClient = null;
     this.botUserId = null;
     this.botId = null;
     this.botDisplayName = null;
@@ -632,7 +675,8 @@ class SlackProvider implements ChatOpsProvider {
     options: ChatReplyOptions,
     replaceTs?: string,
   ): Promise<string> {
-    if (!this.client) {
+    const client = options.bestEffort ? this.bestEffortClient : this.client;
+    if (!client) {
       throw new Error("SlackProvider not initialized");
     }
 
@@ -699,7 +743,7 @@ class SlackProvider implements ChatOpsProvider {
         options.originalMessage.threadId ?? (firstTs || undefined);
 
       if (i === 0 && replaceTs) {
-        await this.client.chat.update({
+        await client.chat.update({
           channel: options.originalMessage.channelId,
           ts: replaceTs,
           text: fallbackText,
@@ -724,7 +768,7 @@ class SlackProvider implements ChatOpsProvider {
         },
         "[SlackProvider] chat.postMessage (sendReply)",
       );
-      const result = await this.client.chat.postMessage(postArgs);
+      const result = await client.chat.postMessage(postArgs);
       if (i === 0) firstTs = (result.ts as string) || "";
     }
 
@@ -851,6 +895,89 @@ class SlackProvider implements ChatOpsProvider {
       "[SlackProvider] chat.postMessage (addApprovalRequestForm)",
     );
     await this.client.chat.postMessage(postArgs);
+  }
+
+  /** Authenticate only the outbound sender; never open a socket or change the app. */
+  async verifyRuntimeNoticeWorkspace(workspaceId: string): Promise<void> {
+    const identity = await this.runtimeNoticeClient().auth.test();
+    if (identity.team_id !== workspaceId || !identity.bot_id) {
+      throw new Error("Slack runtime notice workspace mismatch");
+    }
+    this.botId = identity.bot_id;
+  }
+
+  /** Generic runtime attention only: no command, prompt, or approval payload. */
+  async postRuntimeAttentionNotice(params: {
+    channelId: string;
+    threadId: string;
+    noticeId: string;
+    runUrl: string;
+  }): Promise<string> {
+    const result = await this.runtimeNoticeClient().chat.postMessage({
+      channel: params.channelId,
+      thread_ts: params.threadId,
+      ...runtimeAttentionContent(params.runUrl, false),
+      metadata: {
+        event_type: "archestra_runtime_attention",
+        event_payload: { notice_id: params.noticeId },
+      },
+      unfurl_links: false,
+      unfurl_media: false,
+      reply_broadcast: false,
+    });
+    if (!result.ts)
+      throw new Error("Slack runtime notice returned no message timestamp");
+    return result.ts;
+  }
+
+  async resolveRuntimeAttentionNotice(params: {
+    channelId: string;
+    messageTs: string;
+    runUrl: string;
+  }): Promise<void> {
+    await this.runtimeNoticeClient().chat.update({
+      channel: params.channelId,
+      ts: params.messageTs,
+      ...runtimeAttentionContent(params.runUrl, true),
+    });
+  }
+
+  /** Recover an uncertain post without blindly creating a second notification. */
+  async findRuntimeAttentionNotice(params: {
+    channelId: string;
+    threadId: string;
+    noticeId: string;
+  }): Promise<string | null> {
+    const client = this.runtimeNoticeClient();
+    let cursor: string | undefined;
+    // Bounded below the delivery lease. If a very long thread cannot be fully
+    // checked, fail safely instead of posting a possible duplicate.
+    for (let page = 0; page < 10; page++) {
+      const result = await client.conversations.replies({
+        channel: params.channelId,
+        ts: params.threadId,
+        cursor,
+        limit: 100,
+        include_all_metadata: true,
+      });
+      const message = result.messages?.find(
+        (message) =>
+          message.bot_id === this.botId &&
+          message.metadata?.event_type === "archestra_runtime_attention" &&
+          (
+            message.metadata?.event_payload as
+              | Record<string, unknown>
+              | undefined
+          )?.notice_id === params.noticeId,
+      );
+      if (message?.ts) return message.ts;
+      cursor = result.response_metadata?.next_cursor || undefined;
+      if (!cursor && !result.has_more) return null;
+      if (!cursor) break;
+    }
+    throw new Error(
+      "Could not finish checking the Slack thread for a runtime notice",
+    );
   }
 
   async updateApprovalRequest(
@@ -1207,7 +1334,7 @@ class SlackProvider implements ChatOpsProvider {
   }
 
   async getChannelDescription(channelId: string): Promise<string | null> {
-    const client = this.descriptionClient ?? this.client;
+    const client = this.bestEffortClient ?? this.client;
     if (!client) return null;
     const cached = this.channelDescriptionCache.get(channelId);
     if (cached !== undefined) return cached || null;
@@ -1746,6 +1873,7 @@ class SlackProvider implements ChatOpsProvider {
           Authorization: `Bearer ${this.config.botToken}`,
           "Content-Type": "application/x-www-form-urlencoded",
         },
+        signal: AbortSignal.timeout(SLACK_CONNECT_TIMEOUT_MS),
       });
       if ((await response.json()).ok) {
         this.parseGrantedScopes(response.headers.get("x-oauth-scopes"));
@@ -1815,6 +1943,19 @@ class SlackProvider implements ChatOpsProvider {
   // ===========================================================================
   // Private Methods
   // ===========================================================================
+
+  private runtimeNoticeClient(): WebClient {
+    if (!this.isConfigured()) {
+      throw new Error("Slack runtime notice provider not initialized");
+    }
+    // The durable task queue owns retries. Bound each call so it cannot outlive
+    // the notice's delivery lease, including rate-limit responses.
+    return new WebClient(this.config.botToken, {
+      retryConfig: { retries: 0 },
+      timeout: 10_000,
+      rejectRateLimitedCalls: true,
+    });
+  }
 
   /** Completed control retries must not stop a later turn or re-mute a resumed thread. */
   private async handleControlEvent(
@@ -2111,7 +2252,7 @@ class SlackProvider implements ChatOpsProvider {
     }
   }
 
-  private async startSocketMode(): Promise<void> {
+  private async startSocketMode(signal: AbortSignal): Promise<void> {
     const appToken = this.config.appLevelToken;
     if (!appToken) {
       logger.error(
@@ -2120,9 +2261,69 @@ class SlackProvider implements ChatOpsProvider {
       return;
     }
 
+    signal.throwIfAborted();
+    let connected = false;
+    let rejectInitial: ((error: Error) => void) | undefined;
+    // An upgraded socket leaves Agent's pool. Retain the initial transports so
+    // cancellation also closes a peer that never sends hello or a close frame.
+    const agent = new Agent();
+    const initialSockets = new Set<Duplex>();
+    const createConnection = agent.createConnection.bind(agent);
+    agent.createConnection = (options, callback) => {
+      const socket = createConnection(options, callback);
+      if (socket) initialSockets.add(socket);
+      return socket;
+    };
     this.socketModeClient = new SocketModeClient({
       appToken,
       autoReconnectEnabled: true,
+      clientOptions: {
+        agent,
+        timeout: SLACK_CONNECT_TIMEOUT_MS,
+        // The SDK reads these public options for each API call. Fail the first
+        // connection promptly; keep its normal retry policy for reconnects.
+        retryConfig: {
+          get retries() {
+            return connected ? 100 : 0;
+          },
+          factor: 1.3,
+        },
+        requestInterceptor: (request) => {
+          if (!connected) {
+            request.signal = signal;
+            // Reject before the SDK starts its Retry-After sleep, which an
+            // AbortSignal cannot cancel. Established sessions keep that retry.
+            request.validateStatus = (status) => status !== 429;
+            // Socket Mode retries recoverable API errors outside WebClient's
+            // retry policy, and a later rejection can escape that retry. End
+            // setup on the first API failure through our cancellation path.
+            const transforms = request.transformResponse;
+            request.transformResponse = [
+              ...(Array.isArray(transforms)
+                ? transforms
+                : transforms
+                  ? [transforms]
+                  : []),
+              (data: unknown) => {
+                if (
+                  data !== null &&
+                  typeof data === "object" &&
+                  "ok" in data &&
+                  data.ok === false
+                ) {
+                  rejectInitial?.(
+                    new Error(
+                      "Slack rejected the initial Socket Mode connection.",
+                    ),
+                  );
+                }
+                return data;
+              },
+            ];
+          }
+          return request;
+        },
+      },
     });
 
     // The SocketModeClient dispatches events as follows (see source):
@@ -2209,15 +2410,36 @@ class SlackProvider implements ChatOpsProvider {
       },
     );
 
+    let onAbort: (() => void) | undefined;
+    let onInitialClose: (() => void) | undefined;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      rejectInitial = reject;
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      // Fail the initial attempt before the SDK's delayed reconnect can start.
+      // initialize() disconnects on rejection; established sessions keep the
+      // SDK's ordinary reconnect listener after this one is removed.
+      onInitialClose = () =>
+        reject(
+          new Error("Slack closed the connection before setup completed."),
+        );
+      this.socketModeClient?.once("close", onInitialClose);
+    });
     try {
-      await this.socketModeClient.start();
+      await Promise.race([this.socketModeClient.start(), cancelled]);
+      connected = true;
       logger.info("[SlackProvider] Socket mode connected");
     } catch (error) {
-      logger.error(
-        { error: errorMessage(error) },
-        "[SlackProvider] Failed to start socket mode",
-      );
+      for (const socket of initialSockets) socket.destroy();
+      agent.destroy();
       throw error;
+    } finally {
+      agent.createConnection = createConnection;
+      initialSockets.clear();
+      rejectInitial = undefined;
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      if (onInitialClose)
+        this.socketModeClient.removeListener("close", onInitialClose);
     }
   }
 
@@ -3221,3 +3443,27 @@ type SlackJoinableChannel = {
   isPrivate: boolean;
   isMember: boolean;
 };
+
+/** Only fixed copy and the ordinary authenticated app URL enter Slack. */
+function runtimeAttentionContent(runUrl: string, resolved: boolean) {
+  const text = resolved
+    ? "Resolved — the runtime no longer needs your input."
+    : "The runtime needs your input.";
+  return {
+    text: `${text} Open run: ${runUrl}`,
+    blocks: [
+      { type: "section" as const, text: { type: "plain_text" as const, text } },
+      {
+        type: "actions" as const,
+        elements: [
+          {
+            type: "button" as const,
+            action_id: "open_runtime_run",
+            text: { type: "plain_text" as const, text: "Open run" },
+            url: runUrl,
+          },
+        ],
+      },
+    ],
+  };
+}

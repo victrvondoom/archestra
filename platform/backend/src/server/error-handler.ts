@@ -12,6 +12,7 @@ import {
   isDbStatementTimeoutError,
 } from "@/database/retry";
 import { ApiError } from "@/types";
+import { FAILED_QUERY_CLIENT_MESSAGE, hasFailedQueryText } from "@/utils/db";
 import { incomingRequestAbortTracker } from "@/utils/incoming-request-abort";
 import { isFetchConnectivityError } from "@/utils/network-errors";
 import { captureServerException } from "./exception-capture";
@@ -27,6 +28,23 @@ export function handleServerError(
   if (incomingRequestAbortTracker.isAbortedError(error)) {
     this.log.info(requestContext, "Client closed the incoming request");
     return reply.status(499).send();
+  }
+
+  // A stream can fail before committing its headers. The error body is JSON,
+  // not the file or range the route originally prepared to send.
+  if (!reply.raw.headersSent) {
+    reply.type("application/json");
+    for (const header of [
+      "content-length",
+      "content-range",
+      "content-encoding",
+      "content-disposition",
+      "accept-ranges",
+      "etag",
+      "last-modified",
+    ]) {
+      reply.removeHeader(header);
+    }
   }
 
   // Handle response serialization errors (when response doesn't match schema)
@@ -302,7 +320,10 @@ export function handleServerError(
 
     return reply.status(statusCode).send({
       error: {
-        message,
+        // A route can build an ApiError from a failed query's message.
+        message: hasFailedQueryText(error)
+          ? FAILED_QUERY_CLIENT_MESSAGE
+          : message,
         type,
         ...(internalCode && { internal_code: internalCode }),
         ...(error.details && { details: error.details }),
@@ -334,7 +355,11 @@ export function handleServerError(
 
   return reply.status(statusCode).send({
     error: {
-      message,
+      // A failed query's message holds its SQL and parameter values. Keep it
+      // in the log and the error report above, not in the response.
+      message: hasFailedQueryText(error)
+        ? FAILED_QUERY_CLIENT_MESSAGE
+        : message,
       type: "api_internal_server_error",
     },
   });

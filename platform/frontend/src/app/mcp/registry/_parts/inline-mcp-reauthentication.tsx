@@ -46,7 +46,6 @@ export function InlineMcpReauthentication({
     environmentValues?: Record<string, string>;
     userConfigValues?: Record<string, string>;
     accessToken?: string;
-    isByosVault?: boolean;
   }) => {
     const updated = await reauthenticate.mutateAsync({
       id: server.id,
@@ -69,6 +68,7 @@ export function InlineMcpReauthentication({
         setOAuthMcpServerId(server.id);
         const { authorizationUrl, state } = await initiateOAuth.mutateAsync({
           catalogId: item.id,
+          serverId: server.id,
         });
         setOAuthState(state);
         setOAuthCatalogId(item.id);
@@ -134,7 +134,6 @@ export function InlineMcpReauthentication({
           updateCredentials({
             environmentValues: result.environmentValues,
             userConfigValues: result.userConfigValues,
-            isByosVault: result.isByosVault,
           })
         }
         catalogItem={item}
@@ -155,7 +154,6 @@ export function InlineMcpReauthentication({
         updateCredentials(
           buildRemoteInstallCredentialPayload({
             metadata: result.metadata,
-            isByosVault: result.isByosVault,
           }),
         )
       }

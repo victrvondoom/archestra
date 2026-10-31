@@ -9,6 +9,12 @@ import { ApiError } from "@/types";
 // Public API
 // ===================================================================
 
+/** Resource APIs have no model with which to disambiguate provider accounts. */
+export type ProviderKeySelection = {
+  requireUnique?: boolean;
+  providerApiKeyId?: string;
+};
+
 /**
  * Validate the provider API keys a credential (virtual key, LLM OAuth client)
  * routes to.
@@ -52,11 +58,12 @@ export function assertValidProviderKeyMappings(
  * Pick which of a credential's mapped provider keys serves a request.
  *
  * `mappings` must already be in preference order. With one key for the
- * provider, that key answers. With several (only possible for providers whose
- * keys are separate endpoints), the first key whose endpoint serves the
- * requested model wins: sending a model to a sibling server that does not host
- * it is a guaranteed upstream 404. When the model is unknown, or no request
- * model exists (model listing), the first key answers.
+ * provider, that key answers. With several (a credential's endpoints of a
+ * self-hosted provider, or every key a user may use), the first key linked to
+ * the requested model wins: a sibling server that does not host it is a
+ * guaranteed upstream 404, and a user's other account may not offer it. When
+ * the model is unknown, or no request model exists (model listing), the first
+ * key answers.
  */
 export async function selectMappedProviderKey<
   T extends { provider: SupportedProvider; providerApiKeyId: string },
@@ -64,16 +71,31 @@ export async function selectMappedProviderKey<
   mappings: T[];
   provider: SupportedProvider;
   modelId?: string | null;
+  selection?: ProviderKeySelection;
 }): Promise<T | undefined> {
   const candidates = params.mappings.filter(
     (mapping) => mapping.provider === params.provider,
   );
   const [first] = candidates;
-  if (
-    candidates.length <= 1 ||
-    !params.modelId ||
-    !providerHasEndpointLocalModels(params.provider)
-  ) {
+  if (params.selection?.providerApiKeyId) {
+    const selected = candidates.find(
+      (candidate) =>
+        candidate.providerApiKeyId === params.selection?.providerApiKeyId,
+    );
+    if (!selected)
+      throw new ApiError(
+        403,
+        "The credential cannot use the selected provider account.",
+      );
+    return selected;
+  }
+  if (params.selection?.requireUnique && candidates.length > 1) {
+    throw new ApiError(
+      400,
+      "Resource requests require an unambiguous provider account. Select an allowed provider-api-key-id.",
+    );
+  }
+  if (candidates.length <= 1 || !params.modelId) {
     return first;
   }
 

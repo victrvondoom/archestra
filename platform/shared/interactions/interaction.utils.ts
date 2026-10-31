@@ -1,7 +1,9 @@
 import { isEncryptedChatUnavailableContent } from "../encrypted-chat-content";
 import type { SupportedProvider } from "../index";
 import AnthropicMessagesInteraction from "./llmProviders/anthropic";
+import AudioInteraction from "./llmProviders/audio";
 import AzureChatCompletionInteraction from "./llmProviders/azure";
+import AzureImagesInteraction from "./llmProviders/azure-images";
 import AzureResponsesInteraction from "./llmProviders/azure-responses";
 import BedrockConverseInteraction from "./llmProviders/bedrock";
 import CerebrasChatCompletionInteraction from "./llmProviders/cerebras";
@@ -14,6 +16,7 @@ import GithubCopilotResponsesInteraction from "./llmProviders/github-copilot-res
 import GroqChatCompletionInteraction from "./llmProviders/groq";
 import JevDecisionsInteraction from "./llmProviders/jev";
 import KimiChatCompletionInteraction from "./llmProviders/kimi";
+import KimiCodeChatCompletionInteraction from "./llmProviders/kimi-code";
 import Microsoft365CopilotChatCompletionInteraction from "./llmProviders/microsoft-365-copilot";
 import MinimaxChatCompletionInteraction from "./llmProviders/minimax";
 import MistralChatCompletionInteraction from "./llmProviders/mistral";
@@ -23,8 +26,10 @@ import OpenAiChatCompletionInteraction from "./llmProviders/openai";
 import OpenAiEmbeddingInteraction from "./llmProviders/openai-embedding";
 import OpenAiResponsesInteraction from "./llmProviders/openai-responses";
 import OpenrouterChatCompletionInteraction from "./llmProviders/openrouter";
+import PassthroughInteraction from "./llmProviders/passthrough";
 import PerplexityChatCompletionInteraction from "./llmProviders/perplexity";
 import PerplexityResponsesInteraction from "./llmProviders/perplexity-responses";
+import RealtimeInteraction from "./llmProviders/realtime";
 import VllmChatCompletionInteraction from "./llmProviders/vllm";
 import XaiChatCompletionInteraction from "./llmProviders/xai";
 import ZhipuaiChatCompletionInteraction from "./llmProviders/zhipuai";
@@ -61,6 +66,7 @@ const interactionFactories: Record<Interaction["type"], InteractionFactory> = {
   "zhipuai:chatCompletions": (i) => new ZhipuaiChatCompletionInteraction(i),
   "deepseek:chatCompletions": (i) => new DeepSeekChatCompletionInteraction(i),
   "kimi:chatCompletions": (i) => new KimiChatCompletionInteraction(i),
+  "kimi-code:chatCompletions": (i) => new KimiCodeChatCompletionInteraction(i),
   "github-copilot:chatCompletions": (i) =>
     new GithubCopilotChatCompletionInteraction(i),
   "github-copilot:responses": (i) => new GithubCopilotResponsesInteraction(i),
@@ -70,6 +76,14 @@ const interactionFactories: Record<Interaction["type"], InteractionFactory> = {
   "xai:chatCompletions": (i) => new XaiChatCompletionInteraction(i),
   "minimax:chatCompletions": (i) => new MinimaxChatCompletionInteraction(i),
   "azure:chatCompletions": (i) => new AzureChatCompletionInteraction(i),
+  "azure:realtime": (i) => new AzureChatCompletionInteraction(i),
+  "azure:images": (i) => new AzureImagesInteraction(i),
+  "openai:images": (i) => new AzureImagesInteraction(i),
+  "openai:passthrough": (i) => new PassthroughInteraction(i),
+  "anthropic:passthrough": (i) => new PassthroughInteraction(i),
+  "openai:realtime": (i) => new RealtimeInteraction(i),
+  "azure:audio": (i) => new AudioInteraction(i),
+  "openai:audio": (i) => new AudioInteraction(i),
   "azure:responses": (i) => new AzureResponsesInteraction(i),
   "jev:decisions": (i) => new JevDecisionsInteraction(i),
 };

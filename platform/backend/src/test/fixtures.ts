@@ -83,7 +83,7 @@ type MakeUserOverrides = Partial<
  * Vitest test extension with fixtures
  * https://vitest.dev/guide/test-context.html#extend-test-context
  */
-interface TestFixtures {
+export interface TestFixtures {
   makeUser: typeof makeUser;
   makeAdmin: typeof makeAdmin;
   makeVirtualApiKey: typeof makeVirtualApiKey;
@@ -973,6 +973,7 @@ async function makeInteraction(
       | "type"
       | "model"
       | "inputTokens"
+      | "inputTokensEstimated"
       | "outputTokens"
       | "cost"
       | "baselineCost"
@@ -984,16 +985,27 @@ async function makeInteraction(
       | "authenticatedAppId"
       | "authenticatedAppName"
       | "billingTeamId"
+      | "attributionLabels"
       | "billingMode"
       | "sessionId"
+      | "sessionSource"
+      | "parentId"
+      | "encryptedChatConversationId"
       | "runId"
       | "cacheReadTokens"
       | "cacheWriteTokens"
+      | "cacheWrite1hTokens"
+      | "baselineModel"
       | "externalAgentId"
       | "userId"
       | "serviceAccountId"
       | "appId"
       | "source"
+      | "providerApiKeyId"
+      | "modelPoolId"
+      | "attempt"
+      | "attemptOutcome"
+      | "failureReason"
       | "createdAt"
     >
   > = {},

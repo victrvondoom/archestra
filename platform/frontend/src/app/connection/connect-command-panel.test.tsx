@@ -1,6 +1,7 @@
 import { archestraApiClient, type SupportedProvider } from "@archestra/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -20,10 +21,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
 import appConfig from "@/lib/config/config";
 import { useConfig, useFeature } from "@/lib/config/config.query";
+import {
+  clientConnectionQueryKey,
+  connectionSetupSeedQueryKey,
+} from "@/lib/connection-approval-query-keys";
 import { useAppName } from "@/lib/hooks/use-app-name";
 import { useOrganization } from "@/lib/organization.query";
+import { originFromHeaders } from "@/lib/request-origin";
+import { markShellSeeded } from "@/lib/shell-deferral";
 import { CONNECT_CLIENTS } from "./clients";
 import { ConnectCommandPanel } from "./connect-command-panel";
+import {
+  getConnectableProviders,
+  resolveConnectionBaseUrl,
+} from "./connection-flow.utils";
+import {
+  type ConnectionSetupInputs,
+  connectionSetupBody,
+  connectionSetupInputsKey,
+  connectionSetupKeyDigest,
+  firstConnectionSetupInputs,
+} from "./connection-setup-payload";
 
 const {
   createSetupMock,
@@ -98,8 +116,8 @@ const { availableKeysMock, createKeyMock, modelsByProviderMock } = vi.hoisted(
 
 vi.mock("@/lib/llm-models.query", () => ({
   useLlmModels: () => ({ data: [] }),
-  useLlmModelsByProvider: () => ({
-    modelsByProvider: modelsByProviderMock(),
+  useLlmModelsByProvider: (params: unknown) => ({
+    modelsByProvider: modelsByProviderMock(params),
   }),
 }));
 
@@ -235,7 +253,10 @@ beforeEach(() => {
     data: [{ provider: "anthropic" }, { provider: "bedrock" }],
   });
   createKeyMock.mockResolvedValue({ id: "key-1" });
-  modelsByProviderMock.mockReturnValue({});
+  modelsByProviderMock.mockReturnValue({
+    openai: [{ id: "gpt-5.5" }],
+    "github-copilot": [{ id: "gpt-4o" }],
+  });
   skillNamesMock.mockReturnValue(
     skillNames([
       { id: "s1", name: "warehouse-postgres" },
@@ -279,6 +300,112 @@ beforeEach(() => {
 });
 
 describe("ConnectCommandPanel", () => {
+  it("prepares the first setup at once when the approval reads came with the document", async () => {
+    // This test is about the debounce itself: use the real interval.
+    restoreTimer();
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("connectRequest=demo&platform=macos") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // The server seeded the request with the document (prefetchShellSeed).
+    markShellSeeded(queryClient);
+    queryClient.setQueryData(clientConnectionQueryKey("demo"), {
+      clientId: "claude-code",
+      platform: "macos",
+      userCode: "ABCD-1234",
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    });
+    render(<ConnectCommandPanel {...renderPanelProps()} />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      ),
+    });
+
+    // No debounce on the first preparation: every input is already here.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(createSetupMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for the lists to settle before the first setup of an unseeded load, and after a changed selection", async () => {
+    // This test is about the debounce itself: use the real interval.
+    restoreTimer();
+    const gateways = [
+      { id: "g1", name: "My Gateway", agentType: "mcp_gateway" as const },
+      { id: "g2", name: "Team Gateway", agentType: "mcp_gateway" as const },
+    ];
+    const view = renderPanel({ mcpGateways: gateways });
+
+    // Without the document's seed the lists land one by one: the first
+    // preparation waits for them to settle.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(createSetupMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(createSetupMock).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <ConnectCommandPanel
+        {...renderPanelProps({ mcpGateways: gateways, mcpGatewayId: "g2" })}
+      />,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(createSetupMock).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(createSetupMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ mcpGatewayId: "g2" }),
+      ),
+    );
+    expect(createSetupMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not report nothing to connect while the gateway list is still loading", async () => {
+    // Nothing else to include: only a gateway could make the setup.
+    skillNamesMock.mockReturnValue(skillNames([]));
+    pluginsMock.mockReturnValue({ data: [], isPending: false });
+    const props = { mcpGateways: [], mcpGatewayId: null, llmProxyId: null };
+    const view = renderPanel({ ...props, mcpGatewaysLoading: true });
+
+    expect(screen.queryByText(/Nothing to connect yet/)).toBeNull();
+
+    view.rerender(
+      <ConnectCommandPanel
+        {...renderPanelProps({ ...props, mcpGatewaysLoading: false })}
+      />,
+    );
+    expect(await screen.findByText(/Nothing to connect yet/)).toBeVisible();
+  });
+
+  it("keeps a prepared approval when the page re-renders with the same setup", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("connectRequest=demo&platform=macos") as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    const view = renderPanel();
+    await waitFor(() => expect(createSetupMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId("approve-connection-progress")).toBeNull(),
+    );
+
+    // A permission read that lands later re-runs the preparation, but the
+    // payload it would send is the same one.
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !("llmVirtualKey" in permissions),
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    view.rerender(<ConnectCommandPanel {...renderPanelProps()} />);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    expect(createSetupMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("approve-connection-progress")).toBeNull();
+  });
+
   it("waits for shared skills before generating an approvable setup", async () => {
     skillNamesMock.mockReturnValue({ data: undefined, isPending: true });
     const view = renderPanel({ client: findClient("cursor") });
@@ -356,6 +483,9 @@ describe("ConnectCommandPanel", () => {
   });
 
   it("keeps the gateway in Desktop downloads while honoring optional exclusions", async () => {
+    const download = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
     availableKeysMock.mockReturnValue({ data: [] });
     createSetupMock.mockResolvedValue({
       id: "desktop-setup",
@@ -376,7 +506,7 @@ describe("ConnectCommandPanel", () => {
       true,
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "Prepare installer" }),
+      screen.getByRole("button", { name: "Download installer" }),
     );
     const link = await screen.findByRole("link", {
       name: "Download installer",
@@ -385,6 +515,8 @@ describe("ConnectCommandPanel", () => {
       "href",
       "https://proxy.example/desktop-installer",
     );
+    expect(download).toHaveBeenCalledTimes(1);
+    download.mockRestore();
     expect(createSetupMock).toHaveBeenCalledWith(
       expect.objectContaining({ clientId: "claude-desktop" }),
     );
@@ -590,7 +722,9 @@ describe("ConnectCommandPanel", () => {
       expect(revertLink).toBeVisible();
       expect(revertLink).toHaveAttribute(
         "href",
-        expect.stringContaining("integrations/claude-desktop#revert"),
+        expect.stringContaining(
+          "integrations/ai-clients/claude-desktop#revert",
+        ),
       );
     } else {
       expect(revertLink).not.toBeInTheDocument();
@@ -1750,17 +1884,96 @@ describe("ConnectCommandPanel", () => {
   });
 
   describe("script client model choice", () => {
+    it.each([
+      "pi",
+      "copilot-cli",
+    ])("defaults %s to available GPT-6.1 and preserves an explicit older choice", async (clientId) => {
+      modelsByProviderMock.mockReturnValue({
+        openai: [
+          { id: "gpt-5.5" },
+          { id: "openai:gpt-6-sol" },
+          { id: "openai:gpt-6.1-sol" },
+        ],
+      });
+      if (clientId === "pi")
+        availableKeysMock.mockReturnValue({
+          data: [{ id: "primary-openai", provider: "openai", isPrimary: true }],
+        });
+      const user = userEvent.setup();
+      renderPanel({ client: findClient(clientId) });
+      await waitFor(() =>
+        expect(createSetupMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ model: "openai:gpt-6.1-sol" }),
+        ),
+      );
+      await user.click(screen.getByTestId("connect-change-model"));
+      await user.click(screen.getByRole("combobox", { name: "Model" }));
+      await user.click(screen.getByRole("option", { name: "gpt-5.5" }));
+      await waitFor(() =>
+        expect(createSetupMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ model: "gpt-5.5" }),
+        ),
+      );
+    });
+
+    it("waits for the bound catalog and rejects an unavailable explicit model", async () => {
+      modelsByProviderMock.mockReturnValue({});
+      availableKeysMock.mockReturnValue({
+        data: [{ id: "primary-openai", provider: "openai", isPrimary: true }],
+      });
+      const user = userEvent.setup();
+      renderPanel({ client: findClient("pi") });
+      expect(screen.getByTestId("connect-command-status")).toBeInTheDocument();
+      expect(createSetupMock).not.toHaveBeenCalled();
+      await user.click(screen.getByTestId("connect-change-model"));
+      fireEvent.change(screen.getByPlaceholderText("Model id"), {
+        target: { value: "explicit-model" },
+      });
+      expect(createSetupMock).not.toHaveBeenCalled();
+      expect(
+        screen.getAllByText(/Choose a model served by your provider/)[0],
+      ).toBeVisible();
+    });
+
+    it("selects only models of Pi's mapped key rather than another visible key", async () => {
+      mapClientProviderKeys({ pi: ["openai"] });
+      availableKeysMock.mockReturnValue({
+        data: [
+          { id: "other-key", provider: "openai", isPrimary: true },
+          { id: "openai-org-key", provider: "openai", isPrimary: false },
+        ],
+      });
+      modelsByProviderMock.mockImplementation(
+        (params: { apiKeyId?: string }) => ({
+          openai:
+            params.apiKeyId === "openai-org-key"
+              ? [{ id: "gpt-4o" }]
+              : [{ id: "gpt-6.1-sol" }],
+        }),
+      );
+      renderPanel({ client: findClient("pi") });
+      await waitFor(() =>
+        expect(createSetupMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ provider: "openai", model: "gpt-4o" }),
+        ),
+      );
+      expect(screen.queryByText("gpt-6.1-sol")).not.toBeInTheDocument();
+    });
+
     it("surfaces the model in the review step and sends it with the setup", async () => {
+      modelsByProviderMock.mockReturnValue({
+        openai: [{ id: "gpt-5.5" }, { id: "gpt-6.1-sol" }],
+      });
       renderPanel({ client: findClient("copilot-cli") });
 
       // first supported provider (OpenAI) → its default model is preselected
-      expect(await screen.findByText("gpt-5.5")).toBeInTheDocument();
+      expect(await screen.findByText("gpt-6.1-sol")).toBeInTheDocument();
       expect(screen.getByTestId("connect-change-model")).toBeInTheDocument();
       await waitFor(() =>
         expect(createSetupMock).toHaveBeenCalledWith(
           expect.objectContaining({
             clientId: "copilot-cli",
-            model: "gpt-5.5",
+            model: "gpt-6.1-sol",
           }),
         ),
       );
@@ -1846,8 +2059,13 @@ describe("ConnectCommandPanel", () => {
       await user.click(screen.getByTestId("connect-change-model"));
       const picker = screen.getByRole("combobox", { name: "Model" });
       await user.click(picker);
-      // Keep the default reachable even when it isn't in the synced catalog.
-      expect(screen.getByRole("option", { name: "gpt-5.5" })).toBeVisible();
+      // Never inject an unavailable default into the synced catalog.
+      expect(
+        screen.queryByRole("option", { name: "gpt-5.5" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("option", { name: "synced-model-0" }),
+      ).toBeVisible();
       const search = screen.getByPlaceholderText("Search models...");
       await user.type(search, "missing-model");
       expect(screen.getByText("No models found.")).toBeVisible();
@@ -2169,4 +2387,348 @@ describe("a setup over a delivery limit on the approval page", () => {
       supportedPlatforms: ["posix"],
     }));
   }
+});
+
+// The server seed prepares the approval page's first setup with the document
+// (see `prepareFirstSetup`). It must send what the page itself would send
+// first, or the page prepares a second one: one setup per load either way.
+describe("first approval setup, as the server seed prepares it", () => {
+  const REQUEST_ID = "c".repeat(48);
+  const ADMIN_GATEWAY = "11111111-1111-4111-8111-111111111111";
+  const DEFAULT_GATEWAY = "22222222-2222-4222-8222-222222222222";
+  const roles = {
+    admin: {
+      permissions: {
+        mcpGateway: ["read"],
+        llmProxy: ["read"],
+        skill: ["read"],
+        llmVirtualKey: ["create"],
+      },
+      scoped: [
+        { resource: "plugin", action: "read", scope: "*" },
+        { resource: "plugin", action: "update", scope: "*" },
+      ],
+    },
+    member: {
+      permissions: {
+        mcpGateway: ["read"],
+        llmProxy: ["read"],
+        skill: ["read"],
+        llmVirtualKey: ["create"],
+      },
+      scoped: [],
+    },
+  } as const;
+  const organization = {
+    connectionDefaultMcpGatewayId: ADMIN_GATEWAY,
+    connectionSkillsEnabled: true,
+    connectionLlmProxyEnabled: true,
+    connectionPluginsEnabled: true,
+    connectionClientProviderKeys: null,
+    connectionDefaultClientId: "opencode",
+    connectionShownClientIds: null,
+    modelProviderOverrides: null,
+  };
+  const keys = [
+    {
+      id: "key-2",
+      provider: "openai",
+      isPrimary: true,
+      baseUrl: "http://stub.example/v1",
+      requiresReauthentication: false,
+    },
+    { id: "key-1", provider: "anthropic", isPrimary: false, baseUrl: null },
+  ];
+  const skills = [
+    { id: "s2", name: "second" },
+    { id: "s1", name: "first" },
+  ];
+  const plugins = [
+    {
+      id: "pl-2",
+      displayName: "Two",
+      pluginSlug: "two",
+      clientType: "claude-code",
+      enabled: true,
+      contentHash: "h",
+      approvedContentHash: "h",
+      supportedPlatforms: ["posix", "windows"],
+    },
+    {
+      id: "pl-1",
+      displayName: "One",
+      pluginSlug: "one",
+      clientType: "claude-code",
+      enabled: true,
+      contentHash: "h",
+      approvedContentHash: "h",
+      supportedPlatforms: ["posix"],
+    },
+  ];
+  const gateways = [
+    { id: DEFAULT_GATEWAY, name: "My Gateway", agentType: "mcp_gateway" },
+    { id: ADMIN_GATEWAY, name: "Shared Gateway", agentType: "mcp_gateway" },
+  ] as const;
+
+  it.each(
+    (["opencode", "claude-code", "pi"] as const).flatMap((clientId) =>
+      (["admin", "member"] as const).flatMap((role) =>
+        [false, true].map((configuredBaseUrls) => ({
+          clientId,
+          role,
+          configuredBaseUrls,
+        })),
+      ),
+    ),
+  )("prepares a valid first payload: $clientId, $role, configured base URLs $configuredBaseUrls", async ({
+    clientId,
+    role,
+    configuredBaseUrls,
+  }) => {
+    const grants = roles[role];
+    vi.mocked(useHasPermissions).mockImplementation(
+      (wanted, scope) =>
+        ({
+          data: Object.entries(wanted).every(([resource, actions]) =>
+            (actions ?? []).every((action) =>
+              scope !== undefined && resource === "plugin"
+                ? grants.scoped.some(
+                    (g) => g.resource === resource && g.action === action,
+                  )
+                : (
+                    (grants.permissions as Record<string, readonly string[]>)[
+                      resource
+                    ] ?? []
+                  ).includes(action),
+            ),
+          ),
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useOrganization).mockReturnValue({
+      data: organization,
+    } as unknown as ReturnType<typeof useOrganization>);
+    availableKeysMock.mockReturnValue({ data: keys, isPending: false });
+    skillNamesMock.mockReturnValue(skillNames(skills));
+    pluginsMock.mockImplementation((enabled?: boolean) => ({
+      data: enabled ? plugins : undefined,
+      isPending: false,
+    }));
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams(
+        `clientId=${clientId}&platform=linux&connectRequest=${REQUEST_ID}`,
+      ) as ReturnType<typeof useSearchParams>,
+    );
+    // An admin-curated entry for the page's own URL, marked as the default.
+    const metadata = configuredBaseUrls
+      ? [
+          {
+            url: `${window.location.origin}/v1`,
+            description: "This deployment",
+            isDefault: true,
+            visible: true,
+          },
+        ]
+      : null;
+    // The browser's base URL (useConnectionBaseUrl), and the server's from
+    // the document's Host header, where the browser has window.location.
+    const browserBaseUrl = resolveConnectionBaseUrl({
+      externalProxyUrls: appConfig.api.externalProxyUrls,
+      internalProxyUrl: appConfig.api.internalProxyUrl,
+      metadata,
+    });
+    const origin = originFromHeaders({
+      get: (name) => (name === "host" ? window.location.host : null),
+    });
+    const serverBaseUrl = resolveConnectionBaseUrl({
+      externalProxyUrls: [`${origin}/v1`],
+      internalProxyUrl: appConfig.api.internalProxyUrl,
+      metadata,
+    });
+    expect(serverBaseUrl).toBe(browserBaseUrl);
+
+    const models = [{ provider: "openai" as const, id: "openai:gpt-6.1-sol" }];
+    modelsByProviderMock.mockReturnValue({ openai: models });
+    const client = findClient(clientId);
+    const serverInputs = firstConnectionSetupInputs({
+      client,
+      requestedPlatform: "linux",
+      baseUrl: serverBaseUrl,
+      urlGatewayId: null,
+      urlProviderId: null,
+      organization,
+      shownProviders: getConnectableProviders(organization),
+      permissions: grants.permissions as never,
+      scopedCapabilities: [...grants.scoped],
+      request: { exclude: null, gateway: null, plugins: null },
+      defaultGatewayId: DEFAULT_GATEWAY,
+      gateways: [...gateways],
+      llmProxyId: "p1",
+      skillNames: { data: skills, total: skills.length },
+      plugins: plugins as never,
+      availableKeys: keys,
+      models,
+    });
+    if (clientId === "pi") expect(serverInputs).toBeNull();
+    else expect(serverInputs).not.toBeNull();
+
+    renderPanel({
+      client,
+      mcpGateways: [...gateways],
+      // ConnectionFlow's choice: the admin default before the member's own.
+      mcpGatewayId: ADMIN_GATEWAY,
+      llmProxyId: "p1",
+      shownProviders: getConnectableProviders(organization),
+      baseUrl: browserBaseUrl,
+      skillsEnabled: true,
+      pluginsEnabled: clientId !== "pi",
+    });
+
+    await waitFor(() => expect(createSetupMock).toHaveBeenCalledTimes(1));
+    if (clientId === "pi") {
+      expect(createSetupMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "openai",
+          model: "openai:gpt-6.1-sol",
+        }),
+      );
+      return;
+    }
+    const serverKey = connectionSetupInputsKey(
+      serverInputs as ConnectionSetupInputs,
+    );
+    expect(createSetupMock.mock.calls[0][0]).toEqual(
+      connectionSetupBody(serverKey),
+    );
+    // The page matches the seeded setup by the key's digest: the digest of
+    // the payload it sent equals the server's.
+    const browserKey = connectionSetupInputsKey({
+      ...(serverInputs as ConnectionSetupInputs),
+      ...keyFields(createSetupMock.mock.calls[0][0]),
+    });
+    expect(connectionSetupKeyDigest(browserKey)).toBe(
+      connectionSetupKeyDigest(serverKey),
+    );
+  });
+
+  it("takes a setup the server prepared for its first payload, and prepares none", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams(
+        `clientId=claude-code&platform=macos&connectRequest=${REQUEST_ID}`,
+      ) as ReturnType<typeof useSearchParams>,
+    );
+    // Learn the page's first payload key from one load.
+    renderPanel();
+    await waitFor(() => expect(createSetupMock).toHaveBeenCalledTimes(1));
+    const body = createSetupMock.mock.calls[0][0];
+    const inputsKey = connectionSetupInputsKey({
+      clientId: body.clientId,
+      platform: body.platform,
+      baseUrl: body.baseUrl,
+      gatewayId: body.mcpGatewayId ?? null,
+      proxyId: body.llmProxyId ?? null,
+      provider: body.provider ?? null,
+      proxyAuth: body.proxyAuth ?? null,
+      primaryKeyIds: null,
+      model: body.model ?? null,
+      skillIds: body.skills?.skillIds ?? null,
+      pluginIds: body.pluginIds ?? null,
+    });
+    cleanup();
+    createSetupMock.mockClear();
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    markShellSeeded(queryClient);
+    queryClient.setQueryData(connectionSetupSeedQueryKey(REQUEST_ID), {
+      keyDigest: connectionSetupKeyDigest(inputsKey),
+      id: "server-setup",
+      creditWarning: { kind: "insufficient_balance", keyName: "Anthropic" },
+    });
+    render(<ConnectCommandPanel {...renderPanelProps()} />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      ),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(createSetupMock).not.toHaveBeenCalled();
+    // The seeded setup stands in for the page's own: its warning shows and
+    // the status reads ready. It is taken once, so it leaves the cache.
+    expect(screen.getByTestId("connection-credit-warning")).toBeVisible();
+    expect(screen.getByTestId("connect-command-status")).toHaveTextContent(
+      "Setup command ready",
+    );
+    expect(
+      queryClient.getQueryData(connectionSetupSeedQueryKey(REQUEST_ID)),
+    ).toBeUndefined();
+  });
+
+  it("prepares its own setup when the seeded one is not from this document's render", async () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams(
+        `clientId=claude-code&platform=macos&connectRequest=${REQUEST_ID}`,
+      ) as ReturnType<typeof useSearchParams>,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // A seed left from an earlier document of this URL: not this render's.
+    queryClient.setQueryData(connectionSetupSeedQueryKey(REQUEST_ID), {
+      keyDigest: "0123456789abcdef",
+      id: "old-setup",
+    });
+    render(<ConnectCommandPanel {...renderPanelProps()} />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      ),
+    });
+
+    await waitFor(() => expect(createSetupMock).toHaveBeenCalledTimes(1));
+  });
+});
+
+/** The payload fields a setup body carries, as the page's key names them. */
+function keyFields(body: {
+  clientId: string;
+  platform?: string;
+  baseUrl: string;
+  mcpGatewayId?: string;
+  llmProxyId?: string;
+  provider?: string;
+  proxyAuth?: string;
+  model?: string;
+  skills?: { skillIds?: string[] };
+  pluginIds?: string[];
+}): Partial<ConnectionSetupInputs> {
+  return {
+    clientId: body.clientId as ConnectionSetupInputs["clientId"],
+    platform: body.platform as ConnectionSetupInputs["platform"],
+    baseUrl: body.baseUrl,
+    gatewayId: body.mcpGatewayId ?? null,
+    proxyId: body.llmProxyId ?? null,
+    proxyAuth: (body.proxyAuth ?? null) as ConnectionSetupInputs["proxyAuth"],
+    model: body.model ?? null,
+    skillIds: body.skills?.skillIds ?? null,
+    pluginIds: body.pluginIds ?? null,
+  };
+}
+
+describe("connectionSetupKeyDigest", () => {
+  it("is stable for a key and differs when one selected skill differs", () => {
+    const ids = Array.from({ length: 1100 }, (_, i) => `skill-${i}`);
+    const key = JSON.stringify({ skillIds: ids });
+    expect(connectionSetupKeyDigest(key)).toBe(connectionSetupKeyDigest(key));
+    expect(connectionSetupKeyDigest(key)).toMatch(/^[0-9a-f]{16}$/);
+    expect(
+      connectionSetupKeyDigest(
+        JSON.stringify({ skillIds: [...ids.slice(0, -1), "skill-x"] }),
+      ),
+    ).not.toBe(connectionSetupKeyDigest(key));
+  });
 });

@@ -1,11 +1,21 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { RouteId, RUN_ID_HEADER, SOURCE_HEADER } from "@archestra/shared";
+import {
+  isAgentTool,
+  isSkillTool,
+  RouteId,
+  RUN_ID_HEADER,
+  SOURCE_HEADER,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+} from "@archestra/shared";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 
+import { archestraMcpBranding } from "@/archestra-mcp-server";
 import { RequestLookups } from "@/auth/request-lookups";
+import { requestScope } from "@/auth/request-scope";
+import { internalCallProvenance } from "@/clients/internal-call";
 import type { TokenAuthContext } from "@/clients/mcp-client";
 import config from "@/config";
 import logger from "@/logging";
@@ -17,6 +27,7 @@ import {
   openappaEnabled,
   sessionFromHeaders,
 } from "@/openappa/service";
+import { llmProxyTiming } from "@/server/llm-proxy-timing";
 import {
   RUNTIME_BINDING_HEADER,
   resolveGatewayRuntimeSession,
@@ -575,10 +586,12 @@ async function handleMcpPostRequest(
     }
 
     ensureRequestSocketDestroySoon(request.raw);
-    await transport.handleRequest(
-      request.raw as IncomingMessage,
-      reply.raw as ServerResponse,
-      body,
+    await llmProxyTiming.hijacked(reply, () =>
+      transport.handleRequest(
+        request.raw as IncomingMessage,
+        reply.raw as ServerResponse,
+        body,
+      ),
     );
 
     fastify.log.trace({ profileId }, "Transport.handleRequest completed");
@@ -959,6 +972,13 @@ const mcpGatewayRoutes: FastifyPluginAsyncZod<{
         };
       }
 
+      // Authentication and the tool call's own access checks resolve the same
+      // caller. A request that cannot change roles, teams or gateway settings
+      // shares those answers for its lifetime, and reads the gateway's
+      // configuration from the notify-invalidated cache other calls filled.
+      const readOnly = sharesCallerLookups(request.body);
+      requestScope.enter({ memoize: readOnly, sharesConfig: readOnly });
+
       // Each stateless POST builds its server from scratch; these lookups let
       // authentication and every tools/list helper share one caller and agent
       // resolution for this request only.
@@ -1309,11 +1329,13 @@ const mcpGatewayRoutes: FastifyPluginAsyncZod<{
 };
 
 /**
- * Who sent a gateway request: the built-in chat's loopback client marks
- * itself; everything else is an outside agent.
+ * Only the built-in client can attest that a gateway request came from chat.
  */
 function gatewayCallSource(request: FastifyRequest): McpGatewayCallSource {
-  return readHeader(request, SOURCE_HEADER) === "chat" ? "chat" : "api";
+  return readHeader(request, SOURCE_HEADER) === "chat" &&
+    internalCallProvenance(request).inProcess
+    ? "chat"
+    : "api";
 }
 
 function readHeader(request: FastifyRequest, name: string): string | undefined {
@@ -1406,3 +1428,32 @@ function runtimeTokenMatchesRun(params: {
 }
 
 export default mcpGatewayRoutes;
+
+/**
+ * A listing, or a call to a tool of a connected MCP server, never writes the
+ * caller's roles or teams. The built-in tool search only reads metadata and
+ * can share those lookups too. Other built-in tools and delegations to agents
+ * or skills can write them, so their requests read every answer fresh.
+ */
+function sharesCallerLookups(body: unknown): boolean {
+  const { method, params } = (body ?? {}) as {
+    method?: unknown;
+    params?: { name?: unknown };
+  };
+  if (method === "tools/list") return true;
+  const name = params?.name;
+  if (
+    method === "tools/call" &&
+    typeof name === "string" &&
+    archestraMcpBranding.getToolShortName(name) === TOOL_SEARCH_TOOLS_SHORT_NAME
+  ) {
+    return true;
+  }
+  return (
+    method === "tools/call" &&
+    typeof name === "string" &&
+    !archestraMcpBranding.isToolName(name) &&
+    !isAgentTool(name) &&
+    !isSkillTool(name)
+  );
+}

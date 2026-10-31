@@ -6,7 +6,7 @@ import {
 } from "drizzle-zod";
 import { z } from "zod";
 import { schema } from "@/database";
-import { A2ATaskStateSchema } from "./a2a-task";
+import { A2ATaskFailureSchema, A2ATaskStateSchema } from "./a2a-task";
 
 /**
  * Runtime backends an Agent Runtime configuration can name. The enum is the
@@ -55,17 +55,58 @@ export type AgentRunAttentionState = z.infer<
 export const AgentRuntimeSteerModeSchema = z.enum(["pipe", "tmux_keys"]);
 export type AgentRuntimeSteerMode = z.infer<typeof AgentRuntimeSteerModeSchema>;
 
+/**
+ * The container resources of one run: its tier's size (see
+ * `services/agent-runtime/runtime-tiers.ts`). No CPU limit by default
+ * (matching the MCP server runtime): throttling an agent loop mid-turn
+ * produces confusing timeouts rather than back-pressure.
+ */
 export const AgentRuntimeResourcesSchema = z.object({
   cpuRequest: z.string().optional(),
   memoryRequest: z.string().optional(),
-  /**
-   * No CPU limit by default (matching the MCP server runtime): throttling an
-   * agent loop mid-turn produces confusing timeouts rather than back-pressure.
-   */
   cpuLimit: z.string().optional(),
   memoryLimit: z.string().optional(),
 });
 export type AgentRuntimeResources = z.infer<typeof AgentRuntimeResourcesSchema>;
+
+/**
+ * Runtime tiers: the fixed CPU and memory sizes a run can get. An Agent names
+ * the tier its runs get by default; a caller may ask for a tier at or below it.
+ * The sizes live in `services/agent-runtime/runtime-tiers.ts`.
+ */
+export const AgentRuntimeTierSchema = z.enum(["S", "M", "L"]);
+export type AgentRuntimeTier = z.infer<typeof AgentRuntimeTierSchema>;
+
+/** Limits a caller asks for one run. Each must stay within the Agent's own. */
+export const AgentRunLimitsRequestSchema = z.object({
+  tier: AgentRuntimeTierSchema.optional(),
+  idleTimeoutMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 60)
+    .optional(),
+  maxDurationHours: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 30)
+    .optional(),
+  maxCostUsd: z.number().int().min(1).max(100_000).optional(),
+});
+export type AgentRunLimitsRequest = z.infer<typeof AgentRunLimitsRequestSchema>;
+
+/**
+ * What a run got: the tier it runs at (null only on a run recorded before
+ * every run had one), and its idle, duration and spend limits.
+ */
+export const AgentRunLimitsSchema = z.object({
+  tier: AgentRuntimeTierSchema.nullable(),
+  idleTimeoutMinutes: z.number().int().min(1),
+  maxDurationHours: z.number().int().min(1),
+  maxCostUsd: z.number().int().min(1).nullable(),
+});
+export type AgentRunLimits = z.infer<typeof AgentRunLimitsSchema>;
 
 /** Where a detached run delivers its terminal result. */
 export const AgentRunCompletionTargetSchema = z.discriminatedUnion("type", [
@@ -78,6 +119,8 @@ export const AgentRunCompletionTargetSchema = z.discriminatedUnion("type", [
      * (not the main Slack app) posts the result.
      */
     pinnedAgentId: z.string().uuid().optional(),
+    /** Jira service fallback shares an actor, but never a requester workspace. */
+    jiraRequesterAccountId: z.string().min(1).max(256).optional(),
     conversationReference: z.record(z.string(), z.unknown()).optional(),
     /** Placeholder and mute state belong to this turn, not later UI continuations. */
     originatingTaskId: z.string().uuid().optional(),
@@ -221,7 +264,17 @@ export const AgentRuntimeSchema = z.object({
   backend: AgentRuntimeBackendSchema,
   steerMode: AgentRuntimeSteerModeSchema,
   privileged: z.boolean(),
-  resources: AgentRuntimeResourcesSchema.nullable(),
+  /**
+   * The tier of a run's container, S, M or L: the default tier of the Agent's
+   * runs. Absent means M. Administrators size the tiers for the organization.
+   */
+  tier: AgentRuntimeTierSchema.nullable().optional(),
+  /**
+   * Largest tier a caller may ask for when it starts a run, so a run can move
+   * its work to a larger run of the same Agent. Absent means the Agent's
+   * tier; a value below it counts as the Agent's tier.
+   */
+  maxTier: AgentRuntimeTierSchema.nullable().optional(),
   /** Container ports users can forward from an active workspace. */
   ports: z.array(z.number().int().min(1).max(65_535)).max(20).optional(),
   environment: z.array(AgentRuntimeEnvironmentEntrySchema).nullable(),
@@ -280,6 +333,8 @@ export const SelectAgentRunRecordSchema = createSelectSchema(
   actorKind: AgentRunActorKindSchema,
   attentionState: z.union([AgentRunAttentionStateSchema, z.null()]),
   completionTarget: AgentRunCompletionTargetSchema.nullable(),
+  /** Null on runs that started before limits were recorded. */
+  runtimeLimits: AgentRunLimitsSchema.nullable(),
 });
 export const InsertAgentRunRecordSchema = createInsertSchema(
   schema.agentRunsTable,
@@ -291,8 +346,20 @@ export const InsertAgentRunRecordSchema = createInsertSchema(
       .union([AgentRunAttentionStateSchema, z.null()])
       .optional(),
     completionTarget: AgentRunCompletionTargetSchema.nullable().optional(),
+    runtimeLimits: AgentRunLimitsSchema.nullable().optional(),
   })
   .omit({ id: true, startedAt: true, endedAt: true });
+
+/**
+ * Why a FAILED run failed, in machine-readable form. `code` comes from the
+ * vocabulary in `services/agent-runtime/run-failure.ts` (or `image.<code>` for
+ * an image-owned envelope); `retriable` says whether a new run of the same
+ * Agent is likely to succeed unchanged; `message` repeats `statusReason`.
+ */
+export const AgentRunFailureSchema = A2ATaskFailureSchema.extend({
+  message: z.string(),
+});
+export type AgentRunFailure = z.infer<typeof AgentRunFailureSchema>;
 
 export const SelectAgentRunSchema = SelectAgentRunRecordSchema.omit({
   logs: true,
@@ -303,6 +370,8 @@ export const SelectAgentRunSchema = SelectAgentRunRecordSchema.omit({
 }).extend({
   state: A2ATaskStateSchema,
   statusReason: z.string().nullable(),
+  /** Null unless the run FAILED and its failure was classified. */
+  failure: AgentRunFailureSchema.nullable(),
   stateChangedAt: z.date().nullable(),
   /** Effective Kubernetes lifetime limit, resolved for this run. */
   hardDeadlineAt: z.date(),
@@ -313,6 +382,7 @@ export const SelectAgentRunSchema = SelectAgentRunRecordSchema.omit({
 /** Run metadata shown to Agent managers alongside the runtime state. */
 export const SelectAgentRunListItemSchema = SelectAgentRunSchema.extend({
   initiatorName: z.string().nullable(),
+  canAttach: z.boolean().optional(),
   /** Who the run is shared with, derived from its permission policy. */
   shareVisibility: z.union([
     z.enum(["organization", "team", "user"]),
@@ -331,6 +401,11 @@ export const SelectAgentRunListItemSchema = SelectAgentRunSchema.extend({
 /** A user's durable run session as rendered in Chat and its sidebar. */
 export const SelectAgentRunSessionSchema = SelectAgentRunSchema.extend({
   sessionId: z.string().uuid(),
+  llmSessionId: z
+    .string()
+    .describe(
+      "Key of the run's LLM logs (/llm/logs/:id): the session id its runtime sends",
+    ),
   prompt: z.string(),
   agent: z.object({
     id: z.string().uuid(),
@@ -343,8 +418,8 @@ export const SelectAgentRunSessionSchema = SelectAgentRunSchema.extend({
 
 /**
  * How the requesting user relates to a run they're allowed to open.
- * `owner` started it and may attach interactively; `shared` was granted a
- * read-only view through a share and may only stream its logs.
+ * `owner` started it; `shared` is not its owner. Terminal access is conveyed
+ * separately by `canAttach`, including managers of an owning service account.
  */
 export const AgentRunViewerRoleSchema = z.enum(["owner", "shared"]);
 
@@ -379,6 +454,7 @@ export const GetAgentRunResponseSchema = AgentRunSessionResponseSchema.extend({
     .nullable()
     .optional(),
   viewerRole: AgentRunViewerRoleSchema,
+  canAttach: z.boolean().optional(),
   /** Present on the detail endpoint while an owned run is starting. */
   startupProgress: AgentRunStartupProgressSchema.nullable().optional(),
 });
@@ -405,6 +481,8 @@ export const StartAgentRunResponseSchema = z.object({
   prompt: z.string(),
   projectId: z.string().uuid().nullable(),
   createdAt: z.date(),
+  /** The tier and limits the run got, within the Agent's own; null for a continuation of a run that recorded none. */
+  limits: AgentRunLimitsSchema.nullable(),
 });
 
 export type AgentRunRecord = z.infer<typeof SelectAgentRunRecordSchema>;

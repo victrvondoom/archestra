@@ -8,6 +8,7 @@ type PeriodicTaskDefinition = {
 };
 
 const PERIODIC_TASK_DEFINITIONS: PeriodicTaskDefinition[] = [
+  { taskType: "jira_chatops_poll", intervalSeconds: 60, payload: {} },
   {
     taskType: "interaction_user_activity_rebuild",
     intervalSeconds: 30,
@@ -63,6 +64,13 @@ const PERIODIC_TASK_DEFINITIONS: PeriodicTaskDefinition[] = [
   // read, so this tick is what keeps the catalog current.
   { taskType: "llm_model_sync", intervalSeconds: 60, payload: {} },
   { taskType: "audit_log_cleanup", intervalSeconds: 86400, payload: {} },
+  // Hourly so a busy deployment's backlog drains within the per-tick batch cap.
+  { taskType: "headless_sandbox_cleanup", intervalSeconds: 3600, payload: {} },
+  // Enqueues an auto-routing plan fit per organization whose settings changed
+  // since its last fit, or whose last fit is a day old, and purges routing
+  // history past retention once a day. The minute tick bounds how long a
+  // settings change or a lost publication race waits for its re-plan.
+  { taskType: "auto_routing_dispatch", intervalSeconds: 60, payload: {} },
   // Rebuilds the portable BM25 corpus statistics (document frequency, chunk
   // count, mean chunk length) the keyword ranker scores from. A read-only
   // scan of kb_chunks, and a long interval is safe: stale statistics shift
@@ -124,6 +132,24 @@ const PERIODIC_TASK_DEFINITIONS: PeriodicTaskDefinition[] = [
   {
     taskType: "interaction_session_preview_backfill",
     intervalSeconds: 60,
+    payload: {},
+  },
+  // Resumes model cost backfills (recomputing recorded costs after a price
+  // change) whose run ran out of time or whose worker died. One read of a
+  // tiny table when none are active.
+  {
+    taskType: "check_due_model_cost_backfills",
+    intervalSeconds: 30,
+    payload: {},
+  },
+  // Records each MCP installation's own tool descriptions for installations
+  // that predate them (or never synced since), so callers stop being served
+  // another installation's text. A tick rather than a boot-only run, so an
+  // installation that was unreachable or asleep is retried later. One empty
+  // read once complete.
+  {
+    taskType: "mcp_tool_description_backfill",
+    intervalSeconds: 1800,
     payload: {},
   },
 ];

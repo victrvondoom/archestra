@@ -91,6 +91,16 @@ vi.mock("@/lib/agent-options.query", () => ({
   },
 }));
 
+vi.mock("@/lib/agent-runtime-templates.query", () => ({
+  useRuntimeTemplateCatalog: () => ({
+    data: [],
+    isFetching: false,
+    isPending: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useResolveRuntimeTemplate: () => ({ isPending: false, mutate: vi.fn() }),
+}));
 vi.mock("next/navigation");
 
 const {
@@ -206,7 +216,6 @@ const {
   ),
   useAgentRuntimePreflightMock: vi.fn(() => ({ data: undefined })),
   useOrganizationDefaultModelMock: vi.fn(() => ({
-    isSet: false,
     model: null,
     label: null,
   })),
@@ -1156,6 +1165,7 @@ const baseAgent = {
   llmApiKeyId: null,
   llmModel: null,
   modelId: null,
+  modelPoolId: null,
   identityProviderId: null,
   environmentId: null,
   builtInAgentConfig: null,
@@ -2869,7 +2879,6 @@ describe("AgentForm save payload and failure handling", () => {
     useLlmModelsByProviderMock.mockReturnValue({ modelsByProvider: {} });
     useAgentRuntimePreflightMock.mockReturnValue({ data: undefined });
     useOrganizationDefaultModelMock.mockReturnValue({
-      isSet: false,
       model: null,
       label: null,
     });
@@ -3033,6 +3042,47 @@ describe("AgentForm save payload and failure handling", () => {
     });
   });
 
+  it("keeps saved runtime settings read-only without Configure runtime", () => {
+    vi.mocked(useFeature).mockImplementation((flag) => flag === "agentRuntime");
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.agent?.includes("configure-runtime"),
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    render(
+      <AgentForm agentType="agent" agent={baseAgent} activeSection="runtime" />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Enable runtime" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(/Configure runtime permission is required/),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the saved runtime when an ordinary editor changes an agent name", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.agent?.includes("configure-runtime"),
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    const runtime = {
+      ...defaultAgentRuntime(),
+      image: "example.test/worker:v1",
+    };
+    render(<AgentForm agentType="agent" agent={{ ...baseAgent, runtime }} />);
+    await user.type(
+      await screen.findByDisplayValue("Existing Agent"),
+      " renamed",
+    );
+    await user.click(screen.getByRole("button", { name: /update/i }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled());
+    expect(updateAgent.mock.calls[0][0].data).not.toHaveProperty("runtime");
+  });
+
   it("hides existing runtime settings when another form panel is active", () => {
     vi.mocked(useFeature).mockImplementation((flag) => flag === "agentRuntime");
     const { rerender } = render(
@@ -3042,10 +3092,8 @@ describe("AgentForm save payload and failure handling", () => {
         activeSection="configuration"
       />,
     );
-    // The runtime fields render their own sections, so the panel is the
-    // wrapper directly around them.
     const runtimePanel = () =>
-      screen.getByTestId("agent-runtime").parentElement;
+      screen.getByTestId("agent-runtime").closest("fieldset")?.parentElement;
     expect(runtimePanel()).toHaveClass("hidden");
     rerender(
       <AgentForm agentType="agent" agent={baseAgent} activeSection="runtime" />,
@@ -3283,7 +3331,6 @@ describe("AgentForm save payload and failure handling", () => {
       backend: "kubernetes" as const,
       steerMode: "pipe" as const,
       privileged: false,
-      resources: null,
       environment: null,
       credentials: null,
       ttlHours: null,
@@ -3415,7 +3462,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3475,7 +3521,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3544,7 +3589,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3602,7 +3646,6 @@ describe("AgentForm save payload and failure handling", () => {
 
   it("blocks an Anthropic runtime when the inherited organization model is Gemini", async () => {
     useOrganizationDefaultModelMock.mockReturnValue({
-      isSet: true,
       label: "Google · Gemini 2.5 Pro",
       model: {
         dbId: "gemini-default",
@@ -3628,7 +3671,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3677,7 +3719,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3724,7 +3765,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3783,7 +3823,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -3945,7 +3984,6 @@ describe("AgentForm save payload and failure handling", () => {
       backend: "kubernetes" as const,
       steerMode: "pipe" as const,
       privileged: false,
-      resources: null,
       environment: null,
       credentials: null,
       ttlHours: null,
@@ -3995,7 +4033,6 @@ describe("AgentForm save payload and failure handling", () => {
       backend: "kubernetes" as const,
       steerMode: "pipe" as const,
       privileged: false,
-      resources: null,
       environment: null,
       credentials: null,
       ttlHours: null,
@@ -4074,7 +4111,6 @@ describe("AgentForm save payload and failure handling", () => {
             backend: "kubernetes",
             steerMode: "pipe",
             privileged: false,
-            resources: null,
             environment: null,
             credentials: null,
             ttlHours: null,
@@ -4525,7 +4561,6 @@ describe("AgentForm save payload and failure handling", () => {
       },
     });
     useOrganizationDefaultModelMock.mockReturnValue({
-      isSet: true,
       model: {
         dbId: "gpt-default",
         id: "gpt-5.6-luna",

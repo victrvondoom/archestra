@@ -20,6 +20,7 @@ import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { renderSetupScript } from "../index";
+import { SETUP_STOPPED_EXIT_CODE } from "../types";
 import { CLIENT_CONNECTION_INSTALLER } from "./client-connection-installer";
 
 let directory: string;
@@ -194,6 +195,21 @@ test("downloads and executes the approved script without logging polling credent
   });
 });
 
+test.each([
+  { exit: SETUP_STOPPED_EXIT_CODE, ending: "Setup stopped.", generic: false },
+  { exit: 1, ending: "Setup failed. Review the output above", generic: true },
+])("a setup that exits $exit ends with its own next step only when it explained one", async ({
+  exit,
+  ending,
+  generic,
+}) => {
+  scriptBody = `#!/bin/bash\necho 'Run codex login, then start a new installer run.' >&2\nexit ${exit}\n`;
+  const result = await run();
+  expect(result.code).toBe(1);
+  expect(result.output).toContain(ending);
+  expect(result.output.includes("start the installer again")).toBe(generic);
+});
+
 test("Copilot prints saved credentials once in the final instructions, after the summary and before sign-in", async () => {
   const bin = join(directory, "bin");
   await mkdir(bin);
@@ -234,7 +250,9 @@ test("Copilot prints saved credentials once in the final instructions, after the
   });
   const result = await run(origin, "copilot-cli");
   expect(result.code).toBe(0);
-  const summary = result.output.indexOf("Copilot CLI is connected");
+  const summary = result.output.indexOf(
+    "Copilot CLI connection settings are saved",
+  );
   const optional = result.output.indexOf("Environment variables (optional)");
   const credentials = result.output.indexOf(
     "export COPILOT_PROVIDER_API_KEY='test-key'",
@@ -434,7 +452,11 @@ test("writes the approved Windows setup with a UTF-8 BOM so powershell.exe -File
         if (name === "node:fs/promises") return fileSystem;
         if (name === "node:path") return { join };
         if (name === "node:os")
-          return { hostname: () => "test-host", tmpdir: () => directory };
+          return {
+            hostname: () => "test-host",
+            tmpdir: () => directory,
+            homedir: () => "C:/User name 日本語",
+          };
         if (name === "node:child_process")
           return {
             spawn,
@@ -456,13 +478,26 @@ test("writes the approved Windows setup with a UTF-8 BOM so powershell.exe -File
 });
 
 test.each([
-  { serverName: "prod_gateway", runs: true },
-  { serverName: "r&d_(prod)", runs: false },
-])("Windows sign-in for $serverName gives cmd.exe one command line, never an argument list", async ({
+  { serverName: "prod_gateway", runs: true, signInStatus: 0 },
+  { serverName: "prod_gateway", runs: true, signInStatus: 1 },
+  { serverName: "r&d_(prod)", runs: false, signInStatus: 0 },
+  { serverName: "prod_gateway", runs: true, signInStatus: 0, pi: true },
+  { serverName: "prod_gateway", runs: true, signInStatus: 1, pi: true },
+  { serverName: "prod_gateway", runs: true, signInStatus: 0, kimi: true },
+  { serverName: "prod_gateway", runs: true, signInStatus: 1, kimi: true },
+])("Windows sign-in for $serverName (exit $signInStatus) reports success only after sign-in completes", async ({
   serverName,
   runs,
+  signInStatus,
+  pi,
+  kimi,
 }) => {
-  const command = ["opencode", "mcp", "auth", serverName];
+  // Kimi Code signs in through a Node.js helper in the home directory.
+  const command = pi
+    ? ["arcpi", "--reconnect"]
+    : kimi
+      ? ["node", "~/.archestra/kimi-code/lifecycle.cjs", "sign-in"]
+      : ["opencode", "mcp", "auth", serverName];
   const ending = {
     label: "OpenCode",
     appName: "Test",
@@ -519,13 +554,20 @@ test.each([
         if (name === "node:fs/promises") return fileSystem;
         if (name === "node:path") return { join };
         if (name === "node:os")
-          return { hostname: () => "test-host", tmpdir: () => directory };
+          return {
+            hostname: () => "test-host",
+            tmpdir: () => directory,
+            homedir: () => "C:/User name 日本語",
+          };
         if (name === "node:child_process")
           return {
             spawn,
             spawnSync: (command: string, args: unknown) => {
               calls.push({ command, args });
-              return { status: 0 };
+              expect(output.join("\n")).not.toContain("Signed in.");
+              return {
+                status: command === "powershell.exe" ? 0 : signInStatus,
+              };
             },
           };
         throw new Error(`Unexpected module ${name}`);
@@ -533,12 +575,38 @@ test.each([
     });
   });
   expect(calls[0]?.command).toBe("powershell.exe");
+  expect(output.join("\n")).toContain(
+    "connection settings are saved. MCP sign-in is still required.",
+  );
+  expect(output.join("\n")).not.toContain("is connected");
+  expect(output.join("\n").includes("Signed in.")).toBe(
+    runs && signInStatus === 0,
+  );
+  expect(output.join("\n").includes("Sign-in did not finish.")).toBe(
+    runs && signInStatus !== 0,
+  );
   const signIn = calls.slice(1);
   if (runs) {
     expect(signIn).toEqual([
       {
-        command: "opencode mcp auth prod_gateway",
-        args: expect.objectContaining({ shell: true }),
+        command:
+          pi || kimi ? process.execPath : "opencode mcp auth prod_gateway",
+        args: pi
+          ? [
+              join("C:/User name 日本語", ".archestra", "pi", "launch.cjs"),
+              "--reconnect",
+            ]
+          : kimi
+            ? [
+                join(
+                  "C:/User name 日本語",
+                  ".archestra",
+                  "kimi-code",
+                  "lifecycle.cjs",
+                ),
+                "sign-in",
+              ]
+            : expect.objectContaining({ shell: true }),
       },
     ]);
   } else {
@@ -622,7 +690,11 @@ test.each([
         if (name === "node:fs/promises") return fileSystem;
         if (name === "node:path") return { join };
         if (name === "node:os")
-          return { hostname: () => "test-host", tmpdir: () => directory };
+          return {
+            hostname: () => "test-host",
+            tmpdir: () => directory,
+            homedir: () => "C:/User name 日本語",
+          };
         if (name === "node:child_process")
           return {
             spawn,
@@ -714,7 +786,11 @@ test.each([
         if (name === "node:fs/promises") return fileSystem;
         if (name === "node:path") return { join };
         if (name === "node:os")
-          return { hostname: () => "test-host", tmpdir: () => directory };
+          return {
+            hostname: () => "test-host",
+            tmpdir: () => directory,
+            homedir: () => "C:/User name 日本語",
+          };
         if (name === "node:child_process")
           return {
             spawnSync,

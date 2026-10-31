@@ -40,6 +40,7 @@ import { PageBackLink } from "@/components/page-back-link";
 import { PageLayout } from "@/components/page-layout";
 import { QueryLoadError } from "@/components/query-load-error";
 import { ResourcePermissions } from "@/components/resource-permissions";
+import { AgentSchedulesSection } from "@/components/scheduled-tasks/agent-schedules-section";
 import { StandardDialog } from "@/components/standard-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -47,6 +48,7 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -578,14 +580,18 @@ function AgentDetails({
           {audience && (
             // The owner rides in the chip: who it reaches and who to ask,
             // read together. A built-in record belongs to nobody.
-            <AudienceChip
-              compact={kind === "agent"}
-              audience={audience}
-              owner={isBuiltIn ? null : agent.createdBy}
-            />
+            <span className="hidden sm:contents">
+              <AudienceChip
+                compact={kind === "agent"}
+                audience={audience}
+                owner={isBuiltIn ? null : agent.createdBy}
+              />
+            </span>
           )}
           {hasAgentRuntime && (
-            <RuntimeCapableIndicator variant="icon" runtime={agent.runtime} />
+            <span className="hidden sm:contents">
+              <RuntimeCapableIndicator variant="icon" runtime={agent.runtime} />
+            </span>
           )}
           {kind === "mcp_gateway" && environmentName && (
             <Badge variant="outline" className="font-normal">
@@ -633,15 +639,41 @@ function AgentDetails({
         // that act on it as a whole.
         <div className="flex shrink-0 items-center gap-2">
           {overviewOnly && !isGone && (
-            <Button variant="outline" size="sm" asChild>
-              <Link href={agentEditHref(agent.id)}>
-                <Pencil className="h-4 w-4" />
-                <span>{canEdit ? "Edit" : "View settings"}</span>
-              </Link>
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                className="sm:hidden"
+                asChild
+              >
+                <Link
+                  href={agentEditHref(agent.id)}
+                  aria-label={canEdit ? "Edit" : "View settings"}
+                  title={canEdit ? "Edit" : "View settings"}
+                >
+                  <Pencil className="size-4" />
+                </Link>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="hidden sm:inline-flex"
+                asChild
+              >
+                <Link href={agentEditHref(agent.id)}>
+                  <Pencil className="h-4 w-4" />
+                  <span>{canEdit ? "Edit" : "View settings"}</span>
+                </Link>
+              </Button>
+            </>
           )}
           {chatAction.visible && chatAction.href && (
-            <Button variant="outline" size="sm" asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              className={chatAction.startsRun ? "hidden sm:inline-flex" : ""}
+              asChild
+            >
               <Link href={chatAction.href}>
                 {chatAction.startsRun ? (
                   <TerminalSquare className="h-4 w-4" />
@@ -660,6 +692,19 @@ function AgentDetails({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              {chatAction.visible &&
+                chatAction.href &&
+                chatAction.startsRun && (
+                  <>
+                    <DropdownMenuItem className="sm:hidden" asChild>
+                      <Link href={chatAction.href}>
+                        <TerminalSquare className="size-4" />
+                        <span>{chatAction.label}</span>
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator className="sm:hidden" />
+                  </>
+                )}
               {/* Every item this family offers is here whether or not the
                   reader may take it: an action that vanishes leaves them
                   nothing to read, and a menu whose items all vanish opens on
@@ -750,6 +795,12 @@ function AgentDetails({
                 agent={agent}
                 editHref={agentEditHref(agent.id)}
                 canEdit={canEdit}
+              />
+            )}
+            {overviewOnly && section === "general" && kind === "agent" && (
+              <AgentSchedulesSection
+                agentId={agent.id}
+                agentName={agent.name}
               />
             )}
             {activeFormGroups.length > 0 && (

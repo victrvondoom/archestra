@@ -1,7 +1,10 @@
+import { eq, sql } from "drizzle-orm";
 import { SLACK_DEFAULT_CONNECTION_MODE } from "@/agents/chatops/constants";
+import { schema, withDbTransaction } from "@/database";
 import logger from "@/logging";
 import { secretManager } from "@/secrets-manager";
 import type {
+  ChatOpsProviderType,
   MsTeamsDbConfig,
   NgrokDbConfig,
   SecretValue,
@@ -10,13 +13,14 @@ import type {
   SlackDbConfig,
   TelegramDbConfig,
 } from "@/types";
+import { type JiraDbConfig, JiraDbConfigSchema } from "@/types/chatops-jira";
+import {
+  decryptSecretValue,
+  encryptSecretValue,
+  isEncryptedSecret,
+} from "@/utils/crypto";
 import SecretModel from "./secret";
 
-/**
- * ChatOps config secrets always use DB storage (forceDB: true) because:
- * 1. They are platform-internal config, not user-provided external secrets
- * 2. BYOS Vault (READONLY_VAULT) is read-only from the customer's Vault
- */
 const FORCE_DB = true;
 
 const MS_TEAMS_SECRET_NAME = "chatops-ms-teams";
@@ -25,29 +29,110 @@ const SLACK_AGENT_BOTS_SECRET_NAME = "chatops-slack-agent-bots";
 const SLACK_APP_CONFIG_TOKEN_SECRET_NAME = "chatops-slack-app-config-token";
 const TELEGRAM_SECRET_NAME = "chatops-telegram";
 const NGROK_SECRET_NAME = "chatops-ngrok";
+const JIRA_SECRET_NAME = "chatops-jira";
+const PROVIDER_SECRET_NAMES: Record<ChatOpsProviderType, string> = {
+  "ms-teams": MS_TEAMS_SECRET_NAME,
+  slack: SLACK_SECRET_NAME,
+  telegram: TELEGRAM_SECRET_NAME,
+  jira: JIRA_SECRET_NAME,
+};
+
+interface ProviderDbConfigs {
+  "ms-teams": MsTeamsDbConfig;
+  slack: SlackDbConfig;
+  telegram: TelegramDbConfig;
+  jira: JiraDbConfig;
+}
 
 class ChatOpsConfigModel {
+  async getJiraConfig(): Promise<JiraDbConfig | null> {
+    const row = await SecretModel.findByName(JIRA_SECRET_NAME);
+    return row ? JiraDbConfigSchema.parse(row.secret) : null;
+  }
+
+  async saveJiraConfig(value: JiraDbConfig): Promise<void> {
+    await this.updateJiraConfig(() => value);
+  }
+
+  /** Serialize changes across replicas, including the first configuration. */
+  async updateJiraConfig(
+    mutate: (
+      current: JiraDbConfig | null,
+    ) => JiraDbConfig | Promise<JiraDbConfig>,
+  ): Promise<JiraDbConfig> {
+    return withDbTransaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${JIRA_SECRET_NAME}, 0))`,
+      );
+      const [row] = await tx
+        .select()
+        .from(schema.secretsTable)
+        .where(eq(schema.secretsTable.name, JIRA_SECRET_NAME));
+      const current = row
+        ? JiraDbConfigSchema.parse(
+            isEncryptedSecret(row.secret)
+              ? decryptSecretValue(row.secret)
+              : row.secret,
+          )
+        : null;
+      const next = JiraDbConfigSchema.parse(await mutate(current));
+      const secret = encryptSecretValue(next as unknown as SecretValue);
+      if (row) {
+        await tx
+          .update(schema.secretsTable)
+          .set({ secret })
+          .where(eq(schema.secretsTable.id, row.id));
+      } else {
+        await tx.insert(schema.secretsTable).values({
+          name: JIRA_SECRET_NAME,
+          secret,
+          isVault: false,
+        });
+      }
+      return next;
+    });
+  }
+
+  async getJiraSnapshotForAudit(
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const value = await this.getJiraConfig();
+    if (!value || value.organizationId !== organizationId) return null;
+    return {
+      id: value.id,
+      enabled: value.enabled,
+      siteUrl: value.siteUrl,
+      ingressMode: value.ingressMode,
+      hasWebhookSecret: Boolean(value.webhookSecret),
+      bots: value.bots.map(({ apiToken, ...bot }) => ({
+        ...bot,
+        hasApiToken: Boolean(apiToken),
+      })),
+    };
+  }
+
   async getMsTeamsConfig(): Promise<MsTeamsDbConfig | null> {
     return this.getConfig<MsTeamsDbConfig>(MS_TEAMS_SECRET_NAME);
   }
 
   async getSlackConfig(): Promise<SlackDbConfig | null> {
     const raw = await this.getConfig<SlackDbConfig>(SLACK_SECRET_NAME);
-    if (!raw) return null;
-    // Backward compatibility — precedence:
-    // 1. Explicit connectionMode from DB (already set by user)
-    // 2. Infer "webhook" if signingSecret is present but connectionMode is missing
-    //    (configs saved before socket mode was added)
-    // 3. Default to SLACK_DEFAULT_CONNECTION_MODE ("socket") for new installs
-    const inferredMode =
-      !raw.connectionMode && raw.signingSecret
-        ? "webhook"
-        : (raw.connectionMode ?? SLACK_DEFAULT_CONNECTION_MODE);
+    return raw ? normalizeSlackConfig(raw) : null;
+  }
 
+  /** A provider's stored config and when it last changed, from one read of its row. */
+  async getStoredConfig<P extends ChatOpsProviderType>(
+    provider: P,
+  ): Promise<{ value: ProviderDbConfigs[P]; updatedAt: Date } | null> {
+    const stored = await this.getConfigRow<ProviderDbConfigs[P]>(
+      PROVIDER_SECRET_NAMES[provider],
+    );
+    if (!stored || provider !== "slack") return stored;
     return {
-      ...raw,
-      connectionMode: inferredMode,
-      appLevelToken: raw.appLevelToken ?? "",
+      ...stored,
+      value: normalizeSlackConfig(
+        stored.value as SlackDbConfig,
+      ) as ProviderDbConfigs[P],
     };
   }
 
@@ -163,6 +248,7 @@ class ChatOpsConfigModel {
             hasAppId: Boolean(ms.appId),
             hasAppSecret: Boolean(ms.appSecret),
             hasTenantId: Boolean(ms.tenantId),
+            groupChatFileSignIn: ms.groupChatFileSignIn ?? false,
           }
         : null,
       slack: slack
@@ -204,13 +290,22 @@ class ChatOpsConfigModel {
   }
 
   private async getConfig<T>(secretName: string): Promise<T | null> {
+    return (await this.getConfigRow<T>(secretName))?.value ?? null;
+  }
+
+  private async getConfigRow<T>(
+    secretName: string,
+  ): Promise<{ value: T; updatedAt: Date } | null> {
     const secretRow = await SecretModel.findByName(secretName);
     if (!secretRow) return null;
 
     const secret = await secretManager().getSecret(secretRow.id);
     if (!secret?.secret) return null;
 
-    return secret.secret as unknown as T;
+    return {
+      value: secret.secret as unknown as T,
+      updatedAt: secretRow.updatedAt,
+    };
   }
 
   private async saveConfig(
@@ -228,6 +323,25 @@ class ChatOpsConfigModel {
 }
 
 export default new ChatOpsConfigModel();
+
+/**
+ * Backward compatibility — connectionMode precedence:
+ * 1. Explicit connectionMode from DB (already set by user)
+ * 2. Infer "webhook" if signingSecret is present but connectionMode is missing
+ *    (configs saved before socket mode was added)
+ * 3. Default to SLACK_DEFAULT_CONNECTION_MODE ("socket") for new installs
+ */
+function normalizeSlackConfig(raw: SlackDbConfig): SlackDbConfig {
+  const inferredMode =
+    !raw.connectionMode && raw.signingSecret
+      ? "webhook"
+      : (raw.connectionMode ?? SLACK_DEFAULT_CONNECTION_MODE);
+  return {
+    ...raw,
+    connectionMode: inferredMode,
+    appLevelToken: raw.appLevelToken ?? "",
+  };
+}
 
 function appConfigTokenSecretName(userId?: string): string {
   return userId

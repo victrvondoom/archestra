@@ -15,10 +15,13 @@ import {
 } from "@archestra/shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { isServiceAccountUserId } from "@/auth/service-account-user-id";
+import config from "@/config";
 import {
   CreatedByModel,
   LlmProviderApiKeyModel,
   MemberModel,
+  ModelPoolModel,
   TeamModel,
   VirtualApiKeyLabelModel,
   VirtualApiKeyModel,
@@ -28,6 +31,7 @@ import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
 import { readVirtualKeyValue } from "@/services/connection-setup";
 import { credentialBilling } from "@/services/credential-billing";
 import { CredentialResourcePermissions } from "@/services/credential-resource-permissions";
+import { assertCanGrantModelPools } from "@/services/model-pool-grants";
 import { ResourcePermissions } from "@/services/resource-permissions";
 import {
   ApiError,
@@ -35,6 +39,7 @@ import {
   constructResponseSchema,
   type LabelWithDetails,
   LabelWithDetailsSchema,
+  ModelPoolIdsInputSchema,
   ResourceVisibilityScopeSchema,
   type User,
   VirtualApiKeyTypeSchema,
@@ -77,6 +82,11 @@ const VirtualApiKeyBodyObjectSchema = z.object({
    * keep it; `null` removes it.
    */
   spendCap: CredentialSpendCapInputSchema.nullable().optional(),
+  /**
+   * Model pools the key may call by name even when it maps none of their
+   * members. Omit to keep the key's current pools. Needs model pools on.
+   */
+  modelPoolIds: ModelPoolIdsInputSchema,
 });
 
 /**
@@ -94,6 +104,13 @@ function refineVirtualApiKeyBody(
         code: "custom",
         path: ["providerApiKeys"],
         message: "Passthrough virtual keys cannot map provider API keys",
+      });
+    }
+    if (value.modelPoolIds?.length) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["modelPoolIds"],
+        message: "Passthrough virtual keys cannot use model pools",
       });
     }
     return;
@@ -251,7 +268,7 @@ const virtualApiKeysRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.GetVirtualApiKeyValue,
         description:
-          "Get the raw value of a virtual API key. Only the key's author can reveal it.",
+          "Get the raw value of a virtual API key. Only the key's author can reveal it; a key created by a service account with no owner is revealed to that service account.",
         tags: ["Virtual API Keys"],
         params: z.object({
           id: z.string().uuid(),
@@ -269,8 +286,9 @@ const virtualApiKeysRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Virtual API key not found");
       }
       // The raw value is a bearer credential — visibility (shared team/org
-      // keys) is not enough to reveal it; only the author holds the secret.
-      if (virtualKey.authorId !== user.id) {
+      // keys) is not enough to reveal it; only its creator principal (the
+      // author, or the service account that created an ownerless key) may.
+      if (CreatedByModel.id(virtualKey, virtualKey.authorId) !== user.id) {
         throw new ApiError(403, "Only the key's creator can reveal its value.");
       }
 
@@ -526,6 +544,7 @@ async function createVirtualApiKey(params: {
     mappings: body.providerApiKeys,
     organizationId,
     userId: user.id,
+    ownerId,
   });
 
   await validateVirtualKeyInitialGrants({
@@ -533,6 +552,11 @@ async function createVirtualApiKey(params: {
     organizationId,
     userId: user.id,
     ownerId,
+  });
+  await assertCanGrantModelPools({
+    modelPoolIds: body.modelPoolIds,
+    organizationId,
+    userId: user.id,
   });
 
   const { virtualKey, value, teams, authorName, providerApiKeys } =
@@ -557,6 +581,11 @@ async function createVirtualApiKey(params: {
     entityType: "virtual_key",
     entityId: virtualKey.id,
     cap: body.spendCap,
+  });
+  await setModelPools({
+    modelPoolIds: body.modelPoolIds,
+    organizationId,
+    virtualApiKeyId: virtualKey.id,
   });
 
   return {
@@ -692,6 +721,12 @@ async function updateVirtualApiKey(params: {
       mappings: body.providerApiKeys,
       organizationId,
       userId: user.id,
+      ownerId: accessContext.authorId,
+    });
+    await assertCanGrantModelPools({
+      modelPoolIds: body.modelPoolIds,
+      organizationId,
+      userId: user.id,
     });
     await CredentialResourcePermissions.validateVirtual({
       keyType: accessContext.keyType,
@@ -728,6 +763,13 @@ async function updateVirtualApiKey(params: {
     entityId: id,
     cap: body.spendCap,
   });
+  if (accessContext.keyType === "standard") {
+    await setModelPools({
+      modelPoolIds: body.modelPoolIds,
+      organizationId,
+      virtualApiKeyId: id,
+    });
+  }
 
   const visibilityMetadata =
     await VirtualApiKeyModel.getVisibilityForVirtualApiKeyIds([id]);
@@ -744,6 +786,21 @@ async function updateVirtualApiKey(params: {
     providerApiKeys,
     labels: await syncAndReadLabels(id, body.labels),
   };
+}
+
+/** Saves the pools a create/update body names; undefined keeps the current ones. */
+async function setModelPools(params: {
+  modelPoolIds: string[] | undefined;
+  organizationId: string;
+  virtualApiKeyId: string;
+}): Promise<void> {
+  if (params.modelPoolIds === undefined || !config.llmProxy.modelPoolsEnabled)
+    return;
+  await ModelPoolModel.setPoolsForVirtualApiKey({
+    organizationId: params.organizationId,
+    virtualApiKeyId: params.virtualApiKeyId,
+    poolIds: params.modelPoolIds,
+  });
 }
 
 async function readBilling(virtualKey: {
@@ -830,6 +887,7 @@ async function validateProviderApiKeys(params: {
   mappings: Array<{ provider: SupportedProvider; providerApiKeyId: string }>;
   organizationId: string;
   userId: string;
+  ownerId: string | null;
 }): Promise<void> {
   const { mappings, organizationId, userId } = params;
   if (mappings.length === 0) {
@@ -880,17 +938,35 @@ async function validateProviderApiKeys(params: {
     // other providers in an own model-router key. Ownership is re-checked per
     // mapping at request time in `llm-proxy-auth`.
     const secret = secretsById.get(mapping.providerApiKeyId);
+    let delegatedCopilotMapping = false;
     if (
       credentialRequiresPerUserScope({
         provider: mapping.provider,
         apiKey: secret,
       })
     ) {
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      delegatedCopilotMapping =
+        mapping.provider === "github-copilot" &&
+        isServiceAccountUserId(userId) &&
+        params.ownerId != null &&
+        apiKey.userId === params.ownerId &&
+        !!(await MemberModel.getByUserId(params.ownerId, organizationId)) &&
+        (await ResourcePermissions.allows({
+          organizationId,
+          userId,
+          resource: "llmVirtualKey",
+          scope: "*",
+          action: "update",
+        }));
+      // SPDX-SnippetEnd
       const label = perUserCredentialLabel({
         provider: mapping.provider,
         apiKey: secret,
       });
-      if (apiKey.userId !== userId) {
+      if (apiKey.userId !== userId && !delegatedCopilotMapping) {
         throw new ApiError(
           403,
           `You can only map your own personal ${label} key.`,
@@ -898,6 +974,7 @@ async function validateProviderApiKeys(params: {
       }
     }
     if (
+      !delegatedCopilotMapping &&
       !params.retainedProviderApiKeyIds?.includes(apiKey.id) &&
       !(await LlmProviderApiKeyModel.canUseKey(
         apiKey,

@@ -226,6 +226,7 @@ describe("run_tool", () => {
     // Fresh agent with no Archestra tools assigned.
     const unassignedAgent = await makeAgent({
       name: "Unassigned Agent",
+      agentType: "agent",
       organizationId: mockContext.organizationId,
     });
 
@@ -241,12 +242,44 @@ describe("run_tool", () => {
 
     expect(result.isError).toBe(true);
     expect((result.content[0] as any).text).toContain(
-      "is not assigned to this agent",
+      'is not available through the "Unassigned Agent" agent',
     );
     expect((result._meta?.archestraError as any)?.code).toBe(
       "tool_not_assigned",
     );
     expect(mcpClient.executeToolCallForOwner).not.toHaveBeenCalled();
+  });
+
+  // A model took a tool name from another agent's tool list and called it
+  // through its gateway; the refusal said "this agent" and nothing more.
+  test("names the gateway and says whose tools a refused name belongs to", async ({
+    makeAgent,
+  }) => {
+    const gateway = await makeAgent({
+      name: "My Gateway",
+      agentType: "mcp_gateway",
+      organizationId: mockContext.organizationId,
+    });
+
+    const result = await executeArchestraTool(
+      TOOL_RUN_TOOL_FULL_NAME,
+      { tool_name: "create_agent", tool_args: { name: "some-agent" } },
+      {
+        ...mockContext,
+        agent: { id: gateway.id, name: gateway.name },
+        agentId: gateway.id,
+      },
+    );
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain(
+      'is not available through the "My Gateway" MCP gateway',
+    );
+    expect(text).toContain("Tools listed for other agents");
+    expect(text).toContain(
+      'it can be added to the tools of the "My Gateway" MCP gateway',
+    );
   });
 
   test("routes agent delegation tool names through the built-in dispatcher", async ({
@@ -1004,7 +1037,7 @@ describe("run_tool", () => {
 
       expect(result.isError).toBe(true);
       expect((result.content[0] as any).text).toContain(
-        "not assigned to this agent",
+        "is not available through",
       );
       expect(runSpy).not.toHaveBeenCalled();
     });
@@ -1106,7 +1139,7 @@ describe("run_tool", () => {
 
       expect(result.isError).toBe(true);
       expect((result.content[0] as any).text).toContain(
-        "not assigned to this agent",
+        "is not available through",
       );
     });
 
@@ -1167,7 +1200,7 @@ describe("run_tool", () => {
 
       expect(result.isError).toBe(true);
       expect((result.content[0] as any).text).toContain(
-        "not assigned to this agent",
+        "is not available through",
       );
       const assignedNames = await ToolModel.getAssignedToolNames(
         dynamicAgent.id,
@@ -1845,8 +1878,9 @@ describe("run_tool", () => {
       expect(runSpy).toHaveBeenCalledWith(
         expect.objectContaining({ command: "echo hi" }),
       );
-      const text = result.content.map((item) => (item as any).text).join("\n");
-      expect(text).toContain('"command"');
+      expect(result._meta?.["archestra/unwrappedToolArgs"]).toEqual([
+        "command",
+      ]);
     });
 
     test('unwraps {"item": […]} and {"value": […]} around an array-declared built-in param', async ({
@@ -1872,10 +1906,9 @@ describe("run_tool", () => {
           success: true,
           todoCount: 1,
         });
-        const text = result.content
-          .map((item) => (item as any).text)
-          .join("\n");
-        expect(text).toContain("todos");
+        expect(result._meta?.["archestra/unwrappedToolArgs"]).toEqual([
+          "todos",
+        ]);
       }
     });
 
@@ -1920,10 +1953,10 @@ describe("run_tool", () => {
           mockContext.tokenAuth,
           { conversationId: testConversationId },
         );
-        const text = result.content
-          .map((item) => (item as any).text)
-          .join("\n");
-        expect(text).toContain('"query"');
+        expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+        expect(result._meta?.["archestra/unwrappedToolArgs"]).toEqual([
+          "query",
+        ]);
       }
     });
 
@@ -1967,8 +2000,8 @@ describe("run_tool", () => {
         mockContext.tokenAuth,
         { conversationId: testConversationId },
       );
-      const text = result.content.map((item) => (item as any).text).join("\n");
-      expect(text).toContain('"query"');
+      expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+      expect(result._meta?.["archestra/unwrappedToolArgs"]).toEqual(["query"]);
     });
 
     test("unwraps a param-name-keyed wrapper around a primitive-declared param", async ({
@@ -2011,11 +2044,10 @@ describe("run_tool", () => {
         mockContext.tokenAuth,
         { conversationId: testConversationId },
       );
-      // The upstream result is one block; the disclosed repair note is the
-      // extra one.
-      expect(result.content).toHaveLength(2);
-      expect(result.content[0]).toEqual({ type: "text", text: "ok" });
-      expect((result.content[1] as any).type).toBe("text");
+      // A successful repair is disclosed in _meta; content stays exactly what
+      // the tool returned, so clients that join and parse text blocks still can.
+      expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+      expect(result._meta?.["archestra/unwrappedToolArgs"]).toEqual(["appId"]);
     });
 
     test("repairEnvelopedToolArgs reports a param-name-keyed repair as data", () => {

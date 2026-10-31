@@ -27,9 +27,28 @@ import {
   renderStartupGuardScript,
   type StartupGuardClient,
   type StartupGuardContext,
+  startupGuardUnreachableWarning,
 } from "./startup-guard";
 
 const execFileAsync = promisify(execFile);
+
+test("unreachable diagnostics show only the instance origin, without credentials or resource tokens", () => {
+  const warning = startupGuardUnreachableWarning(
+    {
+      appName: "Test Platform",
+      healthUrl:
+        "https://user:secret@instance.example:8443/private/token?key=secret#secret",
+      proxy: null,
+      mcp: null,
+      skills: null,
+    },
+    CLAUDE_CODE_GUARD_CLIENT,
+  );
+  expect(warning).toContain(
+    "Test Platform is unreachable at https://instance.example:8443",
+  );
+  expect(warning).not.toMatch(/user|secret|private|token/);
+});
 
 // This suite pins the Claude Code descriptor's rendered guard behavior — the
 // reference client for the shared engine.
@@ -224,7 +243,6 @@ if pid == 0:
 if keys:
     os.write(master, keys.encode())
 out = b""
-notice_seen = None
 while True:
     try:
         r, _, _ = select.select([master], [], [], 30)
@@ -240,20 +258,8 @@ while True:
     if not chunk:
         break
     out += chunk
-    if notice_seen is None and b"Continuing in 6 seconds" in out:
-        notice_seen = time.monotonic()
-        if len(sys.argv) > 3 and sys.argv[3] == "dismiss-notice":
-            os.write(master, b"x")
 _, status = os.waitpid(pid, 0)
 sys.stdout.buffer.write(out)
-if len(sys.argv) > 3 and sys.argv[3] == "check-notice":
-    assert notice_seen is not None, "update notice missing"
-    assert time.monotonic() - notice_seen >= 0.8, "type-ahead dismissed unread update steps"
-    assert os.waitstatus_to_exitcode(status) == 0, "guard did not exit successfully"
-if len(sys.argv) > 3 and sys.argv[3] == "dismiss-notice":
-    assert notice_seen is not None, "update notice missing"
-    assert time.monotonic() - notice_seen < 3, "fresh key did not dismiss the update notice"
-    assert os.waitstatus_to_exitcode(status) == 0, "guard did not exit successfully"
 `;
 
 async function runGuardInteractive(params: {
@@ -262,24 +268,13 @@ async function runGuardInteractive(params: {
   curlBody?: string;
   skipFileContent?: string;
   keys: string;
-  checkNoticeDuration?: boolean;
-  dismissNotice?: boolean;
 }): Promise<{ output: string; guardHome: GuardHome }> {
   const guardHome = await makeGuardHome(params);
   const driver = path.join(guardHome.dir, "pty.py");
   await writeFile(driver, PTY_DRIVER, "utf8");
   const { stdout } = await execFileAsync(
     "python3",
-    [
-      driver,
-      guardHome.guardFile,
-      params.keys,
-      params.dismissNotice
-        ? "dismiss-notice"
-        : params.checkNoticeDuration
-          ? "check-notice"
-          : "",
-    ],
+    [driver, guardHome.guardFile, params.keys],
     { env: guardHome.env, timeout: 60_000 },
   );
   return { output: stdout, guardHome };
@@ -406,9 +401,10 @@ describe("renderStartupGuardScript", () => {
     expect(script).toContain("version_is_stale");
     expect(script).toContain(`'"guardVersion":'`);
     expect(script).toContain('-gt "$GUARD_FORMAT_VERSION"');
-    // Interactive runs show the steps without another keypress.
+    // Interactive runs refresh without another keypress.
     expect(script).not.toContain("[U]");
-    expect(script).toContain("/connection page and pick");
+    expect(script).toContain("refresh_version_update");
+    expect(script).not.toContain("/connection page and pick");
     expect(script).toContain('read -rs -n 1 -t "$RECONFIG_WAIT" key');
   });
 
@@ -482,18 +478,18 @@ describe("renderStartupGuardScript", () => {
     );
   });
 
-  test("encodes the retry contract on the single request: 15s budget, notice at 3s, hang-tight at 10s, own-line (Y/n) offer", () => {
+  test("encodes the retry contract on the single request: 15s budget, notice at 3s, hang-tight at 10s, own-line session skip offer", () => {
     const script = renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT);
     expect(script).toContain("RETRY_TOTAL_SECONDS=15");
     expect(script).toContain("NOTICE_AFTER_SECONDS=3");
     expect(script).toContain("HANG_TIGHT_AFTER_SECONDS=10");
     expect(script).toContain("few more seconds, hang tight...");
     expect(script).toContain("trying to connect...");
-    // the disconnect offer sits two lines below the block — the persistent
-    // [C] hint takes +1, this (Y/n) offer +2 — so both stay visible, drawn
+    // the session-only skip offer sits two lines below the block — the persistent
+    // [C] hint takes +1, this skip offer +2 — so both stay visible, drawn
     // via cursor save/restore so the dots keep appending to the row above
     expect(script).toContain(
-      "Disconnect all $ACTIVE_TOTAL unreachable resources from Claude now? (Y/n)",
+      "Instance unreachable. Press [Enter] to skip checks for this session; connections stay configured.",
     );
     expect(script).toContain(
       "printf '\\033[s\\033[%dB\\r\\033[2K%s \\033[u' \"$((ACTIVE_TOTAL + 2))\"",
@@ -523,7 +519,7 @@ describe("renderStartupGuardScript", () => {
     // after claude exits
     expect(script).toContain("\\033[?1049h");
     expect(script).toContain(
-      `trap 'stop_frame_key_reader; stty echo </dev/tty 2>/dev/null; printf "\\033[?1049l"' EXIT`,
+      `trap 'stop_frame_key_reader; stty echo </dev/tty 2>/dev/null; printf "\\033[?1049l"; warn_unreachable' EXIT`,
     );
     // echo off for the whole interactive run so keys buffered during the
     // probe animation leave no smudge
@@ -658,6 +654,9 @@ describe("renderStartupGuardScript", () => {
     });
     expect(stdout).toBe("");
     expect(stderr).toContain("failed to connect to LLM proxy (profile-123)");
+    expect(stderr).toContain(
+      "Archestra is unreachable at https://archestra.example.com",
+    );
     expect(stderr).toContain("failed to connect to MCP gateway (prod-gateway)");
     expect(stderr).toContain(
       "failed to connect to Skills marketplace (acme-skills)",
@@ -708,7 +707,7 @@ describe("renderStartupGuardScript", () => {
     expect(stderr).toBe("");
   });
 
-  test("non-interactive run nudges an update only when the instance reports a strictly newer guard version", async () => {
+  test("non-interactive run attempts an update only when the instance reports a strictly newer guard version", async () => {
     // Remotes healthy; the instance reports a guard format one past the one
     // this guard was stamped with.
     const { stdout, stderr, guardHome } = await runGuardNonInteractive({
@@ -717,8 +716,10 @@ describe("renderStartupGuardScript", () => {
       curlBody: `{"mcp":"ok","llm":"ok","guardVersion":${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
     });
     expect(stdout).toBe("");
-    expect(stderr).toContain("a newer Archestra setup for claude is available");
-    expect(stderr).toContain("/connection");
+    expect(stderr).toContain(
+      "Could not update Archestra launch check automatically",
+    );
+    expect(stderr).not.toContain("/connection");
     expect(
       (await readFile(path.join(guardHome.home, "curl-calls.log"), "utf8"))
         .trim()
@@ -752,7 +753,9 @@ describe("renderStartupGuardScript", () => {
       curlExitCode: 0,
       curlBody: `{"mcp": "ok", "llm": "ok", "guardVersion": ${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
     });
-    expect(stderr).toContain("a newer Archestra setup for claude is available");
+    expect(stderr).toContain(
+      "Could not update Archestra launch check automatically",
+    );
   });
 
   test("ARCHESTRA_CLAUDE_GUARD=0 disables the guard entirely", async () => {
@@ -799,11 +802,11 @@ describe("renderStartupGuardScript", () => {
     }
   });
 
-  test("interactive, platform unreachable, y during the wait: disconnects EVERYTHING and removes the guard itself", async () => {
+  test("interactive, platform unreachable, explicit menu removal disconnects everything and removes the guard", async () => {
     const { output, guardHome } = await runGuardInteractive({
       script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT),
       curlExitCode: 7,
-      keys: "y",
+      keys: "c123",
     });
     // every remote's connect step is reversed…
     const log = await readClaudeLog(guardHome);
@@ -830,6 +833,27 @@ describe("renderStartupGuardScript", () => {
     // Disconnected rows
     expect(output).toContain("Disconnected Skills marketplace (acme-skills)");
     expect(output).not.toContain("Nothing connected is left to check");
+    expect(output.split("\x1b[?1049l").at(-1)).not.toContain(
+      "Archestra is unreachable",
+    );
+  });
+
+  test("interactive outage diagnostics survive the alternate screen when keeping the connection", async () => {
+    const { output, guardHome } = await runGuardInteractive({
+      script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT),
+      curlExitCode: 7,
+      keys: "n",
+    });
+    const normalScreen = output.split("\x1b[?1049l").at(-1);
+    expect(normalScreen).toContain(
+      "Archestra is unreachable at https://archestra.example.com",
+    );
+    expect(normalScreen).toContain("Check that the instance is running");
+    expect(normalScreen).toContain("run claude interactively");
+    expect(normalScreen).not.toContain("archestra_skl_token123");
+    const settings = JSON.parse(await readFile(guardHome.settingsFile, "utf8"));
+    expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBe("vk-secret");
+    expect(await readClaudeLog(guardHome)).toBe("");
   });
 
   test("interactive, one remote down, d at the prompt: disconnects only it and keeps the guard for the rest", async () => {
@@ -908,22 +932,22 @@ describe("renderStartupGuardScript", () => {
     // nothing is disconnected, nothing remembered, the guard stays installed
     expect(await readClaudeLog(guardHome)).toBe("");
     expect(output).not.toContain("Disconnected");
+    expect(output).not.toContain("Archestra is unreachable");
     expect(existsSync(guardHome.skipFile)).toBe(false);
     expect(existsSync(guardHome.guardFile)).toBe(true);
   });
 
-  test("interactive, all healthy but the instance reports a newer guard version: automatically shows the reason and update steps", async () => {
+  test("interactive, all healthy but the instance reports a newer guard version: keeps the installed config when no updater is installed", async () => {
     const { output, guardHome } = await runGuardInteractive({
       script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT),
       curlExitCode: 0,
       curlBody: `{"mcp":"ok","llm":"ok","guardVersion":${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
       keys: "",
     });
-    expect(output).toContain("a newer Archestra setup is available");
     expect(output).toContain(
-      "Your installed startup check is older than this deployment.",
+      "Could not update Archestra launch check automatically",
     );
-    expect(output).toContain("/connection page and pick Claude Code");
+    expect(output).not.toContain("/connection page and pick");
     expect(output).not.toContain("[U]");
     // purely advisory: nothing disconnected, guard stays installed
     expect(output).not.toContain("Disconnected");
@@ -936,18 +960,17 @@ describe("renderStartupGuardScript", () => {
     "U",
     "uu",
     "UU",
-  ])("interactive, stale: an early %s cannot hide the automatic update steps", async (key) => {
+  ])("interactive, stale: an early %s does not request a manual update", async (key) => {
     const { output, guardHome } = await runGuardInteractive({
       script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT),
       curlExitCode: 0,
       curlBody: `{"mcp":"ok","llm":"ok","guardVersion":${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
       keys: key,
-      checkNoticeDuration: true,
     });
     expect(output).toContain(
-      "To update, re-run the Archestra connection setup",
+      "Could not update Archestra launch check automatically",
     );
-    expect(output).toContain("/connection page and pick Claude Code");
+    expect(output).not.toContain("To update, re-run");
     // advisory only — the guard never disconnects or removes anything, and it
     // still exits cleanly so the wrapper can launch the client
     expect(output).not.toContain("Disconnected");
@@ -955,31 +978,20 @@ describe("renderStartupGuardScript", () => {
     expect(existsSync(guardHome.skipFile)).toBe(false);
   });
 
-  test("interactive, stale: a fresh key dismisses the automatic notice", async () => {
-    await runGuardInteractive({
-      script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT).replace(
-        "-t 6 key",
-        "-t 4 key",
-      ),
-      curlExitCode: 0,
-      curlBody: `{"mcp":"ok","llm":"ok","guardVersion":${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
-      keys: "",
-      dismissNotice: true,
-    });
-  });
-
   test.each([
     "c",
     "C",
-  ])("interactive, stale: %s opens reconfigure and still shows the update steps after leaving", async (key) => {
+  ])("interactive, stale: a queued %s remains available for reconfigure after a refresh attempt", async (key) => {
     const { output, guardHome } = await runGuardInteractive({
       script: renderStartupGuardScript(CTX, CLAUDE_CODE_GUARD_CLIENT),
       curlExitCode: 0,
       curlBody: `{"mcp":"ok","llm":"ok","guardVersion":${STARTUP_GUARD_FORMAT_VERSION + 1}}`,
       keys: `${key}\r`,
-      checkNoticeDuration: true,
     });
-    expect(output).toContain("/connection page and pick Claude Code");
+    expect(output).toContain(
+      "Could not update Archestra launch check automatically",
+    );
+    expect(output).toContain("Press 1-3 to disconnect");
     expect(output).not.toContain("Disconnected");
     expect(existsSync(guardHome.skipFile)).toBe(false);
   });

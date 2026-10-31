@@ -15,19 +15,18 @@ mod lease;
 mod peer;
 mod policy;
 mod replay;
+mod sealed;
 
 use appa_eventlog::{
-    Backend, DeploymentName, FamilyKind, LogStore, OperationClaim, OperationKey, OperationRequest,
-    ProcessedResultClaim, ProcessedResultKey, ProcessedResultRequest, ReceiptBinding, ReceiptError,
-    SessionScope,
+    Backend, LogStore, OperationClaim, OperationKey, OperationRequest, ProcessedResultClaim,
+    ProcessedResultKey, ProcessedResultRequest, ReceiptBinding, ReceiptError, SessionScope,
     encryption::{StorageCipher, field_context},
     postgres::{LeaseError, PostgresError},
 };
 use appa_runtime::{
     api::{
-        EmbeddedPresentationOptions, ExecuteRemedyPlanArgs, PreparedDeployment,
-        PublishedDeployment, RemedyOutcome, RemedyPresentation, RemedyRefusal, RootForkRefusal,
-        Runtime,
+        EmbeddedPresentationOptions, ExecuteRemedyPlanArgs, PublishedDeployment, RemedyOutcome,
+        RemedyPresentation, RemedyRefusal, RootForkRefusal, Runtime,
     },
     hooks,
 };
@@ -71,8 +70,8 @@ pub struct ContentEncryption {
 /// runs through a view pinned to the head of its organization's deployment line
 /// (see [`deployments`]), so dispatches run concurrently and none changes what
 /// another serves. Every family decides its next event under its line's head,
-/// whichever revision opened it; a family the previous OpenAPPA version opened
-/// keeps its opening policy until it ends.
+/// whichever revision opened it; the runtime refuses a family pinned to the
+/// policy it opened under as `RefusalClass::LegacyFamily`, which is not retryable.
 /// No dispatch holds a database connection or a lock while it works: the event
 /// log serializes each read-decide-append step of a family on the family's row,
 /// receipts carry a lease per operation (see [`lease`]), and every write is one
@@ -479,6 +478,44 @@ fn storage(message: impl ToString) -> napi::Error {
     failure(Failure::Binding(BindingFailure::Storage), message)
 }
 
+/// A stored log the binding read directly could not be read, under the class a
+/// dispatch that read it would be refused with, so the host classifies the cause
+/// rather than reporting every read as storage.
+fn read_failure(read: appa_eventlog::ReadError) -> napi::Error {
+    use appa_eventlog::ReadError;
+    let class = match &read {
+        ReadError::Undecodable { .. } | ReadError::UndecodableKey { .. } => {
+            RefusalClass::UntrustedLog
+        }
+        ReadError::PolicyFileMissing { .. }
+        | ReadError::PolicyFileMismatch { .. }
+        | ReadError::UnknownRevision { .. } => RefusalClass::PolicyUnavailable,
+        ReadError::LegacyFamily { .. } => RefusalClass::LegacyFamily,
+        // The session names a root whose log is gone: as `read_refused`
+        // classes it, a trajectory that cannot continue.
+        ReadError::UnknownRoot { .. } => RefusalClass::Trajectory,
+        _ => return storage(read),
+    };
+    failure(Failure::Refused(class), read)
+}
+
+/// A session's label could not be read, under the class of its cause: the log's
+/// own read failure, an opening policy that no longer resolves, or a log that no
+/// longer replays.
+fn status_read_failure(read: appa_runtime::api::StatusReadError) -> napi::Error {
+    use appa_runtime::api::StatusReadError;
+    match read {
+        StatusReadError::Read(read) => read_failure(read),
+        StatusReadError::Policy(_) => {
+            failure(Failure::Refused(RefusalClass::PolicyUnavailable), read)
+        }
+        StatusReadError::Replay(_) => failure(Failure::Refused(RefusalClass::UntrustedLog), read),
+        StatusReadError::UnknownRoot { .. } => {
+            failure(Failure::Refused(RefusalClass::Trajectory), read)
+        }
+    }
+}
+
 fn panicked(message: impl ToString) -> napi::Error {
     failure(Failure::Binding(BindingFailure::Panicked), message)
 }
@@ -564,24 +601,15 @@ fn is_policy_moved(error: &napi::Error) -> bool {
 /// policy, and `work` runs once more. When the head names another policy, or moves
 /// again, the dispatch fails as retryable and the host's retry reads the policy
 /// again.
-///
-/// While new sessions keep a policy snapshot (`policy.snapshot`), nothing is
-/// published, and the view depends on the family `root` names, read only then: a
-/// new or pinned family runs through the snapshot view of `policy`, and a family
-/// that follows a line runs pinned to that line's head as it stands.
 async fn on_deployment<T, Work>(
     state: &State,
     organization_id: &str,
     policy: &deployments::HostedPolicy,
-    root: impl FnOnce(&State) -> napi::Result<Option<String>>,
     work: impl Fn(State) -> Work,
 ) -> napi::Result<T>
 where
     Work: std::future::Future<Output = napi::Result<T>>,
 {
-    if policy.snapshot {
-        return on_snapshot(state, organization_id, policy, root(state)?, work).await;
-    }
     let deployment = state
         .deployments
         .deployment(
@@ -605,59 +633,6 @@ where
             else {
                 return Err(policy_moved());
             };
-            match work(state.pinned(&head)).await {
-                Err(moved) if is_policy_moved(&moved) => Err(policy_moved()),
-                result => result,
-            }
-        }
-        result => result,
-    }
-}
-
-/// [`on_deployment`] while new sessions keep a policy snapshot.
-async fn on_snapshot<T, Work>(
-    state: &State,
-    organization_id: &str,
-    policy: &deployments::HostedPolicy,
-    root: Option<String>,
-    work: impl Fn(State) -> Work,
-) -> napi::Result<T>
-where
-    Work: std::future::Future<Output = napi::Result<T>>,
-{
-    let agent_yell = state.reporting.is_some();
-    let kind = match root {
-        Some(root) => {
-            let store = state.store.clone();
-            tokio::task::spawn_blocking(move || store.family_kind(&TrajectoryId(root)))
-                .await
-                .map_err(panicked)?
-                .map_err(storage)?
-        }
-        None => None,
-    };
-    let Some(FamilyKind::Following(line)) = kind else {
-        let prepared = state
-            .deployments
-            .snapshot(&state.runtime, organization_id, policy, agent_yell)
-            .await?;
-        return work(state.snapshot(&DeploymentName::new(organization_id), &prepared)).await;
-    };
-    let frozen = |stale| {
-        state.deployments.frozen(
-            &state.runtime,
-            &state.store,
-            &line,
-            policy,
-            agent_yell,
-            stale,
-        )
-    };
-    let head = frozen(None).await?;
-    match work(state.pinned(&head)).await {
-        // A process that still publishes moved the head on: decide once more at it.
-        Err(moved) if is_policy_moved(&moved) => {
-            let head = frozen(Some(&head)).await?;
             match work(state.pinned(&head)).await {
                 Err(moved) if is_policy_moved(&moved) => Err(policy_moved()),
                 result => result,
@@ -923,11 +898,6 @@ pub struct DispatchPolicy {
     /// dispatch whose composition is no longer the stored one publishes nothing
     /// and is refused as retryable; absent, nothing is checked.
     pub composition_hash: Option<String>,
-    /// Whether new sessions keep a policy snapshot. While it is true nothing is
-    /// published: a new family opens pinned to `content` for its whole life, and
-    /// a family that follows the organization's line decides at the line's head
-    /// as it stands. Absent is false.
-    pub snapshot: Option<bool>,
 }
 
 #[napi(object)]
@@ -935,7 +905,7 @@ pub struct OpenappaStatus {
     pub trust: String,
     pub audience: String,
     /// The organization's policy revision the session's next event is decided under.
-    pub policy_revision: Option<i64>,
+    pub policy_revision: i64,
 }
 
 impl From<DispatchPolicy> for deployments::HostedPolicy {
@@ -944,7 +914,6 @@ impl From<DispatchPolicy> for deployments::HostedPolicy {
             content: policy.content,
             credentials: deployments::HostCredentials::new(policy.credentials),
             composition: policy.composition_hash,
-            snapshot: policy.snapshot.unwrap_or(false),
         }
     }
 }
@@ -1421,65 +1390,42 @@ pub async fn dispatch_hook(
     run(input, policy.into(), encryption).await
 }
 
-/// The policy text the runtime stored when `root` opened. Absent when the root
-/// has no log. This is the opening document, not an error message.
-#[napi(js_name = "readOpenappaOpeningPolicy")]
-pub async fn read_openappa_opening_policy(
-    root: String,
-    encryption: Option<ContentEncryption>,
-) -> napi::Result<Option<String>> {
-    if root.is_empty() || root.len() > 1024 || root.chars().any(char::is_control) {
+/// The kind of family each root opened as, in the order given, for the operator's
+/// preflight count: `following` for one that follows a deployment line, `legacy`
+/// for one pinned to a policy snapshot, `encrypted` for an opening sealed with a
+/// conversation key this read does not hold, and none for a root with no log.
+#[napi(js_name = "openappaRootKinds")]
+pub async fn openappa_root_kinds(roots: Vec<String>) -> napi::Result<Vec<Option<String>>> {
+    if roots
+        .iter()
+        .any(|root| root.is_empty() || root.len() > 1024 || root.chars().any(char::is_control))
+    {
         return Err(invalid_input("invalid root identity"));
     }
-    let state = initialized().await?.encrypted(encryption)?;
-    let leased = state.lease().await?;
-    tokio::task::spawn_blocking(move || match leased.state.store.log(&TrajectoryId(root)) {
-        Ok(log) => String::from_utf8(log.policy_file().to_vec())
-            .map(Some)
-            .map_err(|_| storage("OpenAPPA opening policy is not UTF-8")),
-        Err(appa_eventlog::ReadError::UnknownRoot { .. }) => Ok(None),
-        Err(read) => Err(storage(read)),
+    let leased = initialized().await?.lease().await?;
+    tokio::task::spawn_blocking(move || {
+        roots
+            .into_iter()
+            .map(|root| match leased.state.store.log(&TrajectoryId(root)) {
+                Ok(_) => Ok(Some("following".to_owned())),
+                Err(appa_eventlog::ReadError::LegacyFamily { .. }) => Ok(Some("legacy".to_owned())),
+                Err(appa_eventlog::ReadError::UnknownRoot { .. }) => Ok(None),
+                Err(read) if read.to_string().contains("requires its conversation key") => {
+                    Ok(Some("encrypted".to_owned()))
+                }
+                Err(read) => Err(read_failure(read)),
+            })
+            .collect()
     })
     .await
     .map_err(panicked)?
 }
 
-/// The policy file key each root's first stored batch names, in the order given:
-/// none for a batch that does not open a root this build can read. The host reads
-/// the batches; only this decoding knows how the runtime encodes them.
-#[napi(js_name = "openappaOpeningKeys")]
-pub fn openappa_opening_keys(batches: Vec<napi::bindgen_prelude::Buffer>) -> Vec<Option<String>> {
-    batches
-        .iter()
-        .map(|batch| opening_policy_file_key(batch))
-        .collect()
-}
-
-/// The policy file key a root's first batch names, read the way the event log
-/// encodes it: a bare array of facts, or a host record holding `facts`, whose
-/// first fact is `TrajectoryOpened`. None for anything else.
-fn opening_policy_file_key(payload: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    let facts = match &value {
-        serde_json::Value::Array(_) => &value,
-        serde_json::Value::Object(row) => row.get("facts")?,
-        _ => return None,
-    };
-    let key = facts
-        .get(0)?
-        .get("TrajectoryOpened")?
-        .get("policy_file_key")?
-        .as_str()?;
-    (key.len() == 64
-        && key
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
-    .then(|| key.to_owned())
-}
-
 /// Read the current label of a started session without mutating its trajectory.
 /// The read runs through a view pinned to the organization's deployment line, as
 /// a dispatch does: a family is read on the line it follows.
+/// None before the session started, and for a family opened under the earlier
+/// policy model, whose next event is refused instead.
 #[napi(js_name = "getOpenappaStatus")]
 pub async fn get_openappa_status(
     organization_id: String,
@@ -1505,17 +1451,14 @@ pub async fn get_openappa_status(
         let root = tokio::task::spawn_blocking(move || recorded_root(&lookup, &session))
             .await
             .map_err(panicked)??;
-        let Some(root) = root else { return Ok(None) };
-        on_deployment(
-            &state,
-            &organization_id,
-            &policy,
-            |_| Ok(Some(root)),
-            |pinned| {
-                let key = SessionKey::new(&organization_id, &session_id);
-                async move { session_status(pinned, key).await }
-            },
-        )
+        // An unstarted session has no status, and is no reason to publish.
+        if root.is_none() {
+            return Ok(None);
+        }
+        on_deployment(&state, &organization_id, &policy, |pinned| {
+            let key = SessionKey::new(&organization_id, &session_id);
+            async move { session_status(pinned, key).await }
+        })
         .await
     })
     .catch_unwind()
@@ -1545,7 +1488,8 @@ fn recorded_root(state: &State, key: &SessionKey) -> napi::Result<Option<String>
 async fn session_status(state: State, key: SessionKey) -> napi::Result<Option<OpenappaStatus>> {
     let policy_revision = state
         .served
-        .and_then(|revision| i64::try_from(revision).ok());
+        .and_then(|revision| i64::try_from(revision).ok())
+        .ok_or_else(|| invariant("OpenAPPA status was read outside a pinned deployment"))?;
     let leased = state.lease().await?;
     tokio::task::spawn_blocking(move || {
         let root = Sql(&leased.state.store).with_client(move |client| {
@@ -1558,11 +1502,15 @@ async fn session_status(state: State, key: SessionKey) -> napi::Result<Option<Op
         })?;
         let Some(root) = root else { return Ok(None) };
         let root = TrajectoryId(root);
-        let policy_revision = match leased.state.store.family_kind(&root).map_err(storage)? {
-            Some(FamilyKind::Following(_)) => policy_revision,
-            Some(FamilyKind::Pinned) | None => None,
+        let status = match leased.state.runtime.try_status(&root) {
+            Ok(status) => status,
+            // A family opened under the earlier policy model has no label to
+            // report: its next event is refused with `legacy_family`.
+            Err(appa_runtime::api::StatusReadError::Read(
+                appa_eventlog::ReadError::LegacyFamily { .. },
+            )) => return Ok(None),
+            Err(read) => return Err(status_read_failure(read)),
         };
-        let status = leased.state.runtime.try_status(&root).map_err(storage)?;
         Ok(Some(OpenappaStatus {
             trust: status.trust,
             audience: status.audience,
@@ -1699,16 +1647,10 @@ async fn run(
 ) -> napi::Result<String> {
     let result = AssertUnwindSafe(async {
         let state = initialized().await?.encrypted(encryption)?;
-        on_deployment(
-            &state,
-            &input.organization_id,
-            &policy,
-            |state| state.dispatch_root(&input).map(Some),
-            |pinned| {
-                let input = input.clone();
-                async move { pinned.dispatch(input).await }
-            },
-        )
+        on_deployment(&state, &input.organization_id, &policy, |pinned| {
+            let input = input.clone();
+            async move { pinned.dispatch(input).await }
+        })
         .await
     })
     .catch_unwind()
@@ -1833,7 +1775,6 @@ pub async fn load_offer_review(
     offer_id: String,
     encryption: Option<ContentEncryption>,
 ) -> napi::Result<Option<OfferReviewOutput>> {
-    let session_id_for_output = session_id.clone();
     // Mirror execute_remedy_by_offer: clone state, drop the mutex, then lease
     // a connection before host SQL so review loads never contend with
     // dispatches on the runtime state mutex.
@@ -1841,27 +1782,8 @@ pub async fn load_offer_review(
     let leased = state.lease().await?;
     let pg = &Sql(&leased.state.store);
     if pg.0.cipher().is_encrypted() {
-        for (input, decision) in encrypted_receipts(pg, &organization_id, &session_id)? {
-            let Some(review) = decision["review"].as_array().and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry["offer_id"].as_str() == Some(&offer_id))
-            }) else {
-                continue;
-            };
-            let source = input
-                .get("context")
-                .or_else(|| input.get("semantic"))
-                .unwrap_or(&input);
-            return Ok(Some(OfferReviewOutput {
-                offer_id,
-                session_id,
-                text: review["text"].as_str().unwrap_or_default().to_owned(),
-                tool: source["tool"].as_str().map(str::to_owned),
-                arguments: source.get("arguments").map(Value::to_string),
-            }));
-        }
-        return Ok(None);
+        let receipts = encrypted_receipts(pg, &organization_id, &session_id)?;
+        return Ok(review_in(receipts, &offer_id, &session_id));
     }
     // The SQL closure needs its own offer id copy because it must be 'static.
     let target_offer_id = offer_id.clone();
@@ -1878,35 +1800,72 @@ pub async fn load_offer_review(
             // its host context, or the semantic input of a receipt that
             // predates context.
             let row = client.query_opt(
-                "SELECT entry->>'text' AS text, \
-                 COALESCE(o.input->'context'->>'tool', o.input->'semantic'->>'tool') AS tool, \
-                 COALESCE(o.input->'context'->'arguments', o.input->'semantic'->'arguments')::text AS arguments \
-                 FROM openappa_operations o \
-                 CROSS JOIN LATERAL jsonb_array_elements(o.decision->'review') AS entry \
-                 WHERE o.organization_id=$1 AND o.session_id=$2 AND o.status='complete' \
-                 AND o.decision->'review' IS NOT NULL \
-                 AND entry->>'offer_id' = $3 \
-                 ORDER BY o.created_at DESC \
-                 LIMIT 1",
+                &format!(
+                    "SELECT entry->>'text' AS text, \
+                     COALESCE(o.input->'context'->>'tool', o.input->'semantic'->>'tool') AS tool, \
+                     COALESCE(o.input->'context'->'arguments', o.input->'semantic'->'arguments')::text AS arguments \
+                     FROM openappa_operations o \
+                     CROSS JOIN LATERAL jsonb_array_elements(o.decision->'review') AS entry \
+                     WHERE o.organization_id=$1 AND o.session_id=$2 AND o.status='complete' \
+                     AND NOT {} \
+                     AND o.decision->'review' IS NOT NULL \
+                     AND entry->>'offer_id' = $3 \
+                     ORDER BY o.created_at DESC \
+                     LIMIT 1",
+                    sealed::ESCAPED
+                ),
                 &[&organization_id, &session_id, &target_offer_id],
             )?;
-            Ok(row.map(|row| {
-                (
-                    row.get::<_, String>("text"),
-                    row.get::<_, Option<String>>("tool"),
-                    row.get::<_, Option<String>>("arguments"),
-                )
-            }))
+            if let Some(row) = row {
+                return Ok(Some(OfferReviewOutput {
+                    offer_id: target_offer_id,
+                    text: row.get("text"),
+                    session_id,
+                    tool: row.get("tool"),
+                    arguments: row.get("arguments"),
+                }));
+            }
+            let opened = sealed::read(
+                client,
+                &StorageCipher::Plain,
+                sealed::Receipts::Escaped,
+                "o.organization_id=$1 AND o.session_id=$2",
+                &[&organization_id, &session_id],
+            )?;
+            Ok(review_in(
+                opened.into_iter().map(|receipt| (receipt.input, receipt.decision)),
+                &target_offer_id,
+                &session_id,
+            ))
         })
         ?;
+    Ok(review)
+}
 
-    Ok(review.map(|(text, tool, arguments)| OfferReviewOutput {
-        offer_id,
-        text,
-        session_id: session_id_for_output,
-        tool,
-        arguments,
-    }))
+/// The review entry for `offer_id` among a session's receipts, newest first,
+/// with the reviewed call's tool and arguments.
+fn review_in(
+    receipts: impl IntoIterator<Item = (Value, Value)>,
+    offer_id: &str,
+    session_id: &str,
+) -> Option<OfferReviewOutput> {
+    receipts.into_iter().find_map(|(input, decision)| {
+        let review = decision["review"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["offer_id"].as_str() == Some(offer_id))?;
+        let source = input
+            .get("context")
+            .or_else(|| input.get("semantic"))
+            .unwrap_or(&input);
+        Some(OfferReviewOutput {
+            offer_id: offer_id.to_owned(),
+            session_id: session_id.to_owned(),
+            text: review["text"].as_str().unwrap_or_default().to_owned(),
+            tool: source["tool"].as_str().map(str::to_owned),
+            arguments: source.get("arguments").map(Value::to_string),
+        })
+    })
 }
 
 #[napi(object)]
@@ -1973,8 +1932,8 @@ pub async fn load_child_returns(
             &lookup.operation_prefix, &limit,
         ];
         let mut rows = client.query_raw(
-            "SELECT o.session_id AS child_session_id, \
-              o.operation_id, \
+            &format!("SELECT o.session_id AS child_session_id, \
+              o.operation_id, o.created_at, \
               COALESCE(o.input->'semantic'->>'event', o.input->>'event') AS event, \
               o.decision->>'decision' AS decision, \
               o.decision->>'value' AS decision_value, \
@@ -1982,7 +1941,7 @@ pub async fn load_child_returns(
               COALESCE(o.input->'semantic'->>'child_native_id', o.input->>'child_native_id') AS child_native_id, \
               COALESCE(o.input->'semantic'->>'output', o.input->>'output') AS output \
               FROM openappa_operations o \
-              WHERE o.organization_id=$1 AND o.status='complete' \
+              WHERE o.organization_id=$1 AND o.status='complete' AND NOT {ESCAPED} \
               AND EXISTS (SELECT 1 FROM openappa_sessions s \
                 WHERE s.session_id=o.session_id AND s.organization_id=$1 AND s.parent_id=$2) \
               AND COALESCE(o.input->'semantic'->>'event', o.input->>'event') IN ('child_end', 'child_return') \
@@ -1999,9 +1958,10 @@ pub async fn load_child_returns(
               AND ($3::text IS NULL OR o.session_id=$3) \
               AND ($4::text IS NULL OR left(o.operation_id,length($4))=$4) \
               ORDER BY o.created_at DESC, o.session_id, o.operation_id DESC LIMIT $5",
+                ESCAPED = sealed::ESCAPED),
             params.iter().copied(),
         )?;
-        let mut records = Vec::new();
+        let mut records: Vec<(SystemTime, ChildReturnRecord)> = Vec::new();
         let mut budget = ReceiptLookupBudget::default();
         while let Some(row) = rows.next()? {
             let event: Option<String> = row.get("event");
@@ -2020,15 +1980,61 @@ pub async fn load_child_returns(
             }) else {
                 continue;
             };
-            records.push(ChildReturnRecord {
+            records.push((row.get("created_at"), ChildReturnRecord {
                 child_session_id: row.get("child_session_id"),
                 spawn_call_id: row.get("spawn_call_id"),
                 child_native_id: row.get("child_native_id"),
                 operation_id: Some(crossed.operation_id),
                 value: crossed.value,
-            });
+            }));
         }
-        Ok(records)
+        drop(rows);
+        // The same lookup over the receipts SQL cannot read inside; crossed_return
+        // decides for them as for the rows above.
+        let opened = sealed::read(
+            client,
+            &StorageCipher::Plain,
+            sealed::Receipts::Escaped,
+            "o.organization_id=$1 \
+             AND EXISTS (SELECT 1 FROM openappa_sessions s \
+               WHERE s.session_id=o.session_id AND s.organization_id=$1 AND s.parent_id=$2) \
+             AND ($3::text IS NULL OR o.session_id=$3) \
+             AND ($4::text IS NULL OR left(o.operation_id,length($4))=$4)",
+            &params[..4],
+        )?;
+        let unsealed = records.len();
+        for receipt in opened {
+            let event = receipt.input_text("event");
+            let decision = receipt.decision_text("decision");
+            let decision_value = receipt.decision_text("value");
+            let output = receipt.input_text("output");
+            let Some(crossed) = crossed_return(ReturnReceipt {
+                event: event.as_deref().unwrap_or(""),
+                operation_id: &receipt.operation_id,
+                decision: decision.as_deref().unwrap_or(""),
+                decision_value: decision_value.as_deref(),
+                output: output.as_deref(),
+            }) else {
+                continue;
+            };
+            budget.take(crossed.value.len())?;
+            records.push((receipt.created_at, ChildReturnRecord {
+                spawn_call_id: receipt.input_text("spawn_call_id"),
+                child_native_id: receipt.input_text("child_native_id"),
+                child_session_id: receipt.session_id,
+                operation_id: Some(crossed.operation_id),
+                value: crossed.value,
+            }));
+        }
+        if records.len() > unsealed {
+            records.sort_by(|(a_at, a), (b_at, b)| {
+                b_at.cmp(a_at)
+                    .then_with(|| a.child_session_id.cmp(&b.child_session_id))
+                    .then_with(|| b.operation_id.cmp(&a.operation_id))
+            });
+            records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        Ok(records.into_iter().map(|(_, record)| record).collect())
     })
     .map_err(sql_failure)
 }
@@ -2066,10 +2072,11 @@ pub async fn load_child_addresses(
         use postgres::{fallible_iterator::FallibleIterator, types::ToSql};
         let params: &[&(dyn ToSql + Sync)] = &[&organization_id, &child_session_id];
         let mut rows = client.query_raw(
-            "SELECT o.session_id AS parent_session_id, \
+            &format!(
+                "SELECT o.session_id AS parent_session_id, o.created_at, \
               COALESCE(o.input->'semantic'->>'output', o.input->>'output') AS value \
               FROM openappa_operations o \
-              WHERE o.organization_id=$1 AND o.status='complete' \
+              WHERE o.organization_id=$1 AND o.status='complete' AND NOT {ESCAPED} \
               AND EXISTS (SELECT 1 FROM openappa_sessions s \
                 WHERE s.organization_id=$1 AND s.session_id=$2 AND s.parent_id=o.session_id) \
               AND COALESCE(o.input->'semantic'->>'event', o.input->>'event') = 'child_address' \
@@ -2077,23 +2084,67 @@ pub async fn load_child_addresses(
               AND o.decision->>'decision' = 'ack' \
               AND COALESCE(o.input->'semantic'->>'output', o.input->>'output') IS NOT NULL \
               ORDER BY o.created_at LIMIT 10001",
+                ESCAPED = sealed::ESCAPED
+            ),
             params.iter().copied(),
         )?;
-        let mut records = Vec::new();
+        let mut records: Vec<(SystemTime, ChildAddressRecord)> = Vec::new();
         let mut budget = ReceiptLookupBudget::default();
         while let Some(row) = rows.next()? {
             let value: Option<String> = row.get("value");
             budget.take(value.as_deref().unwrap_or("").len())?;
-            records.push(ChildAddressRecord {
-                parent_session_id: row.get("parent_session_id"),
-                value: value.ok_or_else(|| {
-                    PostgresError("OpenAPPA retained a child address without a value".into())
-                })?,
-            });
+            records.push((
+                row.get("created_at"),
+                ChildAddressRecord {
+                    parent_session_id: row.get("parent_session_id"),
+                    value: value.ok_or_else(|| {
+                        PostgresError("OpenAPPA retained a child address without a value".into())
+                    })?,
+                },
+            ));
         }
-        Ok(records)
+        drop(rows);
+        let opened = sealed::read(
+            client,
+            &StorageCipher::Plain,
+            sealed::Receipts::Escaped,
+            "o.organization_id=$1 AND EXISTS (SELECT 1 FROM openappa_sessions s \
+               WHERE s.organization_id=$1 AND s.session_id=$2 AND s.parent_id=o.session_id)",
+            params,
+        )?;
+        let unsealed = records.len();
+        for receipt in opened {
+            if !addresses(&receipt, &child_session_id)
+                || receipt.decision_text("decision").as_deref() != Some("ack")
+            {
+                continue;
+            }
+            let Some(value) = receipt.input_text("output") else {
+                continue;
+            };
+            budget.take(value.len())?;
+            records.push((
+                receipt.created_at,
+                ChildAddressRecord {
+                    parent_session_id: receipt.session_id,
+                    value,
+                },
+            ));
+        }
+        if records.len() > unsealed {
+            records.sort_by_key(|(created_at, _)| *created_at);
+            // The same bound the SQL applies, over the merged list.
+            records.truncate(10_001);
+        }
+        Ok(records.into_iter().map(|(_, record)| record).collect())
     })
     .map_err(sql_failure)
+}
+
+/// Whether `receipt` is a ChildAddress to `child_session_id`.
+fn addresses(receipt: &sealed::OpenedReceipt, child_session_id: &str) -> bool {
+    receipt.input_text("event").as_deref() == Some("child_address")
+        && receipt.input_text("spawned_id").as_deref() == Some(child_session_id)
 }
 
 /// Whether this child's parent addressed it before the child's first event.
@@ -2103,7 +2154,7 @@ fn addressed_before_start(pg: &Sql<'_>, input: &Input) -> napi::Result<bool> {
     };
     let (organization_id, child) = (input.organization_id.clone(), input.session_id.clone());
     pg.with_client(move |client| {
-        Ok(client
+        let addressed = client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM openappa_operations o \
                   WHERE o.organization_id=$1 AND o.session_id=$2 AND o.status='complete' \
@@ -2111,7 +2162,18 @@ fn addressed_before_start(pg: &Sql<'_>, input: &Input) -> napi::Result<bool> {
                   AND COALESCE(o.input->'semantic'->>'spawned_id', o.input->>'spawned_id') = $3)",
                 &[&organization_id, &parent, &child],
             )?
-            .get::<_, bool>(0))
+            .get::<_, bool>(0);
+        if addressed {
+            return Ok(true);
+        }
+        let opened = sealed::read(
+            client,
+            &StorageCipher::Plain,
+            sealed::Receipts::Escaped,
+            "o.organization_id=$1 AND o.session_id=$2",
+            &[&organization_id, &parent],
+        )?;
+        Ok(opened.iter().any(|receipt| addresses(receipt, &child)))
     })
     .map_err(sql_failure)
 }
@@ -2225,9 +2287,9 @@ fn released_spawn_binding(
         if status != "complete" {
             return Ok(None);
         }
-        let input: Value = row.get("input");
+        let input = sealed::unescape(row.get("input"))?;
         let decision: Option<Value> = row.get("decision");
-        let Some(decision) = decision else {
+        let Some(decision) = decision.map(sealed::unescape).transpose()? else {
             return Ok(None);
         };
         let semantic = input.get("semantic").unwrap_or(&input);
@@ -2280,30 +2342,6 @@ fn rebind_child(root: &TrajectoryId, stored_actor: String) -> HookEvent {
 }
 
 impl State {
-    /// Retention can read this non-content mapping without a conversation key.
-    /// It cannot derive it later from an encrypted opening event.
-    fn record_encrypted_opening(&self, root: &str, organization_id: &str) -> napi::Result<()> {
-        if !self.store.cipher().is_encrypted() {
-            return Ok(());
-        }
-        let log = self
-            .store
-            .log(&TrajectoryId(root.to_owned()))
-            .map_err(storage)?;
-        let first = log
-            .facts()
-            .get(..1)
-            .ok_or_else(|| invariant("root has no opening event"))?;
-        let payload = serde_json::to_vec(first).map_err(invariant)?;
-        let policy_file_key = opening_policy_file_key(&payload)
-            .ok_or_else(|| invariant("root has no opening policy identity"))?;
-        let (root, organization_id) = (root.to_owned(), organization_id.to_owned());
-        Sql(&self.store).with_client(move |client| {
-            client.execute("INSERT INTO openappa_root_openings (root, organization_id, policy_file_key) VALUES ($1,$2,$3) ON CONFLICT (root) DO NOTHING", &[&root, &organization_id, &policy_file_key])?;
-            Ok(())
-        }).map_err(sql_failure)
-    }
-
     /// Opens this session's root as a fork of `fork_of`.
     /// Freezes the parent session's policy revision, labels, effects, and
     /// denials into the new root. Returns the parent watermark bounding inherited results.
@@ -2399,16 +2437,6 @@ impl State {
             store,
             ..self.clone()
         })
-    }
-
-    /// This state with its runtime serving the snapshot view of `prepared` on
-    /// `line`: new families open pinned to it and nothing is published.
-    fn snapshot(&self, line: &DeploymentName, prepared: &PreparedDeployment) -> State {
-        State {
-            runtime: Arc::new(self.runtime.snapshot(line, prepared)),
-            served: None,
-            ..self.clone()
-        }
     }
 
     /// This state with its runtime pinned to `deployment`: every lease of it, and
@@ -2676,7 +2704,6 @@ impl State {
             check_session_identity(&stored, &root, &input)?;
         }
 
-        self.record_encrypted_opening(&root, &key.organization_id)?;
         let receipts = lease::Receipts::new(self.store.clone());
         let began = lease::log_end(pg, &root)?;
         let work = self.handle_event(pg, &receipts, input, root.clone(), key, actor);
@@ -3536,11 +3563,10 @@ fn render_remedy_outcome(outcome: RemedyOutcome, act: &RemedyAct) -> napi::Resul
             false,
             render_human_denial(&presentation, act).unwrap_or(presentation.feedback),
         ),
-        RemedyOutcome::NoAnswer { feedback } => {
-            return Err(remedy_refused(format!(
-                "OpenAPPA remedy awaiting an answer: {feedback}"
-            )));
-        }
+        // The offer stands and the feedback tells the model what to do next:
+        // an answer for it, not a runtime failure that ends the turn. It is an
+        // error result because nothing was released.
+        RemedyOutcome::NoAnswer { feedback } => (OutputSource::Runtime, None, true, feedback),
         RemedyOutcome::Refused {
             reason: appa_runtime::api::RemedyRefusal::Runtime { detail },
         } => {
@@ -3600,10 +3626,13 @@ fn render_human_denial(presentation: &RemedyPresentation, act: &RemedyAct) -> Op
             || "this call".to_owned(),
             |tool| format!("this call to {tool}"),
         );
+    // The runtime records the denial on the call: proposed again in this
+    // session, the call gets no plan naming the reviewer.
     let mut text = format!(
         "[appa] Denied: the human reviewer refused {target}. It did not run and will not run. \
          Do not retry it or re-submit it with changed arguments or encoding to get another \
-         approval; tell the user it was denied."
+         approval; tell the user it was denied. The denial holds for the rest of this session, \
+         also when the user asks for the same call again; a new session can ask for it again."
     );
     if !presentation.offers.is_empty() {
         text.push_str("\n\nThe policy still offers options that do not need this reviewer:\n");
@@ -3629,7 +3658,7 @@ fn render_released_call(status: &str, call: &ProposedCall, owner: Option<&OfferO
         return format!(
             "[appa] {status}. Call the {dispatch} tool again with exactly these arguments: {{\"tool_name\":{},\"tool_args\":{}}}",
             Value::String(spelled_tool(&call.tool)),
-            call.arguments.get()
+            retry_arguments(call)
         );
     }
     let tool = owner
@@ -3641,8 +3670,71 @@ fn render_released_call(status: &str, call: &ProposedCall, owner: Option<&OfferO
     // not credit the model with the choice.
     format!(
         "[appa] {status}. Tell the user in your reply which plan was accepted. Make this your next call: until it runs, the session keeps its current label and calls that need the plan stay blocked. Call the {tool} tool again with exactly these arguments: {}",
-        call.arguments.get()
+        retry_arguments(call)
     )
+}
+
+/// The released call's arguments as the client spelled them. Before the
+/// runtime judges a call, the backend (`normalizeToolArgumentsForPolicy`)
+/// copies a command tool's `command` argument to `cmd`, or `cmd` to
+/// `command`, and a Read, Write or Edit call's `path` to `file_path` when it
+/// has none, so a rule matches every client's spelling. The client's tool
+/// accepts only its own spelling, and a model that follows the tool schema
+/// cannot send the copy, so the retry text leaves it out. The backend copies
+/// the retry the same way, so the retry still matches the released call.
+fn retry_arguments(call: &ProposedCall) -> String {
+    let raw = call.arguments.get();
+    let tool = call.tool.as_str();
+    let tool = tool
+        .strip_prefix("builtin:")
+        .or_else(|| {
+            tool.strip_prefix("host/")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(_, name)| name)
+        })
+        .unwrap_or(tool);
+    let lowered = tool.to_ascii_lowercase();
+    // The same tools the backend copies an argument for.
+    let command_tool = matches!(
+        lowered.as_str(),
+        "bash" | "shell" | "exec_command" | "run_command" | "cmd"
+    );
+    let path_file_tool = matches!(tool, "Read" | "Write" | "Edit");
+    if !command_tool && !path_file_tool {
+        return raw.to_owned();
+    }
+    let Ok(Value::Object(arguments)) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_owned();
+    };
+    let copies = |original: &str, copy: &str| {
+        arguments.get(original).is_some() && arguments.get(original) == arguments.get(copy)
+    };
+    // The path copy reads `/` where a Windows client sent `\`.
+    let path_copied = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| arguments.get("file_path").and_then(Value::as_str) == Some(&path));
+    let copy = if command_tool && copies("command", "cmd") {
+        // Codex's exec_command is the one command tool that spells it `cmd`.
+        if lowered == "exec_command" {
+            "command"
+        } else {
+            "cmd"
+        }
+    } else if path_file_tool && path_copied {
+        // Only a call without `file_path` gets the copy.
+        "file_path"
+    } else {
+        return raw.to_owned();
+    };
+    Value::Object(
+        arguments
+            .into_iter()
+            .filter(|(name, _)| name != copy)
+            .collect(),
+    )
+    .to_string()
 }
 
 fn remedy_operation(input: &Input) -> napi::Result<String> {
@@ -4082,19 +4174,19 @@ fn encrypted_receipts(
     let (organization_id, session_id) = (organization_id.to_owned(), session_id.to_owned());
     let cipher = pg.0.cipher().clone();
     pg.with_client(move |client| {
-        use postgres::fallible_iterator::FallibleIterator;
-        let mut rows = client.query_raw("SELECT operation_id, input, decision FROM openappa_operations WHERE organization_id=$1 AND session_id=$2 AND status='complete' ORDER BY created_at DESC LIMIT 10001", [&organization_id, &session_id])?;
-        let mut budget = ReceiptLookupBudget::default();
-        let mut result = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0);
-            let input = cipher.open_json(&field_context(&["openappa_operations", &organization_id, &session_id, &id, "input"]), row.get(1))?;
-            let decision = cipher.open_json(&field_context(&["openappa_operations", &organization_id, &session_id, &id, "decision"]), row.get(2))?;
-            budget.take(input.to_string().len() + decision.to_string().len())?;
-            result.push((input, decision));
-        }
-        Ok(result)
-    }).map_err(sql_failure)
+        let receipts = sealed::read(
+            client,
+            &cipher,
+            sealed::Receipts::All,
+            "o.organization_id=$1 AND o.session_id=$2",
+            &[&organization_id, &session_id],
+        )?;
+        Ok(receipts
+            .into_iter()
+            .map(|receipt| (receipt.input, receipt.decision))
+            .collect())
+    })
+    .map_err(sql_failure)
 }
 
 fn recorded_call_presentation(
@@ -4104,44 +4196,24 @@ fn recorded_call_presentation(
     offer_id: &str,
 ) -> napi::Result<CallPresentation> {
     if pg.0.cipher().is_encrypted() {
-        let rows = encrypted_receipts(pg, organization_id, session_id)?;
-        for (input, decision) in rows {
-            let matches = ["offers", "review"].iter().any(|field| {
-                decision[*field].as_array().is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| entry["offer_id"].as_str() == Some(offer_id))
-                })
-            });
-            if matches {
-                let semantic = input.get("semantic").unwrap_or(&input);
-                return Ok(presentation_from_receipt(
-                    input.get("context"),
-                    input
-                        .get("context")
-                        .and_then(|v| v["tool"].as_str())
-                        .or_else(|| semantic["tool"].as_str())
-                        .map(str::to_owned),
-                    semantic["event"].as_str(),
-                ));
-            }
-        }
-        return Ok(CallPresentation::default());
+        let receipts = encrypted_receipts(pg, organization_id, session_id)?;
+        return Ok(presentation_in(receipts, offer_id).unwrap_or_default());
     }
     let (organization_id, session_id, offer_id) = (
         organization_id.to_owned(),
         session_id.to_owned(),
         offer_id.to_owned(),
     );
-    let row = pg
+    let presentation = pg
         .with_client(move |client| {
-            Ok(client
-                .query_opt(
+            let row = client.query_opt(
+                &format!(
                     "SELECT o.input->'context' AS context, \
                      COALESCE(o.input->'context'->>'tool', o.input->'semantic'->>'tool', o.input->>'tool') AS tool, \
                      COALESCE(o.input->'semantic'->>'event', o.input->>'event') AS event \
                      FROM openappa_operations o \
                      WHERE o.organization_id=$1 AND o.session_id=$2 AND o.status='complete' \
+                     AND NOT {} \
                      AND ( \
                        EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(o.decision->'offers', '[]'::jsonb)) AS offer \
                          WHERE offer->>'offer_id' = $3) \
@@ -4150,22 +4222,61 @@ fn recorded_call_presentation(
                      ) \
                      ORDER BY o.created_at DESC \
                      LIMIT 1",
-                    &[&organization_id, &session_id, &offer_id],
-                )?
-                .map(|row| {
-                    (
-                        row.get::<_, Option<Value>>("context"),
-                        row.get::<_, Option<String>>("tool"),
-                        row.get::<_, Option<String>>("event"),
-                    )
-                }))
+                    sealed::ESCAPED
+                ),
+                &[&organization_id, &session_id, &offer_id],
+            )?;
+            if let Some(row) = row {
+                let context: Option<Value> = row.get("context");
+                return Ok(Some(presentation_from_receipt(
+                    context.as_ref(),
+                    row.get("tool"),
+                    row.get::<_, Option<String>>("event").as_deref(),
+                )));
+            }
+            let opened = sealed::read(
+                client,
+                &StorageCipher::Plain,
+                sealed::Receipts::Escaped,
+                "o.organization_id=$1 AND o.session_id=$2",
+                &[&organization_id, &session_id],
+            )?;
+            Ok(presentation_in(
+                opened.into_iter().map(|receipt| (receipt.input, receipt.decision)),
+                &offer_id,
+            ))
         })
         ?;
-    Ok(match row {
-        Some((context, tool, event)) => {
-            presentation_from_receipt(context.as_ref(), tool, event.as_deref())
+    Ok(presentation.unwrap_or_default())
+}
+
+/// The presentation of the call whose receipt offered or reviewed `offer_id`,
+/// among a session's receipts, newest first.
+fn presentation_in(
+    receipts: impl IntoIterator<Item = (Value, Value)>,
+    offer_id: &str,
+) -> Option<CallPresentation> {
+    receipts.into_iter().find_map(|(input, decision)| {
+        let matches = ["offers", "review"].iter().any(|field| {
+            decision[*field].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["offer_id"].as_str() == Some(offer_id))
+            })
+        });
+        if !matches {
+            return None;
         }
-        None => CallPresentation::default(),
+        let semantic = input.get("semantic").unwrap_or(&input);
+        Some(presentation_from_receipt(
+            input.get("context"),
+            input
+                .get("context")
+                .and_then(|v| v["tool"].as_str())
+                .or_else(|| semantic["tool"].as_str())
+                .map(str::to_owned),
+            semantic["event"].as_str(),
+        ))
     })
 }
 
@@ -4650,6 +4761,70 @@ mod typed_tests {
     }
 
     #[test]
+    fn released_call_names_only_the_clients_own_arguments() {
+        let released = |tool: &str, arguments: serde_json::Value| {
+            let call = appa_runtime_api::ProposedCall {
+                tool: tool.to_owned(),
+                arguments: serde_json::value::to_raw_value(&arguments).unwrap(),
+                cwd: None,
+            };
+            let text = render_released_call("Authorized", &call, None);
+            let (_, json) = text.split_once("exactly these arguments: ").unwrap();
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        };
+
+        // Kimi Code's Bash refuses unknown arguments, so a retry that had to
+        // carry the backend's `cmd` copy could never match.
+        assert_eq!(
+            released(
+                "Bash",
+                serde_json::json!({ "command": "curl -s http://127.0.0.1/", "timeout": 30, "cmd": "curl -s http://127.0.0.1/" })
+            ),
+            serde_json::json!({ "command": "curl -s http://127.0.0.1/", "timeout": 30 })
+        );
+        assert_eq!(
+            released(
+                "host/codex/exec_command",
+                serde_json::json!({ "cmd": "git status", "command": "git status" })
+            ),
+            serde_json::json!({ "cmd": "git status" })
+        );
+        // Values that differ are the client's own, and other tools keep theirs.
+        assert_eq!(
+            released("bash", serde_json::json!({ "command": "ls", "cmd": "pwd" })),
+            serde_json::json!({ "command": "ls", "cmd": "pwd" })
+        );
+        assert_eq!(
+            released(
+                "client_tool",
+                serde_json::json!({ "command": "ls", "cmd": "ls" })
+            ),
+            serde_json::json!({ "command": "ls", "cmd": "ls" })
+        );
+        // Kimi Code's Read names the file `path`; the backend adds `file_path`.
+        assert_eq!(
+            released(
+                "Read",
+                serde_json::json!({ "path": "/repo/.env", "file_path": "/repo/.env" })
+            ),
+            serde_json::json!({ "path": "/repo/.env" })
+        );
+        // A Windows path is copied with forward slashes.
+        assert_eq!(
+            released(
+                "Read",
+                serde_json::json!({ "path": "C:\\Users\\me\\.npmrc", "file_path": "C:/Users/me/.npmrc" })
+            ),
+            serde_json::json!({ "path": "C:\\Users\\me\\.npmrc" })
+        );
+        // Claude Code's Read keeps its own `file_path`.
+        assert_eq!(
+            released("Read", serde_json::json!({ "file_path": "/repo/.env" })),
+            serde_json::json!({ "file_path": "/repo/.env" })
+        );
+    }
+
+    #[test]
     fn a_blocked_result_repeats_the_ruling_and_steers_the_model() {
         let ruling = "[appa] Blocked: read_secret cannot run yet.\n\nWhy:\n  - allowed readers would narrow: public -> 1 reader";
         let response = authoritative_unexecuted_response(serde_json::json!({
@@ -4877,6 +5052,25 @@ mod remedy_tests {
     }
 
     #[test]
+    fn a_remedy_with_no_answer_reaches_the_model_as_an_error_result() {
+        let feedback = "[appa] the return declaration is refused: the reserved attest-schema \
+                        sanitizer is not registered, or its rank is above this trajectory's; \
+                        the offer stands and may be executed again";
+        let response = render(
+            RemedyOutcome::NoAnswer {
+                feedback: feedback.to_owned(),
+            },
+            &owner(None),
+            None,
+        );
+
+        assert_eq!(text(&response), feedback);
+        assert_eq!(response["result"]["content"][0]["text"], feedback);
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(response["output_source"], "runtime");
+    }
+
+    #[test]
     fn a_human_denial_reads_as_final_under_the_name_the_model_called() {
         let owner = owner(Some("mcp__archestra__todo_write"));
         let response = render(declined(DENIED_BLOCK, &[]), &owner, Some(RulingInput::Deny));
@@ -4901,6 +5095,9 @@ mod remedy_tests {
         );
 
         assert!(text(&response).contains("this call to archestra__todo_write."));
+        // The runtime records the denial on the call, so asking again in this
+        // session gets no new review.
+        assert!(text(&response).contains("holds for the rest of this session"));
     }
 
     #[test]
@@ -5547,55 +5744,10 @@ mod stored_approved_output_tests {
 }
 
 #[cfg(test)]
-mod opening_key_tests {
-    use super::opening_policy_file_key;
-
-    const KEY: &str = "9f2c0a5b1e7d4c3a8b6f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3";
-
-    #[test]
-    fn reads_the_key_from_a_bare_batch_and_from_a_host_record() {
-        let opened =
-            format!(r#"{{"TrajectoryOpened":{{"trajectory":"r","policy_file_key":"{KEY}"}}}}"#);
-        assert_eq!(
-            opening_policy_file_key(format!("[{opened}]").as_bytes()).as_deref(),
-            Some(KEY)
-        );
-        assert_eq!(
-            opening_policy_file_key(format!(r#"{{"facts":[{opened}],"host":{{}}}}"#).as_bytes())
-                .as_deref(),
-            Some(KEY)
-        );
-    }
-
-    #[test]
-    fn answers_no_key_for_anything_that_does_not_open_a_root() {
-        for payload in [
-            "".to_string(),
-            "[".to_string(),
-            "\"not a batch\"".to_string(),
-            "[]".to_string(),
-            r#"[{"CallRecorded":{}}]"#.to_string(),
-            r#"[{"TrajectoryOpened":{"policy_file_key":"ABCDEF"}}]"#.to_string(),
-            format!(
-                r#"[{{"TrajectoryOpened":{{"policy_file_key":"{}"}}}}]"#,
-                KEY.to_uppercase()
-            ),
-            r#"{"host":{}}"#.to_string(),
-        ] {
-            assert_eq!(
-                opening_policy_file_key(payload.as_bytes()),
-                None,
-                "{payload}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod failure_tests {
     use super::{
         BindingFailure, Failure, RefusalClass, SqlError, failure, is_policy_moved, lease_lost,
-        policy_moved,
+        policy_moved, read_failure, status_read_failure,
     };
     use appa_eventlog::postgres::PostgresError;
     use serde_json::{Value, json};
@@ -5630,6 +5782,18 @@ mod failure_tests {
         )));
     }
 
+    /// A family opened under the earlier policy model reaches the host under its
+    /// own code, and no retry loop mistakes it for a moved policy.
+    #[test]
+    fn a_legacy_family_is_its_own_code_and_never_a_moved_policy() {
+        let kind = Failure::Refused(RefusalClass::LegacyFamily);
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!("legacy_family"));
+        assert!(!is_policy_moved(&failure(
+            kind,
+            "this trajectory family was opened before live policy revisions; open a new one"
+        )));
+    }
+
     /// A binding failure that names a runtime fault is spelled as the runtime's class.
     #[test]
     fn a_shared_fault_has_one_spelling() {
@@ -5644,6 +5808,66 @@ mod failure_tests {
                 serde_json::to_value(Failure::Binding(binding)).unwrap(),
                 serde_json::to_value(Failure::Refused(runtime)).unwrap(),
             );
+        }
+    }
+
+    /// A log the binding reads directly reports the class a dispatch reading it
+    /// would be refused with; only a failed read is storage.
+    #[test]
+    fn a_direct_log_read_reports_its_class() {
+        use appa_eventlog::ReadError;
+        for (read, expected) in [
+            (
+                ReadError::Undecodable {
+                    seq: 7,
+                    detail: "expected value".into(),
+                },
+                "untrusted_log",
+            ),
+            (
+                ReadError::PolicyFileMissing { key: "0a1b".into() },
+                "policy_unavailable",
+            ),
+            (
+                ReadError::LegacyFamily {
+                    root: "root".into(),
+                },
+                "legacy_family",
+            ),
+            (
+                ReadError::UnknownRoot {
+                    root: "gone".into(),
+                },
+                "trajectory",
+            ),
+            (
+                ReadError::Postgres(PostgresError("PostgreSQL ERROR (SQLSTATE 08006)".into())),
+                "storage",
+            ),
+        ] {
+            assert_eq!(code(&read_failure(read)), json!(expected));
+        }
+        use appa_runtime::api::StatusReadError;
+        for (read, expected) in [
+            (
+                StatusReadError::Policy("missing".into()),
+                "policy_unavailable",
+            ),
+            (StatusReadError::Replay("diverged".into()), "untrusted_log"),
+            (
+                StatusReadError::UnknownRoot {
+                    root: "gone".into(),
+                },
+                "trajectory",
+            ),
+            (
+                StatusReadError::Read(ReadError::Postgres(PostgresError(
+                    "PostgreSQL ERROR (SQLSTATE 57P01)".into(),
+                ))),
+                "storage",
+            ),
+        ] {
+            assert_eq!(code(&status_read_failure(read)), json!(expected));
         }
     }
 

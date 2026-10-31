@@ -1,4 +1,25 @@
 export const RouteId = {
+  ListAgentRuntimeTemplates: "listAgentRuntimeTemplates",
+  GetAgentRuntimeTemplate: "getAgentRuntimeTemplate",
+  GetRuntimeTemplateSettings: "getRuntimeTemplateSettings",
+  SaveRuntimeTemplateSettings: "saveRuntimeTemplateSettings",
+  AzureAudioSpeechWithDefaultAgent: "azureAudioSpeechWithDefaultAgent",
+  AzureAudioSpeechWithAgent: "azureAudioSpeechWithAgent",
+  AzureAudioTranscriptionsWithDefaultAgent:
+    "azureAudioTranscriptionsWithDefaultAgent",
+  AzureAudioTranscriptionsWithAgent: "azureAudioTranscriptionsWithAgent",
+  AzureAudioTranslationsWithDefaultAgent:
+    "azureAudioTranslationsWithDefaultAgent",
+  AzureAudioTranslationsWithAgent: "azureAudioTranslationsWithAgent",
+  OpenAiAudioSpeechWithDefaultAgent: "openAiAudioSpeechWithDefaultAgent",
+  OpenAiAudioSpeechWithAgent: "openAiAudioSpeechWithAgent",
+  OpenAiAudioTranscriptionsWithDefaultAgent:
+    "openAiAudioTranscriptionsWithDefaultAgent",
+  OpenAiAudioTranscriptionsWithAgent: "openAiAudioTranscriptionsWithAgent",
+  OpenAiAudioTranslationsWithDefaultAgent:
+    "openAiAudioTranslationsWithDefaultAgent",
+  OpenAiAudioTranslationsWithAgent: "openAiAudioTranslationsWithAgent",
+
   AnnotateGuardrailsTool: "annotateGuardrailsTool",
   GetOpenAppaPolicyTests: "getOpenAppaPolicyTests",
   InspectOpenAppaPolicyTests: "inspectOpenAppaPolicyTests",
@@ -36,6 +57,18 @@ export const RouteId = {
   GetDefaultMcpGateway: "getDefaultMcpGateway",
   GetLlmProxy: "getLlmProxy",
   UpdateLlmProxy: "updateLlmProxy",
+  GetAutoRoutingSettings: "getAutoRoutingSettings",
+  UpdateAutoRoutingSettings: "updateAutoRoutingSettings",
+  GetAutoRoutingPlans: "getAutoRoutingPlans",
+  GetAutoRoutingPlan: "getAutoRoutingPlan",
+  ReplanAutoRouting: "replanAutoRouting",
+  PreviewAutoRouting: "previewAutoRouting",
+  SimulateAutoRouting: "simulateAutoRouting",
+  GetAutoRoutingDiagnostics: "getAutoRoutingDiagnostics",
+  GetAutoRoutingBackfill: "getAutoRoutingBackfill",
+  ScanAutoRoutingBackfill: "scanAutoRoutingBackfill",
+  ScoreAutoRoutingBackfill: "scoreAutoRoutingBackfill",
+  CancelAutoRoutingBackfill: "cancelAutoRoutingBackfill",
   TransferSkillOwnership: "transferSkillOwnership",
   TransferPluginOwnership: "transferPluginOwnership",
   TransferProjectOwnership: "transferProjectOwnership",
@@ -101,6 +134,17 @@ export const RouteId = {
   GetAgentA2aDelegations: "getAgentA2aDelegations",
   SyncAgentA2aDelegations: "syncAgentA2aDelegations",
   GetAllDelegationConnections: "getAllDelegationConnections",
+
+  // Dev Feedback Routes
+  GetDevFeedbackSetup: "getDevFeedbackSetup",
+  ListDevFeedbackBots: "listDevFeedbackBots",
+  ListDevFeedbackChannels: "listDevFeedbackChannels",
+  SaveDevFeedbackSetup: "saveDevFeedbackSetup",
+  GetDevFeedbackComments: "getDevFeedbackComments",
+  CreateDevFeedbackComment: "createDevFeedbackComment",
+  GetDevFeedbackReplies: "getDevFeedbackReplies",
+  CreateDevFeedbackReply: "createDevFeedbackReply",
+  ResolveDevFeedbackComment: "resolveDevFeedbackComment",
 
   // Config Routes
   GetConfig: "getConfig",
@@ -200,14 +244,6 @@ export const RouteId = {
   AddTeamExternalGroup: "addTeamExternalGroup",
   RemoveTeamExternalGroup: "removeTeamExternalGroup",
 
-  // Team Vault Folder Routes (BYOS - Bring Your Own Secrets)
-  GetTeamVaultFolder: "getTeamVaultFolder",
-  SetTeamVaultFolder: "setTeamVaultFolder",
-  DeleteTeamVaultFolder: "deleteTeamVaultFolder",
-  CheckTeamVaultFolderConnectivity: "checkTeamVaultFolderConnectivity",
-  ListTeamVaultFolderSecrets: "listTeamVaultFolderSecrets",
-  GetTeamVaultSecretKeys: "getTeamVaultSecretKeys",
-
   // Role Routes
   SearchInitialPermissionSubjects: "searchInitialPermissionSubjects",
   GetScopedCapabilities: "getScopedCapabilities",
@@ -249,6 +285,10 @@ export const RouteId = {
   OpenAiResponsesCompactWithAgent: "openAiResponsesCompactWithAgent",
   OpenAiEmbeddingsWithDefaultAgent: "openAiEmbeddingsWithDefaultAgent",
   OpenAiEmbeddingsWithAgent: "openAiEmbeddingsWithAgent",
+  OpenAiImagesWithDefaultAgent: "openAiImagesWithDefaultAgent",
+  OpenAiImagesWithAgent: "openAiImagesWithAgent",
+  OpenAiImageEditsWithDefaultAgent: "openAiImageEditsWithDefaultAgent",
+  OpenAiImageEditsWithAgent: "openAiImageEditsWithAgent",
   OpenAiListModelsWithDefaultAgent: "openAiListModelsWithDefaultAgent",
   OpenAiListModelsWithAgent: "openAiListModelsWithAgent",
 
@@ -264,6 +304,22 @@ export const RouteId = {
   ModelRouterEmbeddingsWithDefaultAgent:
     "modelRouterEmbeddingsWithDefaultAgent",
   ModelRouterEmbeddingsWithAgent: "modelRouterEmbeddingsWithAgent",
+  ModelRouterImagesWithDefaultAgent: "modelRouterImagesWithDefaultAgent",
+  ModelRouterImagesWithAgent: "modelRouterImagesWithAgent",
+  ModelRouterImageEditsWithDefaultAgent:
+    "modelRouterImageEditsWithDefaultAgent",
+  ModelRouterImageEditsWithAgent: "modelRouterImageEditsWithAgent",
+  ModelRouterAudioSpeechWithDefaultAgent:
+    "modelRouterAudioSpeechWithDefaultAgent",
+  ModelRouterAudioSpeechWithAgent: "modelRouterAudioSpeechWithAgent",
+  ModelRouterAudioTranscriptionsWithDefaultAgent:
+    "modelRouterAudioTranscriptionsWithDefaultAgent",
+  ModelRouterAudioTranscriptionsWithAgent:
+    "modelRouterAudioTranscriptionsWithAgent",
+  ModelRouterAudioTranslationsWithDefaultAgent:
+    "modelRouterAudioTranslationsWithDefaultAgent",
+  ModelRouterAudioTranslationsWithAgent:
+    "modelRouterAudioTranslationsWithAgent",
 
   // Proxy Routes - Gemini
   GeminiEmbeddingsWithDefaultAgent: "geminiEmbeddingsWithDefaultAgent",
@@ -306,6 +362,9 @@ export const RouteId = {
   // Proxy Routes - xAI
   XaiChatCompletionsWithDefaultAgent: "xaiChatCompletionsWithDefaultAgent",
   XaiChatCompletionsWithAgent: "xaiChatCompletionsWithAgent",
+  // Proxy Routes - xAI Responses (served over xAI's chat completions)
+  XaiResponsesWithDefaultAgent: "xaiResponsesWithDefaultAgent",
+  XaiResponsesWithAgent: "xaiResponsesWithAgent",
 
   // Proxy Routes - OpenRouter
   OpenrouterChatCompletionsWithDefaultAgent:
@@ -351,6 +410,11 @@ export const RouteId = {
   // Proxy Routes - Kimi (Moonshot AI)
   KimiChatCompletionsWithDefaultAgent: "kimiChatCompletionsWithDefaultAgent",
   KimiChatCompletionsWithAgent: "kimiChatCompletionsWithAgent",
+
+  // Proxy Routes - Kimi Code (membership plans)
+  KimiCodeChatCompletionsWithDefaultAgent:
+    "kimiCodeChatCompletionsWithDefaultAgent",
+  KimiCodeChatCompletionsWithAgent: "kimiCodeChatCompletionsWithAgent",
 
   // Proxy Routes - AWS Bedrock
   BedrockConverseWithDefaultAgent: "bedrockConverseWithDefaultAgent",
@@ -431,6 +495,22 @@ export const RouteId = {
   AzureChatCompletionsWithAgent: "azureChatCompletionsWithAgent",
   AzureResponsesWithDefaultAgent: "azureResponsesWithDefaultAgent",
   AzureResponsesWithAgent: "azureResponsesWithAgent",
+  AzureRealtimeTurnWithDefaultAgent: "azureRealtimeTurnWithDefaultAgent",
+  AzureRealtimeTurnWithAgent: "azureRealtimeTurnWithAgent",
+  AzureImagesWithDefaultAgent: "azureImagesWithDefaultAgent",
+  AzureImagesWithAgent: "azureImagesWithAgent",
+  AzureImageEditsWithDefaultAgent: "azureImageEditsWithDefaultAgent",
+  AzureImageEditsWithAgent: "azureImageEditsWithAgent",
+  AzureCreateFile: "azureCreateFile",
+  AzureCreateFileWithAgent: "azureCreateFileWithAgent",
+  AzureListFiles: "azureListFiles",
+  AzureListFilesWithAgent: "azureListFilesWithAgent",
+  AzureRetrieveFile: "azureRetrieveFile",
+  AzureRetrieveFileWithAgent: "azureRetrieveFileWithAgent",
+  AzureFileContent: "azureFileContent",
+  AzureFileContentWithAgent: "azureFileContentWithAgent",
+  AzureDeleteFile: "azureDeleteFile",
+  AzureDeleteFileWithAgent: "azureDeleteFileWithAgent",
   AzureEmbeddingsWithDefaultAgent: "azureEmbeddingsWithDefaultAgent",
   AzureEmbeddingsWithAgent: "azureEmbeddingsWithAgent",
 
@@ -465,6 +545,11 @@ export const RouteId = {
   GetChatAttachmentContent: "getChatAttachmentContent",
   DeleteChatAttachment: "deleteChatAttachment",
   GetLlmModels: "getLlmModels",
+  GetModelPools: "getModelPools",
+  GetAvailableModelPools: "getAvailableModelPools",
+  CreateModelPool: "createModelPool",
+  UpdateModelPool: "updateModelPool",
+  DeleteModelPool: "deleteModelPool",
   GetLlmProviderModelLabelValues: "llmProviderModelLabelValues",
   GetLlmProviderModelLabelKeys: "llmProviderModelLabelKeys",
   SyncLlmModels: "syncLlmModels",
@@ -514,6 +599,7 @@ export const RouteId = {
   ListRuntimeCredentials: "listRuntimeCredentials",
   StartGitHubUserConnection: "startGitHubUserConnection",
   CompleteGitHubUserConnection: "completeGitHubUserConnection",
+  ExchangeGitHubActionsToken: "exchangeGitHubActionsToken",
   CreateRuntimeCredential: "createRuntimeCredential",
   GetRuntimeCredentialUsage: "getRuntimeCredentialUsage",
   UpdateRuntimeCredential: "updateRuntimeCredential",
@@ -590,6 +676,9 @@ export const RouteId = {
   GetLlmModelIdsByKey: "getLlmModelIdsByKey",
   GetLlmModelOptions: "getLlmModelOptions",
   UpdateModel: "updateModel",
+  PreviewModelCostBackfill: "previewModelCostBackfill",
+  StartModelCostBackfill: "startModelCostBackfill",
+  GetModelCostBackfill: "getModelCostBackfill",
   BulkUpdateModels: "bulkUpdateModels",
 
   // Limits Routes
@@ -599,6 +688,7 @@ export const RouteId = {
   CreateLimit: "createLimit",
   GetLimit: "getLimit",
   UpdateLimit: "updateLimit",
+  ResetLimitUsage: "resetLimitUsage",
   DeleteLimit: "deleteLimit",
   BulkDeleteLimits: "bulkDeleteLimits",
 
@@ -607,16 +697,18 @@ export const RouteId = {
   CreateDefaultUserLimit: "createDefaultUserLimit",
   UpdateDefaultUserLimit: "updateDefaultUserLimit",
   DeleteDefaultUserLimit: "deleteDefaultUserLimit",
+  ListUserLimitUsage: "listUserLimitUsage",
+  ResetUserLimitUsage: "resetUserLimitUsage",
 
   // Onboarding Routes
   GetOnboardingSeenNavItems: "getOnboardingSeenNavItems",
   MarkOnboardingNavItemsSeen: "markOnboardingNavItemsSeen",
   GetOnboardingSurveyEligibility: "getOnboardingSurveyEligibility",
   SubmitOnboardingSurvey: "submitOnboardingSurvey",
-  GetFeedbackPopupActivation: "getFeedbackPopupActivation",
 
   // Organization Routes
   GetOrganization: "getOrganization",
+  GetOrganizationDefaultModel: "getOrganizationDefaultModel",
   GetOnboardingStatus: "getOnboardingStatus",
   GetMemberSignupStatus: "getMemberSignupStatus",
   GetOrganizationMemberOptions: "getOrganizationMemberOptions",
@@ -703,8 +795,6 @@ export const RouteId = {
   // Member Routes
   GetMemberDefaultAgent: "getMemberDefaultAgent",
   UpdateMemberDefaultAgent: "updateMemberDefaultAgent",
-  GetMemberDefaultModel: "getMemberDefaultModel",
-  UpdateMemberDefaultModel: "updateMemberDefaultModel",
 
   // User Routes
   GetUserPermissionSources: "getUserPermissionSources",
@@ -737,7 +827,6 @@ export const RouteId = {
 
   // Secrets Routes
   GetSecretsType: "getSecretsType",
-  GetSecret: "getSecret",
   CheckSecretsConnectivity: "checkSecretsConnectivity",
 
   // Incoming Email Routes
@@ -748,6 +837,13 @@ export const RouteId = {
   GetAgentEmailAddress: "getAgentEmailAddress",
 
   // ChatOps Routes
+  GetJiraChatOpsConfig: "getJiraChatOpsConfig",
+  UpdateJiraChatOpsConfig: "updateJiraChatOpsConfig",
+  CreateJiraChatOpsBot: "createJiraChatOpsBot",
+  UpdateJiraChatOpsBot: "updateJiraChatOpsBot",
+  DeleteJiraChatOpsBot: "deleteJiraChatOpsBot",
+  ListJiraChatOpsProjects: "listJiraChatOpsProjects",
+  CreateJiraChatOpsBinding: "createJiraChatOpsBinding",
   GetChatOpsStatus: "getChatOpsStatus",
   ListChatOpsBindings: "listChatOpsBindings",
   DeleteChatOpsBinding: "deleteChatOpsBinding",
@@ -756,7 +852,9 @@ export const RouteId = {
   ApplyChatOpsBindingPlan: "applyChatOpsBindingPlan",
   CreateChatOpsDmBinding: "createChatOpsDmBinding",
   UpdateChatOpsConfigInQuickstart: "updateChatOpsConfigInQuickstart",
+  GetMsTeamsChatOpsConfig: "getMsTeamsChatOpsConfig",
   UpdateSlackChatOpsConfig: "updateSlackChatOpsConfig",
+  GetSlackChatOpsConfig: "getSlackChatOpsConfig",
   ListSlackAgentBots: "listSlackAgentBots",
   UpdateSlackAgentBot: "updateSlackAgentBot",
   DeleteSlackAgentBot: "deleteSlackAgentBot",
@@ -770,6 +868,7 @@ export const RouteId = {
   ListSlackRouterBotChannels: "listSlackRouterBotChannels",
   JoinSlackRouterBotChannel: "joinSlackRouterBotChannel",
   UpdateTelegramChatOpsConfig: "updateTelegramChatOpsConfig",
+  GetTelegramChatOpsConfig: "getTelegramChatOpsConfig",
   LinkTelegramChatOpsAccount: "linkTelegramChatOpsAccount",
   UnlinkTelegramChatOpsAccount: "unlinkTelegramChatOpsAccount",
   GenerateTelegramLinkCode: "generateTelegramLinkCode",
@@ -878,6 +977,16 @@ export const RouteId = {
   CreateAppaGithubRepository: "createAppaGithubRepository",
   StartAppaGithubApp: "startAppaGithubApp",
   CompleteAppaGithubApp: "completeAppaGithubApp",
+  StartCopilotGithubApp: "startCopilotGithubApp",
+  ConnectCopilotGithubAppCredential: "connectCopilotGithubAppCredential",
+  GetPendingCopilotGithubApp: "getPendingCopilotGithubApp",
+  DiscardCopilotGithubApp: "discardCopilotGithubApp",
+  InstallCopilotGithubApp: "installCopilotGithubApp",
+  ValidateExistingCopilotGithubApp: "validateExistingCopilotGithubApp",
+  ConnectExistingCopilotGithubApp: "connectExistingCopilotGithubApp",
+  GetCopilotGithubAppKeySummary: "getCopilotGithubAppKeySummary",
+  CheckCopilotGithubOrganization: "checkCopilotGithubOrganization",
+  CompleteCopilotGithubApp: "completeCopilotGithubApp",
   GetPendingAppaGithubApp: "getPendingAppaGithubApp",
   DiscardAppaGithubApp: "discardAppaGithubApp",
   InstallAppaGithubApp: "installAppaGithubApp",
@@ -889,6 +998,7 @@ export const RouteId = {
   GetOpenappaBatteryPolicySource: "getOpenappaBatteryPolicySource",
   GetOpenappaEffectivePolicy: "getOpenappaEffectivePolicy",
   GetOpenappaBatteryMatches: "getOpenappaBatteryMatches",
+  GetOpenappaBatteryInstall: "getOpenappaBatteryInstall",
   CreateOpenappaBatteryInstall: "createOpenappaBatteryInstall",
   UpdateOpenappaBatteryInstall: "updateOpenappaBatteryInstall",
   DeleteOpenappaBatteryInstall: "deleteOpenappaBatteryInstall",
@@ -896,6 +1006,8 @@ export const RouteId = {
   UploadOpenappaBatteryPackage: "uploadOpenappaBatteryPackage",
   DeleteOpenappaBatteryPackage: "deleteOpenappaBatteryPackage",
   SetOpenappaCredentialBinding: "setOpenappaCredentialBinding",
+  GetOpenappaCredentialBindings: "getOpenappaCredentialBindings",
+  GetOpenappaCredentialBinding: "getOpenappaCredentialBinding",
   GetOpenappaPolicyDeclarations: "getOpenappaPolicyDeclarations",
   ConsultOpenappaBatteryHelper: "consultOpenappaBatteryHelper",
   // white-label-ok: operation id for the builtin = "archestra" annotator route, a wire identifier
@@ -1009,6 +1121,7 @@ export const RouteId = {
   GetConnectionInstructions: "getConnectionInstructions",
   GetConnectionRuntime: "getConnectionRuntime",
   GetConnectionHealth: "getConnectionHealth",
+  RenderStartupGuard: "renderStartupGuard",
   GetConnectedClients: "getConnectedClients",
   DisconnectConnectedClient: "disconnectConnectedClient",
   GetConnectedClientLog: "getConnectedClientLog",

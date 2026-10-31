@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/tooltip";
 import { UnstyledButton } from "@/components/ui/unstyled-button";
 import { describeKey } from "@/components/virtual-key-badge";
+import { copilotCredentialSourceLabel } from "@/lib/organization-subscription";
 import { cn } from "@/lib/utils/tailwind";
 import { AgentIdenticon } from "./hue-avatar";
 import { isKnowledgeSource, type LogSession } from "./logs-table-format";
@@ -40,7 +41,7 @@ export function AgentCell({
     agent?.name ??
     session.profileName ??
     (isKnowledge
-      ? "Knowledge base"
+      ? (session.connectorName ?? "Knowledge base")
       : session.profileId === null
         ? "Deleted LLM proxy"
         : "Unknown agent");
@@ -79,6 +80,13 @@ export function AgentCell({
           {agentName}
         </div>
         <KeyLine session={session} kind={kind} />
+        {(session.copilotCredentialSources ?? []).length > 0 && (
+          <div className="truncate text-xs leading-4 text-muted-foreground">
+            {(session.copilotCredentialSources ?? [])
+              .map(copilotCredentialSourceLabel)
+              .join(", ")}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -93,7 +101,7 @@ type AgentKind = "agent" | "proxy" | "knowledge";
 const AGENT_KINDS: Record<AgentKind, { icon: typeof Bot; label: string }> = {
   agent: { icon: Bot, label: "Agent" },
   proxy: { icon: Layers, label: "LLM proxy" },
-  knowledge: { icon: Database, label: "Knowledge base" },
+  knowledge: { icon: Database, label: "Knowledge connector" },
 };
 
 function agentKind({

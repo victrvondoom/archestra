@@ -33,6 +33,7 @@ import sentryClient from "@/observability/sentry";
 import { isNoiseRoute } from "@/observability/utils";
 import { ATTR_ROUTE_CATEGORY } from "./attributes";
 import { getHttpInstrumentationConfig } from "./http-instrumentation";
+import { infrastructureSpansEnabled } from "./infrastructure-spans";
 
 const {
   api: { name, version },
@@ -57,7 +58,7 @@ const {
  * When Sentry is not configured, auto-instrumentations are only enabled if
  * ARCHESTRA_OTEL_VERBOSE_TRACING=true.
  */
-const enableAutoInstrumentations = sentryEnabled || verboseTracing;
+const enableAutoInstrumentations = infrastructureSpansEnabled();
 
 // Configure the OTLP exporter to send traces to the OpenTelemetry Collector
 const traceExporter = new OTLPTraceExporter(traceExporterConfig);
@@ -224,11 +225,7 @@ if (sentryClient) {
   }
 }
 
-// Gracefully shutdown the SDK on process exit
-process.on("SIGTERM", () => {
-  sdk
-    .shutdown()
-    .then(() => logger.info("Tracing terminated"))
-    .catch((error) => logger.error("Error terminating tracing", error))
-    .finally(() => process.exit(0));
-});
+// The server owns signals and flushes telemetry after requests and audit writes.
+export async function shutdownTelemetry(): Promise<void> {
+  await sdk.shutdown();
+}

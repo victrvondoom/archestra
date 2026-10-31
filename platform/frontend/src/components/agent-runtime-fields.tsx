@@ -3,9 +3,9 @@
 import {
   buildCustomAgentRuntime,
   getAgentRuntimeAllowedProtocols,
+  resolveAgentRuntimeTiers,
   TOOL_TRANSFER_CREDENTIAL_SHORT_NAME,
 } from "@archestra/shared";
-import { ChevronDown } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { ContainerDeploymentFields } from "@/components/container-deployment-fields";
@@ -20,11 +20,6 @@ import {
   SettingsSection,
   SettingsSectionGroup,
 } from "@/components/settings-section";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import { FieldDescription } from "@/components/ui/field-description";
 import { Input } from "@/components/ui/input";
 import {
@@ -42,16 +37,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { UnstyledButton } from "@/components/ui/unstyled-button";
 import { useHasPermissions } from "@/lib/auth/auth.query";
 import { useFeature } from "@/lib/config/config.query";
 import { useAppName } from "@/lib/hooks/use-app-name";
+import { useOrganization } from "@/lib/organization.query";
 import {
   type RuntimeCredentialDefinition,
   useCanAttachCredential,
   useRuntimeCredentials,
 } from "@/lib/runtime-credentials.query";
-import { cn } from "@/lib/utils/tailwind";
+
+export type AgentRuntimeTier = "S" | "M" | "L";
 
 export type AgentRuntimeConfig = {
   image: string;
@@ -60,12 +56,10 @@ export type AgentRuntimeConfig = {
   backend: "kubernetes";
   steerMode: "pipe" | "tmux_keys";
   privileged: boolean;
-  resources: {
-    cpuRequest?: string;
-    memoryRequest?: string;
-    cpuLimit?: string;
-    memoryLimit?: string;
-  } | null;
+  /** The default tier of a run's container; absent means M. */
+  tier?: AgentRuntimeTier;
+  /** The scaleup tier, the largest a run may ask for; absent means `tier`. */
+  maxTier?: AgentRuntimeTier;
   ports?: number[];
   environment: Array<{ key: string; value: string }> | null;
   credentials: Array<{
@@ -181,13 +175,16 @@ export function AgentRuntimeFields({
             </SettingsSection>
             <SettingsSection
               title="Limits"
-              description="Run lifetime, spend, and resources. Blank fields use installation defaults."
+              description="Run lifetime, spend and container size. Blank fields use installation defaults."
             >
               <AgentRuntimeRunLimits value={config} onChange={onChange} />
-              <AgentRuntimeContainerOptions
-                value={config}
-                onChange={onChange}
-              />
+              <AgentRuntimeTierFields value={config} onChange={onChange} />
+            </SettingsSection>
+            <SettingsSection
+              title="Access"
+              description="The ports people can open on a run, and whether its container may reach its host."
+            >
+              <AgentRuntimeAccessFields value={config} onChange={onChange} />
             </SettingsSection>
           </>
         )}
@@ -519,15 +516,16 @@ export function AgentRuntimeSteeringField({
   );
 }
 
-/** Limits plus container options, for surfaces with no section of their own. */
+/** Limits, tiers and access, for surfaces with no section of their own. */
 export function AgentRuntimeRunControls({
   value,
   onChange,
 }: RuntimeSectionProps) {
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <AgentRuntimeRunLimits value={value} onChange={onChange} />
-      <AgentRuntimeContainerOptions value={value} onChange={onChange} />
+      <AgentRuntimeTierFields value={value} onChange={onChange} />
+      <AgentRuntimeAccessFields value={value} onChange={onChange} />
     </div>
   );
 }
@@ -575,112 +573,106 @@ function AgentRuntimeRunLimits({ value, onChange }: RuntimeSectionProps) {
   );
 }
 
-/**
- * Resources, ports, and host access: rarely changed, so they sit closed
- * behind a one-line summary of what is set.
- */
-function AgentRuntimeContainerOptions({
-  value,
-  onChange,
-}: RuntimeSectionProps) {
+/** The tier a run's container gets, and the largest tier a run may ask for. */
+function AgentRuntimeTierFields({ value, onChange }: RuntimeSectionProps) {
   const update = (patch: Partial<AgentRuntimeConfig>) =>
     onChange({ ...value, ...patch });
   const runtimeDefaults = useFeature("agentRuntimeBackend");
-  const [open, setOpen] = useState(false);
+  // Sizes come from the organization's tier settings over the code defaults.
+  const { data: organization } = useOrganization();
+  const tiers = resolveAgentRuntimeTiers(organization?.agentRuntimeTiers);
+  const defaultTier = value.tier ?? runtimeDefaults?.defaultTier ?? "M";
+  // Never below the default tier: a smaller value counts as the default tier.
+  const scaleupTier =
+    value.maxTier &&
+    TIER_ORDER.indexOf(value.maxTier) > TIER_ORDER.indexOf(defaultTier)
+      ? value.maxTier
+      : defaultTier;
   return (
-    <Collapsible
-      open={open}
-      onOpenChange={setOpen}
-      className="rounded-md border"
-    >
-      <CollapsibleTrigger asChild>
-        <UnstyledButton
-          type="button"
-          className="flex w-full items-center gap-3 rounded-md px-4 py-3 text-left outline-none transition-colors hover:bg-muted/50 focus-visible:ring-[3px] focus-visible:ring-ring/50"
+    <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
+      <div className="space-y-2">
+        <Label htmlFor="agent-runtime-tier">Default tier</Label>
+        <Select
+          value={defaultTier}
+          onValueChange={(tier: AgentRuntimeTier) =>
+            // A default tier above the saved scaleup tier raises it too, so
+            // the saved pair matches what the form shows.
+            update(
+              TIER_ORDER.indexOf(tier) > TIER_ORDER.indexOf(scaleupTier)
+                ? { tier, maxTier: tier }
+                : { tier },
+            )
+          }
         >
-          <span className="min-w-0 flex-1">
-            <span className="block text-sm font-medium">
-              Resources and access
-            </span>
-            <span className="block truncate text-xs text-muted-foreground">
-              {containerOptionsSummary(value)}
-            </span>
-          </span>
-          <ChevronDown
-            aria-hidden="true"
-            className={cn(
-              "size-4 shrink-0 text-muted-foreground transition-transform",
-              open && "rotate-180",
-            )}
-          />
-        </UnstyledButton>
-      </CollapsibleTrigger>
-      <CollapsibleContent className="space-y-5 border-t px-4 py-4">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <ResourceField
-            id="agent-runtime-cpu-request"
-            label="CPU request"
-            placeholder={installationDefaultPlaceholder(
-              runtimeDefaults?.resources.cpuRequest,
-            )}
-            value={value.resources?.cpuRequest}
-            onChange={(cpuRequest) =>
-              updateResource(value, update, { cpuRequest })
-            }
-          />
-          <ResourceField
-            id="agent-runtime-cpu-limit"
-            label="CPU limit"
-            placeholder={installationDefaultPlaceholder("No limit")}
-            value={value.resources?.cpuLimit}
-            onChange={(cpuLimit) => updateResource(value, update, { cpuLimit })}
-          />
-          <ResourceField
-            id="agent-runtime-memory-request"
-            label="Memory request"
-            placeholder={installationDefaultPlaceholder(
-              runtimeDefaults?.resources.memoryRequest,
-            )}
-            value={value.resources?.memoryRequest}
-            onChange={(memoryRequest) =>
-              updateResource(value, update, { memoryRequest })
-            }
-          />
-          <ResourceField
-            id="agent-runtime-memory-limit"
-            label="Memory limit"
-            placeholder={installationDefaultPlaceholder(
-              runtimeDefaults?.resources.memoryLimit,
-            )}
-            value={value.resources?.memoryLimit}
-            onChange={(memoryLimit) =>
-              updateResource(value, update, { memoryLimit })
-            }
-          />
-        </div>
+          <SelectTrigger id="agent-runtime-tier" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIER_ORDER.map((tier) => (
+              <SelectItem key={tier} value={tier}>
+                {tierLabel(tier, tiers[tier])}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <FieldDescription>
+          The CPU and memory of a run's container. A caller that starts a run
+          can ask for another tier, up to the scaleup tier.
+        </FieldDescription>
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="agent-runtime-max-tier">Scaleup tier</Label>
+        <Select
+          value={scaleupTier}
+          onValueChange={(maxTier: AgentRuntimeTier) => update({ maxTier })}
+        >
+          <SelectTrigger id="agent-runtime-max-tier" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIER_ORDER.slice(TIER_ORDER.indexOf(defaultTier)).map((tier) => (
+              <SelectItem key={tier} value={tier}>
+                {tierLabel(tier, tiers[tier])}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <FieldDescription>
+          The largest tier a run may ask for. A run whose work needs more CPU or
+          memory starts a run of this agent at a larger tier and hands its work
+          over.
+        </FieldDescription>
+      </div>
+    </div>
+  );
+}
 
-        <RuntimePortsField
-          value={value.ports ?? []}
-          onChange={(ports) => update({ ports })}
+/** The ports people can open on a run, and host access. */
+function AgentRuntimeAccessFields({ value, onChange }: RuntimeSectionProps) {
+  const update = (patch: Partial<AgentRuntimeConfig>) =>
+    onChange({ ...value, ...patch });
+  return (
+    <div className="space-y-5">
+      <RuntimePortsField
+        value={value.ports ?? []}
+        onChange={(ports) => update({ ports })}
+      />
+      <div className="flex items-start gap-3">
+        <Switch
+          id="agent-runtime-privileged"
+          className="mt-0.5 shrink-0"
+          checked={value.privileged}
+          onCheckedChange={(privileged) => update({ privileged })}
         />
-
-        <div className="flex items-start gap-3">
-          <Switch
-            id="agent-runtime-privileged"
-            className="mt-0.5 shrink-0"
-            checked={value.privileged}
-            onCheckedChange={(privileged) => update({ privileged })}
-          />
-          <div className="min-w-0 space-y-1">
-            <Label htmlFor="agent-runtime-privileged">Privileged mode</Label>
-            <FieldDescription>
-              Gives the container elevated access to its host. Only Agent
-              administrators can turn it on.
-            </FieldDescription>
-          </div>
+        <div className="min-w-0 space-y-1">
+          <Label htmlFor="agent-runtime-privileged">Privileged mode</Label>
+          <FieldDescription>
+            Gives the container elevated access to its host. Only Agent
+            administrators can turn it on.
+          </FieldDescription>
         </div>
-      </CollapsibleContent>
-    </Collapsible>
+      </div>
+    </div>
   );
 }
 
@@ -877,57 +869,18 @@ function NumberField({
   );
 }
 
-function ResourceField({
-  id,
-  label,
-  placeholder,
-  value,
-  onChange,
-}: {
-  id: string;
-  label: string;
-  placeholder: string;
-  value?: string;
-  onChange: (value: string | undefined) => void;
-}) {
-  return (
-    <div className="space-y-2">
-      <Label htmlFor={id}>{label}</Label>
-      <Input
-        id={id}
-        value={value ?? ""}
-        onChange={(event) => onChange(event.target.value || undefined)}
-        placeholder={placeholder}
-      />
-    </div>
-  );
-}
+const TIER_ORDER: AgentRuntimeTier[] = ["S", "M", "L"];
 
-function containerOptionsSummary(config: AgentRuntimeConfig): string {
-  const resources = config.resources ?? {};
-  const parts = [
-    resources.cpuRequest && `CPU ${resources.cpuRequest}`,
-    resources.cpuLimit && `CPU limit ${resources.cpuLimit}`,
-    resources.memoryRequest && `Memory ${resources.memoryRequest}`,
-    resources.memoryLimit && `Memory limit ${resources.memoryLimit}`,
-    config.ports?.length &&
-      `${config.ports.length === 1 ? "Port" : "Ports"} ${config.ports.join(", ")}`,
-    config.privileged && "Privileged",
-  ].filter(Boolean);
-  return parts.length
-    ? parts.join(" · ")
-    : "Installation default CPU and memory, no forwarded ports";
-}
-
-function updateResource(
-  config: AgentRuntimeConfig,
-  update: (patch: Partial<AgentRuntimeConfig>) => void,
-  patch: NonNullable<AgentRuntimeConfig["resources"]>,
-) {
-  const resources = { ...(config.resources ?? {}), ...patch };
-  update({
-    resources: Object.values(resources).some(Boolean) ? resources : null,
-  });
+function tierLabel(
+  tier: AgentRuntimeTier,
+  resources?: {
+    cpuRequest: string;
+    memoryRequest: string;
+    memoryLimit: string;
+  },
+): string {
+  if (!resources) return tier;
+  return `${tier}: ${resources.cpuRequest} CPU, ${resources.memoryRequest} memory (${resources.memoryLimit} limit)`;
 }
 
 const ENVIRONMENT_KEY_LABELS: Record<string, string> = {

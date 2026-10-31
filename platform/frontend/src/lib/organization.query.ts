@@ -5,15 +5,21 @@ import {
   type archestraApiTypes,
   PLATFORM_ADMIN_ROLE_NAME,
 } from "@archestra/shared";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  QueryClientContext,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { Invitation } from "better-auth/plugins/organization";
 import { useRouter } from "next/navigation";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
 import { toast } from "sonner";
 import { awaitBootstrapSeed, useSession } from "@/lib/auth/auth.query";
 import { usePermissionSources } from "@/lib/auth/permission-sources.query";
 import { authClient } from "@/lib/clients/auth/auth-client";
 import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { isDocumentSeedFresh } from "@/lib/shell-deferral";
 import { environmentKeys } from "./environment.query";
 import { parseRoleAssignmentBlocked } from "./role-assignment-blocked";
 import {
@@ -64,6 +70,7 @@ export const organizationKeys = {
   activeMemberRole: (organizationId: string | undefined) =>
     [...organizationKeys.activeOrg(), "member-role", organizationId] as const,
   details: () => [...organizationKeys.all, "details"] as const,
+  defaultModel: () => [...organizationKeys.all, "default-model"] as const,
   onboardingStatus: () =>
     [...organizationKeys.all, "onboarding-status"] as const,
   memberSignupStatus: (userIds?: string[]) =>
@@ -329,9 +336,17 @@ export function useCreateInvitation(organizationId: string | undefined) {
  */
 export function useOrganization(
   enabled = true,
-  options: { fresh?: boolean } = {},
+  options: {
+    fresh?: boolean;
+    refetchInterval?: number;
+    refetchOnWindowFocus?: boolean | "always";
+  } = {},
 ) {
   const session = useSession();
+  // Read through the context, not useQueryClient(): that hook throws without
+  // a provider, and only the seed check below needs the client, so the hook
+  // keeps working where no provider is mounted.
+  const client = useContext(QueryClientContext);
   const { fresh = false } = options;
 
   return useQuery({
@@ -350,13 +365,35 @@ export function useOrganization(
     // Org settings (theme, app name, etc.) change rarely and all mutations
     // imperatively setQueryData() this key, so a long stale time keeps
     // re-mounts cheap. Connect opts into a fresh read because these settings
-    // authorize which setup artifacts may be generated.
+    // authorize which setup artifacts may be generated. A value the server
+    // read for this document (a seeded approval page) is that fresh read.
     staleTime: fresh ? 0 : 5 * 60 * 1000,
-    refetchOnMount: fresh ? "always" : undefined,
-    refetchOnWindowFocus: fresh || undefined,
+    refetchOnMount: fresh
+      ? (query) =>
+          client && isDocumentSeedFresh(client, query) ? false : "always"
+      : undefined,
+    refetchOnWindowFocus: options.refetchOnWindowFocus ?? (fresh || undefined),
+    refetchInterval: options.refetchInterval,
     // Restored on refresh: the shell reads the app name and theme from here,
     // so without it a reload repaints the branding a beat after the layout.
     meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * What "Organization default" runs on, readable by every member: the default
+ * model, or the trio auto routing routes it across.
+ */
+export function useOrganizationDefaultModelSummary(enabled = true) {
+  return useQuery({
+    queryKey: organizationKeys.defaultModel(),
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getOrganizationDefaultModel();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    enabled,
   });
 }
 
@@ -455,8 +492,13 @@ export function useUpdateSecuritySettings(
         await archestraApiSdk.updateSecuritySettings({ body: data });
 
       if (error) {
-        toast.error(onErrorMessage);
-        return null;
+        toast.error(onErrorMessage, { description: toApiError(error).message });
+        // A disable can commit before runtime cleanup fails. Refresh the policy
+        // even on an error; keep the form dirty so Save retries cleanup.
+        await queryClient.invalidateQueries({
+          queryKey: organizationKeys.details(),
+        });
+        throw toApiError(error);
       }
 
       return updatedOrganization;
@@ -555,6 +597,9 @@ export function useUpdateAgentSettings(
     onSuccess: (updatedOrganization) => {
       if (!updatedOrganization) return;
       queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.defaultModel(),
+      });
       toast.success(onSuccessMessage);
     },
   });

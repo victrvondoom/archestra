@@ -28,6 +28,7 @@ import type {
   Mistral,
   StreamAccumulatorState,
 } from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
 import {
   OpenAIRequestAdapter,
   OpenAIResponseAdapter,
@@ -158,8 +159,8 @@ class MistralStreamAdapter
   readonly provider = "mistral" as const;
   private delegate: OpenAIStreamAdapter;
 
-  constructor() {
-    this.delegate = new OpenAIStreamAdapter();
+  constructor(request?: MistralRequest) {
+    this.delegate = new OpenAIStreamAdapter("openai", request);
   }
 
   get state() {
@@ -221,8 +222,10 @@ export const mistralAdapterFactory: LLMProvider<
     return new MistralResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<MistralStreamChunk, MistralResponse> {
-    return new MistralStreamAdapter();
+  createStreamAdapter(
+    request?: MistralRequest,
+  ): LLMStreamAdapter<MistralStreamChunk, MistralResponse> {
+    return new MistralStreamAdapter(request);
   },
 
   extractApiKey(headers: MistralHeaders): string | undefined {
@@ -277,15 +280,9 @@ export const mistralAdapterFactory: LLMProvider<
       stream: true,
       stream_options: { include_usage: true },
     } as unknown as ChatCompletionCreateParamsStreaming;
-    const stream = await mistralClient.chat.completions.create(mistralRequest);
-
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const chunk of stream) {
-          yield chunk as MistralStreamChunk;
-        }
-      },
-    };
+    return streamChatCompletionChunks<MistralStreamChunk>(
+      mistralClient.chat.completions.create(mistralRequest),
+    );
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {

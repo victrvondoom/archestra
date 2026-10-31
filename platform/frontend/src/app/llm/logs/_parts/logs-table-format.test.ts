@@ -8,6 +8,7 @@ import {
   identiconHue,
   initialsOf,
   isFreeTierModel,
+  passThroughProvider,
   sessionTitleOf,
   shortModelName,
 } from "./logs-table-format";
@@ -49,6 +50,35 @@ describe("describeModelOrigin", () => {
     ).toEqual({ kind: "maker", provider: "gemini", name: "Google" });
   });
 
+  it("credits Moonshot with Kimi Code plan models", () => {
+    expect(
+      describeModelOrigin({
+        model: "k3.1-pro",
+        interactionType: "kimi-code:chatCompletions",
+      }),
+    ).toEqual({ kind: "maker", provider: "kimi", name: "Moonshot" });
+    expect(
+      describeModelOrigin({
+        model: "kimi-for-coding",
+        interactionType: "kimi-code:chatCompletions",
+      }),
+    ).toEqual({ kind: "maker", provider: "kimi", name: "Moonshot" });
+    // Only plan ids are Moonshot's.
+    expect(
+      describeModelOrigin({
+        model: "llama3.1",
+        interactionType: "kimi-code:chatCompletions",
+      }),
+    ).toEqual({ kind: "unknown", name: "Meta" });
+    // Another vendor's k-numbered model is not Moonshot's.
+    expect(
+      describeModelOrigin({
+        model: "k2-think",
+        interactionType: "ollama:chatCompletions",
+      }),
+    ).toEqual({ kind: "aggregator", provider: "ollama" });
+  });
+
   it("falls back to an aggregator that served an unrecognised model", () => {
     expect(
       describeModelOrigin({
@@ -68,6 +98,23 @@ describe("describeModelOrigin", () => {
     ).toEqual({ kind: "unknown", name: "Meta" });
   });
 
+  it("credits a first-party provider with an id no vendor pattern knows", () => {
+    // OpenAI serves only its own models, so an unfamiliar id on its endpoint
+    // (a moderation or speech model) is still OpenAI's.
+    expect(
+      describeModelOrigin({
+        model: "omni-moderation-latest",
+        interactionType: "openai:passthrough",
+      }),
+    ).toEqual({ kind: "maker", provider: "openai", name: "OpenAI" });
+    expect(
+      describeModelOrigin({
+        model: "omni-moderation-latest",
+        interactionType: null,
+      }),
+    ).toEqual({ kind: "unknown", name: "Self-hosted" });
+  });
+
   it.each([
     ["qwen/qwen3-coder", "Qwen"],
     ["acme-labs/widget-1", "Acme"],
@@ -77,6 +124,15 @@ describe("describeModelOrigin", () => {
       kind: "unknown",
       name,
     });
+  });
+});
+
+describe("passThroughProvider", () => {
+  it("names the provider of a pass-through call, which may name no model", () => {
+    expect(passThroughProvider("openai:passthrough")).toBe("openai");
+    expect(passThroughProvider("anthropic:passthrough")).toBe("anthropic");
+    expect(passThroughProvider("openai:chatCompletions")).toBeNull();
+    expect(passThroughProvider(null)).toBeNull();
   });
 });
 

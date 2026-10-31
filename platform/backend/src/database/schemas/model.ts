@@ -3,8 +3,10 @@ import type {
   SupportedProvider,
   SupportedProviderEndpoint,
 } from "@archestra/shared";
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -141,22 +143,22 @@ const modelsTable = pgTable(
 
     /** Custom admin-set price per million tokens for input (nullable, overrides models.dev price) */
     customPricePerMillionInput: numeric("custom_price_per_million_input", {
-      precision: 10,
-      scale: 2,
+      precision: 16,
+      scale: 8,
     }),
 
     /** Custom admin-set price per million tokens for output (nullable, overrides models.dev price) */
     customPricePerMillionOutput: numeric("custom_price_per_million_output", {
-      precision: 10,
-      scale: 2,
+      precision: 16,
+      scale: 8,
     }),
 
     /** Custom admin-set price per million cache-read tokens (nullable, overrides synced price) */
     customPricePerMillionCacheRead: numeric(
       "custom_price_per_million_cache_read",
       {
-        precision: 10,
-        scale: 2,
+        precision: 16,
+        scale: 8,
       },
     ),
 
@@ -164,9 +166,32 @@ const modelsTable = pgTable(
     customPricePerMillionCacheWrite: numeric(
       "custom_price_per_million_cache_write",
       {
-        precision: 10,
-        scale: 2,
+        precision: 16,
+        scale: 8,
       },
+    ),
+
+    /**
+     * Long-context pricing: once a request's prompt (input + cache read +
+     * cache write) exceeds this many tokens, the long prices below replace
+     * the base prices. Set all five together or none.
+     */
+    longContextThreshold: integer("long_context_threshold"),
+    longContextPricePerMillionInput: numeric(
+      "long_context_price_per_million_input",
+      { precision: 16, scale: 8 },
+    ),
+    longContextPricePerMillionOutput: numeric(
+      "long_context_price_per_million_output",
+      { precision: 16, scale: 8 },
+    ),
+    longContextPricePerMillionCacheRead: numeric(
+      "long_context_price_per_million_cache_read",
+      { precision: 16, scale: 8 },
+    ),
+    longContextPricePerMillionCacheWrite: numeric(
+      "long_context_price_per_million_cache_write",
+      { precision: 16, scale: 8 },
     ),
 
     /** Whether this model should be excluded from chat model selection. */
@@ -232,6 +257,10 @@ const modelsTable = pgTable(
     ),
     /** Index for lookups by external_id */
     externalIdIdx: index("models_external_id_idx").on(table.externalId),
+    longContextPricingCheck: check(
+      "models_long_context_pricing_check",
+      sql`num_nonnulls(${table.longContextThreshold}, ${table.longContextPricePerMillionInput}, ${table.longContextPricePerMillionOutput}, ${table.longContextPricePerMillionCacheRead}, ${table.longContextPricePerMillionCacheWrite}) IN (0, 5) AND (${table.longContextThreshold} IS NULL OR ${table.longContextThreshold} > 0)`,
+    ),
   }),
 );
 

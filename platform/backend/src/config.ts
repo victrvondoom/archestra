@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,7 +22,6 @@ import {
   DEFAULT_CHILD_CHUNK_SIZE_TOKENS,
   DEFAULT_CHUNK_SIZE_TOKENS,
   DEFAULT_CONTEXT_EXPANSION_RADIUS,
-  DEFAULT_MODELS,
   DEFAULT_VAULT_TOKEN,
   getAgentCatalogImages,
   getAgentCatalogImageTag,
@@ -39,15 +39,17 @@ import {
   type SupportedProvider,
   SupportedProviders,
 } from "@archestra/shared";
+import { normalizeVersion } from "@archestra/shared/version";
 import type { OTLPExporterNodeConfigBase } from "@opentelemetry/otlp-exporter-base";
 import dotenv from "dotenv";
+import { getAppVersion } from "@/app-version";
 import logger from "@/logging";
 import { SKILL_MARKETPLACE_PREFIX } from "@/routes/route-paths";
 import {
   type EmailProviderType,
   EmailProviderTypeSchema,
 } from "@/types/email-provider-type";
-import packageJson from "../../package.json";
+import { isValidCidr } from "@/utils/network";
 
 type ProcessType = "web" | "worker" | "all";
 type FileStorageProviderType = "db" | "filesystem" | "s3";
@@ -79,7 +81,7 @@ const environment = process.env.NODE_ENV?.toLowerCase() ?? "";
 const isProduction = ["production", "prod"].includes(environment);
 const isDevelopment = !isProduction;
 
-const appVersion = process.env.ARCHESTRA_VERSION || packageJson.version;
+const appVersion = getAppVersion();
 
 /**
  * Developer-only convenience: when set (and NOT in production), the login screen
@@ -91,6 +93,13 @@ const appVersion = process.env.ARCHESTRA_VERSION || packageJson.version;
 const devAutoAuthenticateEmail = isProduction
   ? undefined
   : process.env.ARCHESTRA_AUTH_DEV_AUTO_AUTHENTICATE_EMAIL?.trim() || undefined;
+
+// Settlement is no longer optional; an old deployment may still set the mode.
+if (process.env.ARCHESTRA_LLM_PROXY_USAGE_ACCOUNTING_MODE !== undefined) {
+  logger.warn(
+    "[config] ARCHESTRA_LLM_PROXY_USAGE_ACCOUNTING_MODE is no longer used: every request is settled and charged to its budgets. Remove it from your configuration.",
+  );
+}
 
 if (devAutoAuthenticateEmail) {
   logger.warn(
@@ -119,6 +128,26 @@ export function parseFrontendBaseUrl(rawValue: string | undefined): string {
 const frontendBaseUrl = parseFrontendBaseUrl(
   process.env.ARCHESTRA_FRONTEND_URL,
 );
+
+/** @public — validates an operator-provided webhook base URL. */
+export function parseChatopsWebhookBaseUrl(rawValue: string | undefined) {
+  const trimmed = rawValue?.trim();
+  if (!trimmed) return undefined;
+  const url = new URL(trimmed);
+  if (
+    !["https:", "http:"].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(
+      "ARCHESTRA_CHATOPS_WEBHOOK_BASE_URL must be an HTTP(S) base URL without credentials, query or fragment",
+    );
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
 const DEFAULT_POSTHOG_KEY = "phc_FFZO7LacnsvX2exKFWehLDAVaXLBfoBaJypdOuYoTk7";
 const DEFAULT_POSTHOG_HOST = "https://eu.i.posthog.com";
 
@@ -1578,7 +1607,7 @@ export const getAnalyticsConfig = () => {
 
 const mcpServerBaseImage =
   process.env.ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE ||
-  `europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-base:${appVersion}`;
+  `ghcr.io/archestra-ai/mcp-server-base:${appVersion}`;
 
 /**
  * Default resource requests/limits applied to generated MCP server
@@ -1815,6 +1844,45 @@ export const parseEngineDeniedCidrs = (
 };
 
 /**
+ * The Kubernetes API server CIDRs the SRE agent's MCP server may reach. Invalid
+ * entries are dropped loudly: one bad entry would otherwise make the API
+ * server reject the environment's whole egress policy.
+ *
+ * @public — exported for testability
+ */
+export const parseSreApiServerCidrs = (
+  envValue: string | undefined,
+): string[] => {
+  const entries = parseCommaSeparatedList(envValue ?? "");
+  const invalid = entries.filter((entry) => !isValidCidr(entry));
+  if (invalid.length > 0) {
+    logger.error(
+      `ARCHESTRA_SRE_APISERVER_CIDRS ignoring invalid CIDRs: ${invalid.join(", ")}`,
+    );
+  }
+  return [...new Set(entries.filter(isValidCidr))];
+};
+
+/**
+ * Parses `ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DNS_IPS`: the cluster resolver
+ * address(es) MCP, agent and sandbox egress policies allow DNS to. Each entry
+ * becomes a single-host ipBlock on port 53, so anything that is not one IP
+ * address (a CIDR, a hostname) is dropped loudly rather than widening the rule.
+ *
+ * @public — exported for testability
+ */
+export const parseClusterDnsIps = (envValue: string | undefined): string[] => {
+  const entries = parseCommaSeparatedList(envValue ?? "");
+  const invalid = entries.filter((entry) => isIP(entry) === 0);
+  if (invalid.length > 0) {
+    logger.error(
+      `ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DNS_IPS ignoring entries that are not IP addresses: ${invalid.join(", ")}`,
+    );
+  }
+  return entries.filter((entry) => isIP(entry) !== 0);
+};
+
+/**
  * Bytes in a Kubernetes memory quantity (`4Gi`, `512Mi`, `1G`, `1048576`), or
  * undefined when it is not one.
  *
@@ -2021,21 +2089,27 @@ const OFFER_SIGNING_DOMAIN = "archestra.openappa.offer-signing.v1";
  */
 export function parseOpenAppaConfig({
   yellEnabled,
+  yellForwardingEnabled,
   offerSigningSecret,
   postgresMaxConnections,
   reviewSummaryProvider,
   reviewSummaryModel,
-  keptAnnotatorHorizonDays,
   authSecret,
 }: {
   yellEnabled?: string;
+  yellForwardingEnabled?: string;
   offerSigningSecret?: string;
   postgresMaxConnections?: string;
   reviewSummaryProvider?: string;
   reviewSummaryModel?: string;
-  keptAnnotatorHorizonDays?: string;
   authSecret?: string;
 } = {}) {
+  const forwarding = yellForwardingEnabled?.trim() ?? "";
+  if (forwarding !== "" && forwarding !== "true" && forwarding !== "false") {
+    throw new Error(
+      "ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED must be true or false",
+    );
+  }
   const dedicated = offerSigningSecret ?? "";
   if (
     dedicated.length > 0 &&
@@ -2060,6 +2134,8 @@ export function parseOpenAppaConfig({
   return {
     enabled: true,
     yellEnabled: (yellEnabled ?? "true") === "true",
+    // External diagnostic delivery requires its own opt-in in every environment.
+    yellForwardingEnabled: forwarding === "true",
     offerSigningSecret: secret,
     postgresMaxConnections: parseOpenAppaPostgresMaxConnections(
       postgresMaxConnections,
@@ -2067,30 +2143,8 @@ export function parseOpenAppaConfig({
     // Omitted (not `undefined`) when disabled so exact-shape consumers and
     // tests do not observe a key for a feature that is off.
     ...(reviewSummary ? { reviewSummary } : {}),
-    keptAnnotatorHorizonDays: parseKeptAnnotatorHorizonDays(
-      keptAnnotatorHorizonDays,
-    ),
   };
 }
-
-/**
- * Days without activity after which an annotator kept for conversations that
- * started under an earlier policy is no longer kept. 0 keeps it for as long
- * as a stored opening policy names it.
- */
-function parseKeptAnnotatorHorizonDays(envValue?: string): number {
-  const value = envValue?.trim();
-  if (value === undefined || value === "")
-    return DEFAULT_KEPT_ANNOTATOR_HORIZON_DAYS;
-  if (!/^\d+$/.test(value) || Number(value) > MAX_KEPT_ANNOTATOR_HORIZON_DAYS)
-    throw new Error(
-      `ARCHESTRA_OPENAPPA_KEPT_ANNOTATOR_HORIZON_DAYS must be a whole number of days from 0 to ${MAX_KEPT_ANNOTATOR_HORIZON_DAYS}`,
-    );
-  return Number(value);
-}
-
-const DEFAULT_KEPT_ANNOTATOR_HORIZON_DAYS = 30;
-const MAX_KEPT_ANNOTATOR_HORIZON_DAYS = 3650;
 
 function deriveOfferSigningSecret(authSecret: string | undefined): string {
   if (!authSecret) return "";
@@ -2208,27 +2262,83 @@ const authSessionSecret =
 
 const openappa = parseOpenAppaConfig({
   yellEnabled: process.env.ARCHESTRA_OPENAPPA_YELL_ENABLED,
+  yellForwardingEnabled: process.env.ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED,
   offerSigningSecret: process.env.ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET,
   postgresMaxConnections:
     process.env.ARCHESTRA_OPENAPPA_POSTGRES_MAX_CONNECTIONS,
   reviewSummaryProvider: process.env.ARCHESTRA_OPENAPPA_REVIEW_SUMMARY_PROVIDER,
   reviewSummaryModel: process.env.ARCHESTRA_OPENAPPA_REVIEW_SUMMARY_MODEL,
-  keptAnnotatorHorizonDays:
-    process.env.ARCHESTRA_OPENAPPA_KEPT_ANNOTATOR_HORIZON_DAYS,
   authSecret: authSessionSecret,
 });
 const llmProxyPlugins = parseLlmProxyPlugins(
   process.env.ARCHESTRA_LLM_PROXY_PLUGINS,
 );
 
+/** @public — validated directly by configuration tests. */
+export function parseShutdownSeconds(
+  value: string | undefined,
+  fallback: number,
+  minimum = 1,
+  maximum = 86400,
+): number {
+  if (value === undefined) return fallback;
+  if (
+    !/^\d+$/.test(value) ||
+    !Number.isSafeInteger(Number(value)) ||
+    Number(value) < minimum ||
+    Number(value) > maximum
+  ) {
+    throw new Error(
+      `Shutdown durations must be integer seconds between ${minimum} and ${maximum}`,
+    );
+  }
+  return Number(value);
+}
+
+/** Validate resolved Secret/ConfigMap values before the server accepts work. */
+export function validateShutdownPodGrace(
+  podGraceSeconds: number | undefined,
+  drainSeconds: number,
+  cleanupSeconds: number,
+  workerSeconds: number,
+): void {
+  if (podGraceSeconds === undefined) return;
+  const required = Math.max(drainSeconds, workerSeconds) + cleanupSeconds + 40;
+  if (podGraceSeconds < required) {
+    throw new Error(
+      `Pod shutdown grace is ${podGraceSeconds}s but resolved shutdown durations require at least ${required}s. Increase archestra.terminationGracePeriodSeconds or reduce the configured shutdown durations.`,
+    );
+  }
+}
+
 const config = {
+  shutdown: {
+    podGraceSeconds:
+      process.env.ARCHESTRA_SERVER_POD_GRACE_SECONDS === undefined
+        ? undefined
+        : parseShutdownSeconds(
+            process.env.ARCHESTRA_SERVER_POD_GRACE_SECONDS,
+            120,
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+    drainSeconds: parseShutdownSeconds(
+      process.env.ARCHESTRA_SERVER_REQUEST_DRAIN_SECONDS,
+      60,
+    ),
+    cleanupSeconds: parseShutdownSeconds(
+      process.env.ARCHESTRA_SERVER_SHUTDOWN_CLEANUP_SECONDS,
+      20,
+      5,
+    ),
+  },
   openappa,
   frontendBaseUrl,
   api: {
     host: isDevelopment ? "127.0.0.1" : "0.0.0.0",
     port: getPortFromUrl(),
     name: DEFAULT_APP_NAME,
-    version: appVersion,
+    version: normalizeVersion(appVersion),
     corsOrigins: getCorsOrigins(),
     apiKeyAuthorizationHeaderName: "Authorization",
     /**
@@ -2268,6 +2378,11 @@ const config = {
   },
   websocket: {
     path: "/ws",
+  },
+  mcpOAuth: {
+    // Deployment-operator opt-in; compatibility must remain the default.
+    enforceOutboundValidation:
+      process.env.ARCHESTRA_MCP_OAUTH_ENFORCE_OUTBOUND_VALIDATION === "true",
   },
   mcpGateway: {
     endpoint: "/v1/mcp",
@@ -2391,7 +2506,7 @@ const config = {
     /** Fallback lifetime cap for Agent Runtime runs whose agent sets none. */
     defaultTtlHours: parsePositiveInt(
       process.env.ARCHESTRA_AGENT_RUNTIME_DEFAULT_TTL_HOURS,
-      72,
+      24,
     ),
     /**
      * Fallback idle stop for Agent Runtime runs whose agent sets none. An idle run is
@@ -2400,22 +2515,8 @@ const config = {
      */
     defaultIdleTimeoutMinutes: parsePositiveInt(
       process.env.ARCHESTRA_AGENT_RUNTIME_DEFAULT_IDLE_TIMEOUT_MINUTES,
-      180,
+      60,
     ),
-    resources: {
-      cpuRequest:
-        process.env.ARCHESTRA_AGENT_RUNTIME_CPU_REQUEST?.trim() || "500m",
-      memoryRequest:
-        process.env.ARCHESTRA_AGENT_RUNTIME_MEMORY_REQUEST?.trim() || "1Gi",
-      /**
-       * No CPU limit by default, matching the MCP server runtime: throttling
-       * an agent mid-turn surfaces as confusing timeouts rather than
-       * back-pressure. Memory is limited because a runaway agent process
-       * should die rather than take the node with it.
-       */
-      memoryLimit:
-        process.env.ARCHESTRA_AGENT_RUNTIME_MEMORY_LIMIT?.trim() || "4Gi",
-    },
     workspaceStorageSize: parseK8sResourceQuantity({
       envName: "ARCHESTRA_AGENT_RUNTIME_WORKSPACE_STORAGE_SIZE",
       value: process.env.ARCHESTRA_AGENT_RUNTIME_WORKSPACE_STORAGE_SIZE,
@@ -2832,6 +2933,14 @@ const config = {
       baseUrl:
         process.env.ARCHESTRA_KIMI_BASE_URL || "https://api.moonshot.ai/v1",
     },
+    // Kimi Code membership keys answer only on the Kimi Code endpoint. The
+    // default is the overseas host; China accounts use
+    // https://api.kimi.com/coding/v1.
+    "kimi-code": {
+      baseUrl:
+        process.env.ARCHESTRA_KIMI_CODE_BASE_URL ||
+        "https://api.kimi.ai/coding/v1",
+    },
     "github-copilot": {
       baseUrl:
         process.env.ARCHESTRA_GITHUB_COPILOT_BASE_URL ||
@@ -2977,6 +3086,9 @@ const config = {
     kimi: {
       apiKey: process.env.ARCHESTRA_CHAT_KIMI_API_KEY || "",
     },
+    "kimi-code": {
+      apiKey: process.env.ARCHESTRA_CHAT_KIMI_CODE_API_KEY || "",
+    },
     "github-copilot": {
       apiKey: process.env.ARCHESTRA_CHAT_GITHUB_COPILOT_API_KEY || "",
     },
@@ -2994,18 +3106,6 @@ const config = {
     azure: {
       apiKey: process.env.ARCHESTRA_CHAT_AZURE_OPENAI_API_KEY || "",
     },
-    defaultModel:
-      process.env.ARCHESTRA_CHAT_DEFAULT_MODEL || DEFAULT_MODELS.anthropic,
-    defaultProvider: ((): SupportedProvider => {
-      const provider = process.env.ARCHESTRA_CHAT_DEFAULT_PROVIDER;
-      if (
-        provider &&
-        SupportedProviders.includes(provider as SupportedProvider)
-      ) {
-        return provider as SupportedProvider;
-      }
-      return "anthropic";
-    })(),
     activeRun: {
       replayPollIntervalMs: parseActiveChatRunPollIntervalMs({
         value: process.env.ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS,
@@ -3068,8 +3168,6 @@ const config = {
     knowledgeBase:
       process.env.ARCHESTRA_ENTERPRISE_LICENSE_KNOWLEDGE_BASE_ACTIVATED ===
       "true",
-    aiSecurity:
-      process.env.ARCHESTRA_ENTERPRISE_LICENSE_AI_SECURITY_ACTIVATED === "true",
     fullWhiteLabeling:
       process.env.ARCHESTRA_ENTERPRISE_LICENSE_FULL_WHITE_LABELING === "true",
   },
@@ -3156,6 +3254,11 @@ const config = {
       clusterDomain:
         process.env.ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DOMAIN ||
         "cluster.local",
+      // Cluster resolver IP(s) for egress-policy DNS rules. When set, they are
+      // used instead of discovering the kube-dns Service.
+      clusterDnsIps: parseClusterDnsIps(
+        process.env.ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DNS_IPS,
+      ),
       // Namespaces the platform ServiceAccount is granted RBAC in (Helm
       // rbac.environmentNamespaces). Surfaced to the UI so the environment
       // editor can offer a namespace dropdown instead of free text.
@@ -3163,6 +3266,19 @@ const config = {
         process.env.ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES ?? "",
       ),
     },
+  },
+  /**
+   * The pre-installed read-only Kubernetes MCP server and the SRE agent that
+   * uses it (see services/sre-agent). Off by default; turning it off removes
+   * what it seeded.
+   */
+  sreAgent: {
+    enabled: process.env.ARCHESTRA_SRE_AGENT_ENABLED === "true",
+    k8sServiceAccount:
+      process.env.ARCHESTRA_SRE_K8S_SERVICE_ACCOUNT?.trim() || undefined,
+    apiServerCidrs: parseSreApiServerCidrs(
+      process.env.ARCHESTRA_SRE_APISERVER_CIDRS,
+    ),
   },
   /**
    * code execution sandbox runtime — the per-conversation Dagger container that
@@ -3211,6 +3327,14 @@ const config = {
     artifactBytesLimit: parsePositiveInt(
       process.env.ARCHESTRA_SKILLS_SANDBOX_ARTIFACT_BYTES_LIMIT,
       DEFAULT_CHAT_ATTACHMENT_STORAGE_BYTES,
+    ),
+    /**
+     * Days a headless (conversation-less, non-app) sandbox is kept after its
+     * last activity before the sweep deletes it. 0 keeps them forever.
+     */
+    headlessRetentionDays: parseNonNegativeInt(
+      process.env.ARCHESTRA_SKILLS_SANDBOX_HEADLESS_RETENTION_DAYS,
+      7,
     ),
   },
   /**
@@ -3434,6 +3558,13 @@ const config = {
   production: isProduction,
   environment,
   llmProxy: {
+    // BETA gate for model pools: hides the page and its API, and keeps the
+    // proxy and the Model Router from resolving a model name to a pool. Off
+    // by default; a blank value falls back to the ARCHESTRA_BETA master switch
+    // (see betaFeatureEnabled).
+    modelPoolsEnabled: betaFeatureEnabled(
+      process.env.ARCHESTRA_LLM_MODEL_POOLS_ENABLED,
+    ),
     plugins: llmProxyPlugins,
     maxVirtualKeysPerApiKey: parsePositiveInt(
       process.env.ARCHESTRA_LLM_PROXY_MAX_VIRTUAL_KEYS,
@@ -3451,6 +3582,20 @@ const config = {
     streamKeepAliveIntervalMs: parseNonNegativeInt(
       process.env.ARCHESTRA_LLM_PROXY_STREAM_KEEPALIVE_INTERVAL_MS,
       DEFAULT_LLM_PROXY_STREAM_KEEPALIVE_INTERVAL_MS,
+    ),
+  },
+  autoRouting: {
+    /** ALPHA gate for the Model Router's "auto" model; off by default, follows ARCHESTRA_BETA when blank. */
+    enabled: betaFeatureEnabled(process.env.ARCHESTRA_AUTO_ROUTING_ENABLED),
+    /** Budget (ms) for one session-scoring call before the router falls back. */
+    scorerTimeoutMs: parsePositiveInt(
+      process.env.ARCHESTRA_AUTO_ROUTING_SCORER_TIMEOUT_MS,
+      2000,
+    ),
+    /** Idle sessions (live, plus scored past ones) a fit needs before it publishes a plan; fewer keep the organization in cold start. */
+    minSessions: parsePositiveInt(
+      process.env.ARCHESTRA_AUTO_ROUTING_MIN_SESSIONS,
+      1000,
     ),
   },
   kb: {
@@ -3482,7 +3627,7 @@ const config = {
     perforceShim: {
       image:
         process.env.ARCHESTRA_KNOWLEDGE_BASE_PERFORCE_SHIM_IMAGE ||
-        `europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/p4-shim:${appVersion}`,
+        `ghcr.io/archestra-ai/p4-shim:${appVersion}`,
       p4Binary: {
         x64: {
           url:
@@ -3594,7 +3739,7 @@ const config = {
         .ARCHESTRA_KNOWLEDGE_BASE_PERMISSION_SYNC_WORKER_MAX_CONCURRENT,
       1,
     ),
-    taskWorkerShutdownTimeoutSeconds: parsePositiveInt(
+    taskWorkerShutdownTimeoutSeconds: parseShutdownSeconds(
       process.env.ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
       30,
     ),
@@ -3866,6 +4011,15 @@ const config = {
    * the new connection page the default Connect destination — can key off it.
    */
   beta: process.env.ARCHESTRA_BETA === "true",
+  /**
+   * Internal UI feedback overlay for the team's own deployments: pin a comment
+   * on an element and post it, with a screenshot and an optional screen clip,
+   * to a Slack channel. Slack is the only storage. It posts as a chatops
+   * Slack bot; which one, and the channel, are picked in the UI on first use.
+   */
+  devFeedback: {
+    enabled: process.env.ARCHESTRA_DEV_FEEDBACK_ENABLED === "true",
+  },
   ngrok: {
     // When set, the backend brings up an ngrok tunnel in-process (via the ngrok
     // agent SDK) so the instance is reachable from the Internet for inbound
@@ -3876,6 +4030,11 @@ const config = {
     domain: process.env.ARCHESTRA_NGROK_DOMAIN || "",
   },
   chatops: {
+    // Provider-to-server delivery can use a public listener while the UI and
+    // browser OAuth callback stay on the frontend origin.
+    webhookBaseUrl: parseChatopsWebhookBaseUrl(
+      process.env.ARCHESTRA_CHATOPS_WEBHOOK_BASE_URL,
+    ),
     // The Telegram integration is generally available: on by default, with
     // ARCHESTRA_CHATOPS_TELEGRAM_ENABLED=false as the operator opt-out.
     // Off = the provider never starts (even with a token saved in the DB),
@@ -3909,9 +4068,10 @@ const config = {
   // maintenanceMode it does not affect request handling.
   siteNotificationMessage:
     process.env.ARCHESTRA_SITE_NOTIFICATION_MESSAGE || null,
-  // Enterprise-licensed like the `retention` block below — the boot-time
-  // assertion in data-retention/license-gate.ee.ts covers this window too.
   auditLog: {
+    otelEnabled: process.env.ARCHESTRA_AUDIT_LOG_OTEL_ENABLED === "true",
+    // Retention is enterprise-licensed; the boot-time assertion in
+    // data-retention/license-gate.ee.ts covers this window too.
     retentionDays: parseRetentionDays(
       "ARCHESTRA_AUDIT_LOG_RETENTION_DAYS",
       process.env.ARCHESTRA_AUDIT_LOG_RETENTION_DAYS,

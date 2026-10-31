@@ -6,6 +6,7 @@ import { UsageCell } from "./usage-cell";
 
 const session: ComponentProps<typeof UsageCell>["session"] = {
   requestCount: 4,
+  failedOverCount: 0,
   totalInputTokens: 4210,
   totalOutputTokens: 318,
   totalCacheReadTokens: 18400,
@@ -28,6 +29,15 @@ describe("UsageCell", () => {
     expect(details.getByText("18,400")).toBeInTheDocument();
     expect(details.getByText("$0.0182")).toBeInTheDocument();
     expect(details.getByText("$0.0118")).toBeInTheDocument();
+  });
+
+  it("shows how many requests a model pool failed over", async () => {
+    const user = userEvent.setup();
+    render(<UsageCell session={{ ...session, failedOverCount: 2 }} />);
+    await user.tab();
+    const details = within(await screen.findByRole("tooltip"));
+    expect(details.getByText("Failed over")).toBeInTheDocument();
+    expect(details.getByText("2")).toBeInTheDocument();
   });
 
   it.each([
@@ -67,6 +77,27 @@ describe("UsageCell", () => {
     await user.tab();
     expect(
       within(await screen.findByRole("tooltip")).getByText("$0.000040"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no figure when no request in the session recorded a cost", async () => {
+    const user = userEvent.setup();
+    render(
+      <UsageCell
+        session={{
+          ...session,
+          totalCost: null,
+          totalBilledCost: null,
+          totalSubscriptionCost: null,
+          totalBaselineCost: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("—")).toBeVisible();
+    expect(screen.queryByText("$0")).toBeNull();
+    await user.tab();
+    expect(
+      within(await screen.findByRole("tooltip")).getByText("Not recorded"),
     ).toBeInTheDocument();
   });
 });

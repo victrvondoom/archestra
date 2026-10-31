@@ -1,32 +1,23 @@
 "use client";
 
-import {
-  type ClientFilter,
-  INTERACTION_SOURCE_DISPLAY,
-  type InteractionSource,
-} from "@archestra/shared";
+import type { ClientFilter, InteractionSource } from "@archestra/shared";
 import type { ColumnDef } from "@tanstack/react-table";
 import { MessagesSquare } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { useLogsHeaderAction } from "@/app/_parts/logs-section-layout";
 import { AgentSelector } from "@/components/agent-selector";
 import {
   CollectionFilters,
   FilterBar,
-  FilterSelect,
   filterControlClass,
   filterSearchClass,
 } from "@/components/filter-bar";
-import { SourceFilterOption } from "@/components/log-filter-option";
 import { QueryLoadError } from "@/components/query-load-error";
 import { SearchInput } from "@/components/search-input";
 import { TimeRangePicker } from "@/components/time-range-picker/time-range-picker";
 import { DataTable } from "@/components/ui/data-table";
-import {
-  ClientFilterSelect,
-  UserFilterSelect,
-} from "@/components/user-client-filter-selects";
+import { UserFilterSelect } from "@/components/user-client-filter-selects";
 import { useAgentOptionsByIds } from "@/lib/agent-options.query";
 import { useHasPermissions } from "@/lib/auth/auth.query";
 import { useCursorPagination } from "@/lib/hooks/use-cursor-pagination";
@@ -41,7 +32,8 @@ import { llmSessionHref } from "@/lib/interactions/llm-log-links";
 import { ErrorBoundary } from "../../_parts/error-boundary";
 import { AgentCell } from "./_parts/agent-cell";
 import type { LogSession } from "./_parts/logs-table-format";
-import { ModelCell } from "./_parts/model-cell";
+import { ModelCell, makerLogoCount } from "./_parts/model-cell";
+import { OriginFilter } from "./_parts/origin-filter";
 import { SessionCell } from "./_parts/session-cell";
 import { TimeCell } from "./_parts/time-cell";
 import { UsageCell } from "./_parts/usage-cell";
@@ -58,8 +50,7 @@ export default function LlmProxyLogsPage() {
 
 function SessionsTable() {
   const router = useRouter();
-  const { searchParams, pathname, updateQueryParams } =
-    useDataTableQueryParams();
+  const { searchParams, updateQueryParams } = useDataTableQueryParams();
   const cursorPagination = useCursorPagination();
 
   // Get URL params
@@ -75,23 +66,6 @@ function SessionsTable() {
   const sourceFilter = sourceFromUrl || "all";
   const clientFilter = clientFromUrl || "all";
 
-  // Cursors are transient navigation state. Keep filters shareable, but scrub
-  // pagination from old links rather than exposing opaque cursors in the URL.
-  useEffect(() => {
-    const params = new URLSearchParams(searchParams.toString());
-    const hasLegacyPagination = ["cursor", "page", "pageSize"].some((key) =>
-      params.has(key),
-    );
-    if (!hasLegacyPagination) return;
-    params.delete("cursor");
-    params.delete("page");
-    params.delete("pageSize");
-    const query = params.toString();
-    router.replace(query ? `${pathname}?${query}` : pathname, {
-      scroll: false,
-    });
-  }, [pathname, router, searchParams]);
-
   // The logs search box only filters by session ID (free-text content search
   // was removed). Translate the typed term into a sessionId filter when it is a
   // valid session ID; otherwise it filters nothing and we surface a hint.
@@ -105,15 +79,13 @@ function SessionsTable() {
     endDateFromUrl,
     onDateRangeChange: useCallback(
       ({ startDate, endDate }) => {
-        cursorPagination.goNewest();
         updateQueryParams({
           startDate,
           endDate,
           page: null,
-          pageSize: null,
         });
       },
-      [cursorPagination.goNewest, updateQueryParams],
+      [updateQueryParams],
     ),
   });
   // Every log page keeps its time range in the header's top-right corner.
@@ -135,50 +107,42 @@ function SessionsTable() {
 
   const handleProfileFilterChange = useCallback(
     (value: string) => {
-      cursorPagination.goNewest();
       updateQueryParams({
         profileId: value === "all" ? null : value,
         page: null,
-        pageSize: null,
       });
     },
-    [cursorPagination.goNewest, updateQueryParams],
+    [updateQueryParams],
   );
 
   const handleUserFilterChange = useCallback(
     (value: string) => {
-      cursorPagination.goNewest();
       updateQueryParams({
         userId: value === "all" ? null : value,
         page: null,
-        pageSize: null,
       });
     },
-    [cursorPagination.goNewest, updateQueryParams],
+    [updateQueryParams],
   );
 
   const handleSourceFilterChange = useCallback(
     (value: string) => {
-      cursorPagination.goNewest();
       updateQueryParams({
         source: value === "all" ? null : value,
         page: null,
-        pageSize: null,
       });
     },
-    [cursorPagination.goNewest, updateQueryParams],
+    [updateQueryParams],
   );
 
   const handleClientFilterChange = useCallback(
     (value: string) => {
-      cursorPagination.goNewest();
       updateQueryParams({
         client: value === "all" ? null : value,
         page: null,
-        pageSize: null,
       });
     },
-    [cursorPagination.goNewest, updateQueryParams],
+    [updateQueryParams],
   );
 
   const {
@@ -205,6 +169,12 @@ function SessionsTable() {
   const { label: providerLabel } = useModelProviderCatalog();
 
   const sessions = sessionsResponse?.data ?? [];
+  // Every row keeps room for the widest logo stack on the page, so the model
+  // names line up.
+  const modelLogoSlots = Math.max(
+    1,
+    ...sessions.map((session) => makerLogoCount(session, providerLabel)),
+  );
   const { data: agents } = useAgentOptionsByIds({
     ids: sessions.flatMap((session) =>
       session.profileId ? [session.profileId] : [],
@@ -220,7 +190,6 @@ function SessionsTable() {
     !!searchFromUrl;
 
   const clearFilters = useCallback(() => {
-    cursorPagination.goNewest();
     dateTimePicker.clearDateRange();
     updateQueryParams({
       profileId: null,
@@ -231,9 +200,8 @@ function SessionsTable() {
       endDate: null,
       search: null,
       page: null,
-      pageSize: null,
     });
-  }, [cursorPagination.goNewest, dateTimePicker, updateQueryParams]);
+  }, [dateTimePicker, updateQueryParams]);
 
   const columns: ColumnDef<LogSession>[] = useMemo(
     () => [
@@ -262,7 +230,11 @@ function SessionsTable() {
         size: 184,
         minSize: 164,
         cell: ({ row }) => (
-          <ModelCell session={row.original} providerLabel={providerLabel} />
+          <ModelCell
+            session={row.original}
+            providerLabel={providerLabel}
+            logoSlots={modelLogoSlots}
+          />
         ),
       },
       {
@@ -280,7 +252,7 @@ function SessionsTable() {
         cell: ({ row }) => <TimeCell session={row.original} />,
       },
     ],
-    [agents, providerLabel],
+    [agents, providerLabel, modelLogoSlots],
   );
 
   // A failed fetch leaves no rows; show a retry state instead of the table's
@@ -311,7 +283,6 @@ function SessionsTable() {
                 paramName="search"
                 className="relative w-full"
                 paginationMode="cursor"
-                onSearchChange={cursorPagination.goNewest}
               />
               {/* Keep validation below search without moving the table. */}
               {searchIsNotSessionId && (
@@ -355,55 +326,22 @@ function SessionsTable() {
             />
           ) : null}
 
-          <FilterSelect
-            value={sourceFilter}
-            onValueChange={handleSourceFilterChange}
-            placeholder="Filter by Source"
-            items={[
-              { value: "all", label: "All Sources" },
-              ...Object.entries(INTERACTION_SOURCE_DISPLAY).map(
-                ([value, { label }]) => ({
-                  value,
-                  label,
-                  content: (
-                    <SourceFilterOption source={value as InteractionSource} />
-                  ),
-                  selectedContent: (
-                    <SourceFilterOption source={value as InteractionSource} />
-                  ),
-                }),
-              ),
-            ]}
-          />
-
-          <ClientFilterSelect
-            value={clientFilter}
-            onValueChange={handleClientFilterChange}
+          <OriginFilter
+            client={clientFilter}
+            source={sourceFilter}
+            onClientChange={handleClientFilterChange}
+            onSourceChange={handleSourceFilterChange}
           />
         </FilterBar>
       </CollectionFilters>
 
       <DataTable
         columns={columns}
-        fixedWidthColumnIds={["agent", "models", "usage", "time"]}
         flexibleColumnIds={["session"]}
         data={sessions}
         hideSelectedCount
         manualPagination
-        cursorPagination={
-          paginationMeta
-            ? {
-                pageIndex: cursorPagination.pageIndex,
-                pageSize: cursorPagination.pageSize,
-                hasNext: paginationMeta.hasNext,
-                canGoNewer: cursorPagination.canGoNewer,
-                onPageSizeChange: cursorPagination.setPageSize,
-                onNewer: cursorPagination.goNewer,
-                onOlder: () =>
-                  cursorPagination.goOlder(paginationMeta.nextCursor),
-              }
-            : undefined
-        }
+        cursorPagination={cursorPagination.tableState(paginationMeta)}
         isLoading={isFetching}
         hasActiveFilters={hasFilters}
         emptyIcon={MessagesSquare}

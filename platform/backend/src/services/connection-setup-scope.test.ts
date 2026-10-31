@@ -5,7 +5,17 @@ test("maps native client provenance, and nothing else, to a client", () => {
   expect(nativeSetupClientFromProvenance("claude-code-header")).toBe(
     "claude-code",
   );
+  expect(nativeSetupClientFromProvenance("claude-code-metadata")).toBe(
+    "claude-code",
+  );
+  expect(nativeSetupClientFromProvenance("claude-desktop-header")).toBe(
+    "claude-desktop",
+  );
+  expect(nativeSetupClientFromProvenance("claude-desktop-metadata")).toBe(
+    "claude-desktop",
+  );
   expect(nativeSetupClientFromProvenance("codex-turn-metadata")).toBe("codex");
+  expect(nativeSetupClientFromProvenance("pi-session-header")).toBe("pi");
   expect(nativeSetupClientFromProvenance("kilo-session-header")).toBe("kilo");
   expect(nativeSetupClientFromProvenance("kilo-hosted-header")).toBe("kilo");
   for (const provenance of [

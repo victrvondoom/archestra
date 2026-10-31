@@ -8,6 +8,7 @@ import { ExternalDocsLink } from "@/components/external-docs-link";
 import { PageLayout } from "@/components/page-layout";
 import { usePermissionMap } from "@/lib/auth/auth.query";
 import { getFrontendDocsUrl } from "@/lib/docs/docs";
+import { useTeamLimitAccess } from "@/lib/limits-access";
 
 const TABS = [
   { label: "Costs", href: "/llm/costs" },
@@ -22,8 +23,8 @@ const PAGE_CONFIG: Record<
     title: "Costs",
     description: (
       <>
-        Monitor usage costs and savings across teams, agents, and models. View
-        and edit model token prices in{" "}
+        Track spend, token usage and requests across your organization. View and
+        edit model token prices in{" "}
         <Link href="/llm/models" className="text-primary hover:underline">
           Model Settings
         </Link>
@@ -33,8 +34,7 @@ const PAGE_CONFIG: Record<
   },
   "/llm/limits": {
     title: "Limits",
-    description:
-      "Control LLM spend with token-cost limits scoped to the organization, teams, agents, users, virtual keys, or environments.",
+    description: "Set spend and rate limits for LLM traffic.",
   },
 };
 
@@ -57,7 +57,14 @@ export default function CostsLayout({
 }) {
   const pathname = usePathname();
   const [actionButton, setActionButton] = useState<React.ReactNode>(null);
-  const permissionMap = usePermissionMap(requiredPagePermissionsMap);
+  const pageMap = usePermissionMap(requiredPagePermissionsMap);
+  const limitsAccess = useTeamLimitAccess();
+  const permissionMap: Record<string, boolean> | null = pageMap
+    ? {
+        ...pageMap,
+        "/llm/limits": pageMap["/llm/limits"] || limitsAccess.canRead,
+      }
+    : null;
   const prometheusDocsUrl = getFrontendDocsUrl("admin/observability/metrics");
 
   // Wait for the permission answer rather than flashing tabs that would only
@@ -97,7 +104,7 @@ export default function CostsLayout({
             config.description
           )
         }
-        tabs={tabs}
+        tabs={tabs.length > 1 ? tabs : []}
         actionButton={actionButton}
       >
         {children}

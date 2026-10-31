@@ -102,12 +102,6 @@ interface OrganizationInfo {
   defaultLlmApiKeyId?: string | null;
 }
 
-/** The current user's saved default (model, key) pair — the "member" level. */
-interface MemberDefaultInfo {
-  modelId?: string | null;
-  chatApiKeyId?: string | null;
-}
-
 interface ChatContext {
   modelsByProvider: Record<string, ModelInfo[]>;
   /**
@@ -115,9 +109,12 @@ interface ChatContext {
    * not every key they can see. A key shared as read-only is listed in
    * settings but refused when a chat sends it.
    */
-  chatApiKeys: Array<{ id: string; provider: string }>;
+  chatApiKeys: Array<{
+    id: string;
+    provider: string;
+    isGithubAppKey?: boolean;
+  }>;
   organization: OrganizationInfo | null;
-  memberDefault: MemberDefaultInfo | null;
 }
 
 interface ResolveInitialModelParams extends ChatContext {
@@ -131,7 +128,7 @@ interface ResolvedModel {
 
 /**
  * Resolve which model to use on initial chat load.
- * Priority: member default -> agent default -> organization default ->
+ * Priority: agent default -> organization default ->
  * best available model. Returns null when no model can be resolved.
  *
  * Delegates to the shared `resolveModelSelection` so the client and the
@@ -140,8 +137,7 @@ interface ResolvedModel {
 export function resolveInitialModel(
   params: ResolveInitialModelParams,
 ): ResolvedModel | null {
-  const { modelsByProvider, agent, chatApiKeys, organization, memberDefault } =
-    params;
+  const { modelsByProvider, agent, chatApiKeys, organization } = params;
 
   const findKeyForProvider = (provider: string): string | null =>
     chatApiKeys.find((k) => k.provider === provider)?.id ?? null;
@@ -167,11 +163,17 @@ export function resolveInitialModel(
   // no key for it. So a per-user model is selectable by model alone: pairing it
   // with `findKeyForProvider` (null) would otherwise drop it from the catalog
   // and leave an org/agent default pointing at one half-pinned and skipped.
-  const isPerUserModel = (modelId: string | null | undefined): boolean => {
+  const isPerUserModel = (
+    modelId: string | null | undefined,
+    apiKeyId?: string | null,
+  ): boolean => {
     const provider = providerForModel(modelId);
     return (
       provider != null &&
-      providerRequiresPerUserCredential(provider as SupportedProvider)
+      providerRequiresPerUserCredential(provider as SupportedProvider) &&
+      // Paired with a GitHub App key, a Copilot model is an ordinary keyed
+      // model; only the personal sign-in path is per-user.
+      !chatApiKeys.some((key) => key.id === apiKeyId && key.isGithubAppKey)
     );
   };
 
@@ -202,12 +204,14 @@ export function resolveInitialModel(
     apiKeyId: string | null | undefined,
   ): ModelSelection => ({
     modelId,
-    apiKeyId: isPerUserModel(modelId) ? PER_USER_PLACEHOLDER_KEY : apiKeyId,
+    apiKeyId: isPerUserModel(modelId, apiKeyId)
+      ? PER_USER_PLACEHOLDER_KEY
+      : apiKeyId,
   });
 
-  // The member and organization defaults store a key chosen by someone, at
-  // some point, that the viewer may not be allowed to use now (an admin's org
-  // default, a key whose grant was narrowed to read-only). Sending it is
+  // The organization default stores a key chosen by someone, at some point,
+  // that the viewer may not be allowed to use now (an admin's choice, a key
+  // whose grant was narrowed to read-only). Sending it is
   // refused, so keep the level's model and pair it with a key the viewer can
   // use for that provider instead, or skip the level when there is none. The
   // agent's own key needs no grant — it is used through the agent — so the
@@ -219,7 +223,7 @@ export function resolveInitialModel(
     if (
       !modelId ||
       !apiKeyId ||
-      isPerUserModel(modelId) ||
+      isPerUserModel(modelId, apiKeyId) ||
       apiKeyId === agent?.llmApiKeyId ||
       chatApiKeys.some((k) => k.id === apiKeyId)
     ) {
@@ -233,7 +237,6 @@ export function resolveInitialModel(
   };
 
   const levels: ModelSelection[] = [
-    toUsableLevel(memberDefault?.modelId, memberDefault?.chatApiKeyId),
     toLevel(agent?.modelId, agent?.llmApiKeyId),
     toUsableLevel(
       organization?.defaultModelId,
@@ -255,7 +258,7 @@ export function resolveInitialModel(
   // resolution (which surfaces the inline connect prompt).
   return {
     modelId: resolved.modelId,
-    apiKeyId: isPerUserModel(resolved.modelId)
+    apiKeyId: isPerUserModel(resolved.modelId, resolved.apiKeyId)
       ? null
       : (resolved.apiKeyId ?? null),
   };

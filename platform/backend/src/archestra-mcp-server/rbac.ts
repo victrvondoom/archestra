@@ -150,7 +150,7 @@ export const TOOL_PERMISSIONS: Record<
   add_team_member: { resource: "team", action: "read" },
   update_team_member_role: { resource: "team", action: "read" },
   remove_team_member: { resource: "team", action: "read" },
-  // External group sync tools follow the same pattern as membership tools:
+  // Team Sync tools follow the same pattern as membership tools:
   // team:read as the coarse gate (matching the REST routes), with the finer
   // manage check (org-level team manager OR team admin) and the enterprise
   // license gate enforced in the handlers.
@@ -237,6 +237,7 @@ export const TOOL_PERMISSIONS: Record<
   get_schedule_trigger: { resource: "project", action: "read" },
   list_schedule_trigger_runs: { resource: "project", action: "read" },
   get_schedule_trigger_run: { resource: "project", action: "read" },
+  get_schedule_trigger_run_transcript: { resource: "project", action: "read" },
   enable_schedule_trigger: { resource: "project", action: "update" },
   disable_schedule_trigger: { resource: "project", action: "update" },
   // Starting a run creates a run row, matching RunScheduleTriggerNow.
@@ -274,13 +275,13 @@ export const TOOL_PERMISSIONS: Record<
 
   // Runs are an Agent capability, including when an Agent opts into
   // Agent Runtime. Per-run ownership stays in the handlers.
-  start_run: { resource: "agent", action: "read" },
-  get_run: { resource: "agent", action: "read" },
-  list_runs: { resource: "agent", action: "read" },
+  start_agent_run: { resource: "agent", action: "read" },
+  get_agent_run: { resource: "agent", action: "read" },
   list_agent_runs: { resource: "agent", action: "read" },
-  steer_run: { resource: "agent", action: "read" },
-  cancel_run: { resource: "agent", action: "read" },
-  post_run_file: { resource: "agent", action: "read" },
+  steer_agent_run: { resource: "agent", action: "read" },
+  cancel_agent_run: { resource: "agent", action: "read" },
+  post_agent_run_file: { resource: "agent", action: "read" },
+  post_agent_run_message: { resource: "agent", action: "read" },
   read_workspace_file: { resource: "agent", action: "read" },
   write_workspace_file: { resource: "agent", action: "read" },
   transfer_workspace_file: { resource: "agent", action: "read" },
@@ -340,12 +341,13 @@ export const TOOL_PERMISSIONS: Record<
 
 /**
  * Read-only tools that operate at organization scope and so may be used by
- * org/team-token MCP sessions, which carry no `userId`. Their handlers
- * restrict results to org-scoped resources when no user is present.
+ * application credentials that carry no `userId`. Their handlers restrict
+ * results to resources published to the organization when no user is present.
  */
 const ORG_CONTEXT_READ_TOOLS: ReadonlySet<ArchestraToolShortName> = new Set([
   "list_skills",
   "load_skill",
+  "query_knowledge_sources",
 ]);
 
 /**
@@ -370,7 +372,7 @@ export async function checkToolPermission(
     return errorResult("Organization context not available");
   }
 
-  // org/team-token sessions have no user; they may still use read-only tools
+  // Application credentials may have no user; they may still use read-only tools
   // that operate at organization scope — the handlers restrict the results.
   if (!context.userId) {
     if (ORG_CONTEXT_READ_TOOLS.has(typedShortName)) return null;
@@ -379,7 +381,7 @@ export async function checkToolPermission(
     // previous wording ("User context not available") read as an internal
     // fault rather than a fixable choice of credential.
     return errorResult(
-      `${toolName} requires an acting user, but the credential used to authenticate does not identify one. Team tokens, organization tokens, and OAuth client-credentials tokens act for an application, not a person. Re-authenticate with a personal token, a user OAuth token, or an Identity Provider JWT.`,
+      `${toolName} requires an acting user, but the credential used to authenticate does not identify one. Team tokens, organization tokens, and OAuth client-credentials tokens act for an application, not a person. Re-authenticate with a personal token, a service account API key, a user OAuth token, or an Identity Provider JWT.`,
     );
   }
 

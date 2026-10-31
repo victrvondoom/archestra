@@ -89,7 +89,10 @@ import {
   useUpdateModel,
 } from "@/lib/llm-models.query";
 import { useLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
-import { formatPricePerMillion } from "@/lib/model-price-format";
+import {
+  formatMediaPricing,
+  formatPricePerMillion,
+} from "@/lib/model-price-format";
 import { formatContextLength } from "@/lib/utils/format-context-length";
 import { EditModelDialog } from "./_parts/edit-model-dialog";
 import {
@@ -104,6 +107,7 @@ import {
 
 export default function ModelsPage() {
   const { searchParams, updateQueryParams } = useDataTableQueryParams();
+  const apiKeyFilter = searchParams.get("apiKey") ?? "all";
   const { hasActiveScopeFilters, access, sharedWith } = useScopeFilterParams();
   const {
     data: models = [],
@@ -111,7 +115,12 @@ export default function ModelsPage() {
     isLoadingError: isModelsLoadError,
     error: modelsError,
     refetch,
-  } = useModelsWithApiKeys({ toastOnError: false, access, sharedWith });
+  } = useModelsWithApiKeys({
+    toastOnError: false,
+    access,
+    sharedWith,
+    apiKeyIds: apiKeyFilter === "all" ? undefined : [apiKeyFilter],
+  });
   const { data: apiKeys = [], isLoading: isApiKeysLoading } =
     useLlmProviderApiKeys();
   const syncModelsMutation = useSyncLlmModels();
@@ -138,7 +147,6 @@ export default function ModelsPage() {
   // Filters live in the URL so they survive reloads and are shareable, like the
   // other list pages' table filters.
   const search = searchParams.get("search") ?? "";
-  const apiKeyFilter = searchParams.get("apiKey") ?? "all";
   const modelTypeParam = searchParams.get("modelType");
   const modelTypeFilter: ModelsPageModelTypeFilter =
     modelTypeParam === "chat" || modelTypeParam === "embedding"
@@ -183,8 +191,7 @@ export default function ModelsPage() {
       freeOnly,
       canFilterFreeModels,
     });
-    // Applied here rather than on the query: this page reads the whole catalog
-    // once and narrows it in the browser, as its other filters do.
+    // Labels narrow the selected instance's catalog in the browser.
     if (!selectedLabels) return byPageFilters;
     return byPageFilters.filter((model) =>
       Object.entries(selectedLabels).every(([key, values]) =>
@@ -303,7 +310,7 @@ export default function ModelsPage() {
         accessorKey: "modelId",
         header: "Model ID",
         cell: ({ row }) => {
-          const { modelId, provider, isFree } = row.original;
+          const { modelId, provider, isFree, description } = row.original;
           const isLatestAlias = isOpenRouterLatestAlias(provider, modelId);
           // The provider icon sits inline before the model ID (as the knowledge
           // connectors table does) rather than in its own column, saving the
@@ -325,13 +332,21 @@ export default function ModelsPage() {
                   <span className="truncate">{modelId}</span>
                   <LabelTags labels={row.original.labels} />
                 </span>
+                {description && description !== modelId && (
+                  <p className="truncate text-xs text-muted-foreground">
+                    {description}
+                  </p>
+                )}
                 <div className="mt-0.5 flex flex-wrap items-center gap-2">
                   {isFree && <FreeModelBadge />}
                   {isLatestAlias && <LatestModelBadge />}
                   {row.original.isBest && <BestModelBadge />}
-                  {providerRequiresPerUserCredential(provider) && (
-                    <PerUserModelBadge />
-                  )}
+                  {providerRequiresPerUserCredential(provider) &&
+                    // A model linked to a shared key (an organization GitHub
+                    // App key) is not per-user.
+                    !row.original.apiKeys.some(
+                      (key) => key.scope !== "personal",
+                    ) && <PerUserModelBadge />}
                   {row.original.embeddingDimensions !== null && (
                     <EmbeddingModelBadge />
                   )}
@@ -447,8 +462,18 @@ export default function ModelsPage() {
         // lines when the column is narrow.
         header: "$/M In/Out",
         cell: ({ row }) => {
-          const { pricePerMillionInput, pricePerMillionOutput } = row.original;
+          const { pricePerMillionInput, pricePerMillionOutput, mediaPricing } =
+            row.original;
           if (hasUnknownCapabilities(row.original)) return null;
+          // A media model is charged by its media rates; the per-token price
+          // beside it would be a fallback estimate nothing is billed at.
+          if (mediaPricing) {
+            return (
+              <span className="text-sm font-mono">
+                {formatMediaPricing(mediaPricing)}
+              </span>
+            );
+          }
           if (!pricePerMillionInput && !pricePerMillionOutput) {
             return <span className="text-sm text-muted-foreground">-</span>;
           }
@@ -468,18 +493,22 @@ export default function ModelsPage() {
         size: 160,
         header: "$/M Cache R/W",
         cell: ({ row }) => {
-          const { pricePerMillionCacheRead, pricePerMillionCacheWrite } =
-            row.original;
+          const {
+            pricePerMillionCacheRead,
+            pricePerMillionCacheWrite,
+            mediaPricing,
+          } = row.original;
           if (hasUnknownCapabilities(row.original)) return null;
           if (
-            pricePerMillionCacheRead === null ||
-            pricePerMillionCacheWrite === null
+            mediaPricing ||
+            (pricePerMillionCacheRead === null &&
+              pricePerMillionCacheWrite === null)
           ) {
             return <span className="text-sm text-muted-foreground">-</span>;
           }
           return (
             <span className="text-sm font-mono">
-              {`$${formatPricePerMillion(pricePerMillionCacheRead)} / $${formatPricePerMillion(pricePerMillionCacheWrite)}`}
+              {`${pricePerMillionCacheRead === null ? "-" : `$${formatPricePerMillion(pricePerMillionCacheRead)}`} / ${pricePerMillionCacheWrite === null ? "-" : `$${formatPricePerMillion(pricePerMillionCacheWrite)}`}`}
             </span>
           );
         },
@@ -635,7 +664,7 @@ export default function ModelsPage() {
               search={
                 <SearchInput
                   objectNamePlural="models"
-                  searchFields={["model ID"]}
+                  searchFields={["model ID", "name"]}
                   paramName="search"
                   className={filterSearchClass}
                 />

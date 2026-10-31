@@ -1,30 +1,33 @@
 import {
-  DEFAULT_MODELS,
+  findTierDefault,
   isCompleteModelSelection,
   isSubscriptionCredential,
   type ModelInputModality,
   type ModelSelection,
+  PROVIDER_MODEL_TIERS,
   providerHasEndpointLocalModels,
   providerRequiresPerUserCredential,
   resolveModelSelection,
+  type SubagentModelTier,
   type SupportedProvider,
   SupportedProvidersSchema,
 } from "@archestra/shared";
 import { resolveAgentMaxOutputTokens } from "@/agents/agent-output-budget";
+import { userKeyForModel } from "@/auto-routing/eligibility";
 import { isVertexAiEnabled } from "@/clients/gemini-client";
 import config, { getProviderEnvApiKey } from "@/config";
 import logger from "@/logging";
 import {
   LlmProviderApiKeyModel,
   LlmProviderApiKeyModelLinkModel,
-  MemberModel,
   ModelModel,
   OrganizationModel,
   selectionKey,
   TeamModel,
 } from "@/models";
+import { checkModelTeamAccess } from "@/routes/proxy/utils/model-team-access";
 import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
-import type { Model } from "@/types";
+import { ApiError, type Model } from "@/types";
 import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
 
 /** A fully dereferenced selection ready for an LLM call. */
@@ -51,8 +54,10 @@ interface ResolvedLlmSelection {
  * only when no model is configured anywhere and no provider has a synced
  * model (the env/Vertex/config fallback path). `selectedModel` /
  * `selectedProvider` are the dereferenced values for the LLM proxy.
+ *
+ * @public — exercised by llm-resolution.subagent-tier.test.ts
  */
-interface ConversationLlmSelection {
+export interface ConversationLlmSelection {
   modelId: string | null;
   chatApiKeyId: string | null;
   selectedModel: string;
@@ -60,23 +65,13 @@ interface ConversationLlmSelection {
 }
 
 /**
- * Resolve the model for a conversation using the priority chain:
- *
- *   explicit pick -> member default -> agent default -> organization default
- *   -> best available model across the user's keys
+ * Resolve the model for a conversation: an explicit trio (the conversation's
+ * pick, then the agent's, then the organization's), else the provider's default
+ * trio on the user's keys.
  *
  * Each level is a foreign key, so a deleted model is simply NULL and the chain
- * falls through. When the database has no models at all, falls back to
- * environment / Vertex AI / config defaults (and `modelId` is null).
- *
- * The member-default level is the model/key the user last picked in the /chat
- * model selector — a personal preference for that UI. It should NOT bleed into
- * runs the user isn't actively driving there (chatops replies, scheduled
- * triggers, external A2A), where the surprising outcome is a Slack bot or a cron
- * job silently using whatever model someone last chose in web chat. Those
- * callers pass `includeMemberChatDefault: false` so resolution reflects the
- * agent's own configuration (then org default, then best-available) — which is
- * both predictable and self-explanatory to the user.
+ * falls through. When the database has no models at all, falls back to the
+ * default trio of the first provider with an environment key, or Vertex AI.
  */
 export async function resolveConversationLlmSelectionForAgent(params: {
   agent: { llmApiKeyId: string | null; modelId: string | null };
@@ -86,15 +81,8 @@ export async function resolveConversationLlmSelectionForAgent(params: {
   explicitModelId?: string | null;
   /** The API key the user explicitly picked, alongside `explicitModelId`. */
   explicitApiKeyId?: string | null;
-  /**
-   * Whether the acting member's /chat default (defaultModelId /
-   * defaultChatApiKeyId) participates in resolution. Defaults to true (the
-   * /chat surfaces). Non-/chat A2A callers pass false. See the doc comment.
-   */
-  includeMemberChatDefault?: boolean;
 }): Promise<ConversationLlmSelection> {
   const { agent, organizationId, userId } = params;
-  const includeMemberChatDefault = params.includeMemberChatDefault ?? true;
 
   // A per-user provider model (e.g. GitHub Copilot) is catalogued org-wide and
   // its credential is resolved per-user at request time, so an explicit pick is
@@ -107,7 +95,9 @@ export async function resolveConversationLlmSelectionForAgent(params: {
     const explicitModel = await ModelModel.findById(params.explicitModelId);
     if (
       explicitModel &&
-      providerRequiresPerUserCredential(explicitModel.provider)
+      providerRequiresPerUserCredential(explicitModel.provider) &&
+      // An explicitly picked GitHub App key is a real shared key: keep it.
+      !(await LlmProviderApiKeyModel.isGithubAppKey(params.explicitApiKeyId))
     ) {
       return {
         modelId: explicitModel.id,
@@ -118,17 +108,8 @@ export async function resolveConversationLlmSelectionForAgent(params: {
     }
   }
 
-  const [member, organization] = await Promise.all([
-    MemberModel.getByUserId(userId, organizationId),
-    OrganizationModel.getById(organizationId),
-  ]);
+  const organization = await OrganizationModel.getById(organizationId);
 
-  const memberLevel: ModelSelection | null = includeMemberChatDefault
-    ? {
-        modelId: member?.defaultModelId,
-        apiKeyId: member?.defaultChatApiKeyId,
-      }
-    : null;
   const organizationLevel: ModelSelection = {
     modelId: organization?.defaultModelId,
     apiKeyId: organization?.defaultLlmApiKeyId,
@@ -137,29 +118,19 @@ export async function resolveConversationLlmSelectionForAgent(params: {
     organizationId,
     userId,
   });
-  // The member and organization defaults name a key somebody chose; the acting
-  // user may not be allowed to use it. The send path would never run through
-  // it anyway (it falls back to a key the user may use), so resolve to that
-  // key now and store what will actually be used. Explicit picks are not
-  // re-paired: they are validated by the caller and refused when unusable.
-  const [usableMemberLevel, usableOrganizationLevel] = await Promise.all([
-    memberLevel
-      ? toUsableDefaultLevel({
-          level: memberLevel,
-          agentApiKeyId: agent.llmApiKeyId,
-          availableModels,
-        })
-      : null,
-    toUsableDefaultLevel({
-      level: organizationLevel,
-      agentApiKeyId: agent.llmApiKeyId,
-      availableModels,
-    }),
-  ]);
+  // The organization default names a key somebody chose; the acting user may
+  // not be allowed to use it. The send path would never run through it anyway
+  // (it falls back to a key the user may use), so resolve to that key now and
+  // store what will actually be used. Explicit picks are not re-paired: they
+  // are validated by the caller and refused when unusable.
+  const usableOrganizationLevel = await toUsableDefaultLevel({
+    level: organizationLevel,
+    agentApiKeyId: agent.llmApiKeyId,
+    availableModels,
+  });
 
   const configuredLevels: ModelSelection[] = [
     { modelId: params.explicitModelId, apiKeyId: params.explicitApiKeyId },
-    ...(usableMemberLevel ? [usableMemberLevel] : []),
     { modelId: agent.modelId, apiKeyId: agent.llmApiKeyId },
     usableOrganizationLevel,
   ];
@@ -178,9 +149,11 @@ export async function resolveConversationLlmSelectionForAgent(params: {
         // whoever configured it and isn't usable by — or visible to — the acting
         // user. Persist the model alone; the acting user's own credential is
         // resolved per-user at request time (or a connect prompt is surfaced).
-        chatApiKeyId: providerRequiresPerUserCredential(model.provider)
-          ? null
-          : (resolved.apiKeyId ?? null),
+        chatApiKeyId:
+          providerRequiresPerUserCredential(model.provider) &&
+          !(await LlmProviderApiKeyModel.isGithubAppKey(resolved.apiKeyId))
+            ? null
+            : (resolved.apiKeyId ?? null),
         selectedModel: model.modelId,
         selectedProvider: model.provider,
       };
@@ -195,6 +168,204 @@ export async function resolveConversationLlmSelectionForAgent(params: {
     selectedModel: fallback.model,
     selectedProvider: fallback.provider,
   };
+}
+
+/**
+ * The selection a fork starts from: its parent's model, else the agent's own
+ * configuration. The fork runs on the returned key as its agent key, which
+ * skips the per-user access check, so the parent's key is kept only while the
+ * user can use it and it still serves the model. Without it the fork resolves
+ * a key for the model the way its parent's turn does.
+ */
+export async function resolveForkParentSelection(params: {
+  agent: { llmApiKeyId: string | null; modelId: string | null };
+  organizationId: string;
+  userId: string;
+  parentLlm?: ModelSelection;
+}): Promise<ConversationLlmSelection> {
+  const { agent, organizationId, userId, parentLlm } = params;
+  const model = parentLlm?.modelId
+    ? await ModelModel.findById(parentLlm.modelId)
+    : null;
+  if (!parentLlm || !model) {
+    return resolveConversationLlmSelectionForAgent({
+      agent,
+      organizationId,
+      userId,
+    });
+  }
+  return {
+    modelId: model.id,
+    chatApiKeyId:
+      providerRequiresPerUserCredential(model.provider) &&
+      !(await LlmProviderApiKeyModel.isGithubAppKey(parentLlm.apiKeyId))
+        ? null
+        : await usableLinkedKey({
+            parentLlm,
+            agentLlmApiKeyId: agent.llmApiKeyId,
+            userId,
+          }),
+    selectedModel: model.modelId,
+    selectedProvider: model.provider,
+  };
+}
+
+async function usableLinkedKey(params: {
+  parentLlm: ModelSelection;
+  agentLlmApiKeyId: string | null;
+  userId: string;
+}): Promise<string | null> {
+  const { parentLlm, agentLlmApiKeyId, userId } = params;
+  if (!parentLlm.apiKeyId) return null;
+  const usable = await isParentKeyUsable({
+    apiKeyId: parentLlm.apiKeyId,
+    agentLlmApiKeyId,
+    userId,
+  });
+  if (!usable) return null;
+  const [linked] = await filterLinkedModelSelectionLevels([parentLlm]);
+  return linked.apiKeyId ?? null;
+}
+
+async function isParentKeyUsable(params: {
+  apiKeyId: string | null | undefined;
+  agentLlmApiKeyId: string | null;
+  userId: string;
+}): Promise<boolean> {
+  const { apiKeyId, agentLlmApiKeyId, userId } = params;
+  if (!apiKeyId || apiKeyId === agentLlmApiKeyId) return true;
+  const key = await LlmProviderApiKeyModel.findById(apiKeyId);
+  return (
+    key !== null && (await LlmProviderApiKeyModel.canUseKey(key, userId, []))
+  );
+}
+
+/** The optional `fast` / `smart` tiers of the organization's default trio. */
+interface ModelTrioTiers {
+  fastModelId: string | null;
+  smartModelId: string | null;
+}
+
+type ForkTier = Exclude<SubagentModelTier, "normal">;
+
+const ORGANIZATION_TIER_FIELD = {
+  fast: "defaultFastModelId",
+  smart: "defaultSmartModelId",
+} as const satisfies Record<ForkTier, string>;
+
+/**
+ * The model and key a forked subagent runs on for `tier`: the organization
+ * trio's model for that tier, else the provider's default tier model on the
+ * parent's key. The trio's model runs on the parent's key when it serves the
+ * model, else on a key the user may use for it, chosen as the Model Router
+ * chooses one for the user. Falls back to the parent's own selection.
+ */
+export async function resolveSubagentTierSelection(params: {
+  tier: SubagentModelTier;
+  parent: ConversationLlmSelection;
+  organizationId: string;
+  userId: string;
+}): Promise<ConversationLlmSelection> {
+  const { tier, parent } = params;
+  if (tier === "normal" || !parent.modelId) return parent;
+  return (await findTierSelection({ ...params, tier })) ?? parent;
+}
+
+/**
+ * The tiers a fork of `parent` can run on: every tier that resolves to a model
+ * the user can reach. A tier that lands on the parent's own model is still
+ * offered — what counts as fast or smart is the organization's call.
+ */
+export async function availableSubagentTiers(params: {
+  parent: ConversationLlmSelection;
+  organizationId: string;
+  userId: string;
+}): Promise<ForkTier[]> {
+  if (!params.parent.modelId) return [];
+  const tiers = await Promise.all(
+    (["fast", "smart"] as const).map(async (tier) =>
+      (await findTierSelection({ ...params, tier })) ? [tier] : [],
+    ),
+  );
+  return tiers.flat();
+}
+
+/** Each set trio tier must be a tool-capable chat model, on any provider. */
+export async function assertModelTrioTiers(
+  trio: ModelTrioTiers,
+): Promise<void> {
+  const ids = [trio.fastModelId, trio.smartModelId].filter((id): id is string =>
+    Boolean(id),
+  );
+  if (ids.length === 0) return;
+  const models = await ModelModel.findByIds(ids);
+  for (const id of ids) {
+    const model = models.find((m) => m.id === id);
+    if (!model || !isSubagentTierCandidate(model)) {
+      throw new ApiError(400, `Model ${id} is not a tool-capable chat model`);
+    }
+  }
+}
+
+async function findTierSelection(params: {
+  tier: ForkTier;
+  parent: ConversationLlmSelection;
+  organizationId: string;
+  userId: string;
+}): Promise<ConversationLlmSelection | undefined> {
+  const { tier, parent } = params;
+  const [organization, parentKeyModels] = await Promise.all([
+    OrganizationModel.getById(params.organizationId),
+    parent.chatApiKeyId
+      ? LlmProviderApiKeyModelLinkModel.getModelsForApiKey(parent.chatApiKeyId)
+      : providerRequiresPerUserCredential(parent.selectedProvider)
+        ? ModelModel.findAll({ provider: parent.selectedProvider })
+        : Promise.resolve([]),
+  ]);
+  const trioModelId = organization?.[ORGANIZATION_TIER_FIELD[tier]] ?? null;
+  const trioModel = trioModelId ? await ModelModel.findById(trioModelId) : null;
+  if (trioModel && isSubagentTierCandidate(trioModel)) {
+    const onParentKey =
+      parent.chatApiKeyId !== null &&
+      parentKeyModels.some((m) => m.id === trioModel.id) &&
+      (
+        await checkModelTeamAccess({
+          provider: trioModel.provider,
+          modelId: trioModel.modelId,
+          organizationId: params.organizationId,
+          authenticatedUserId: params.userId,
+        })
+      ).allowed;
+    const key = onParentKey
+      ? { kind: "found" as const, apiKeyId: parent.chatApiKeyId }
+      : await userKeyForModel({ ...params, model: trioModel });
+    if (key.kind === "found") return toSelection(trioModel, key.apiKeyId);
+  }
+  const fallback = findTierDefault(
+    parentKeyModels.filter(isSubagentTierCandidate),
+    parent.selectedProvider,
+    tier,
+  );
+  return fallback ? toSelection(fallback, parent.chatApiKeyId) : undefined;
+}
+
+function toSelection(
+  model: Model,
+  chatApiKeyId: string | null,
+): ConversationLlmSelection {
+  return {
+    modelId: model.id,
+    chatApiKeyId,
+    selectedModel: model.modelId,
+    selectedProvider: model.provider,
+  };
+}
+
+/** A fork runs the parent's tools, so its model must chat and call tools. */
+function isSubagentTierCandidate(model: Model): boolean {
+  return (
+    ModelModel.supportsTextChat(model) && model.supportsToolCalling !== false
+  );
 }
 
 /**
@@ -351,10 +522,12 @@ export async function resolveConfiguredAgentLlm(
     // owner's personal token — never hand it to another user. Leave apiKey
     // undefined so resolveAgentLlmOrDefault falls through to per-user
     // resolution for the acting user.
-    if (
-      apiKeyRecord.secretId &&
-      !providerRequiresPerUserCredential(apiKeyRecord.provider)
-    ) {
+    // An organization GitHub App key is shared; any other key on a per-user
+    // provider is its owner's token, and is not even read here.
+    const ownersToken =
+      providerRequiresPerUserCredential(apiKeyRecord.provider) &&
+      !(await LlmProviderApiKeyModel.isGithubAppKey(apiKeyRecord.id));
+    if (apiKeyRecord.secretId && !ownersToken) {
       const secret = await getSecretValueForLlmProviderApiKey(
         apiKeyRecord.secretId,
       );
@@ -466,12 +639,18 @@ export async function resolveModelOutputBudget(params: {
   provider: SupportedProvider;
   modelName: string;
   unknownOutputLength?: number;
+  chatApiKeyId?: string | null;
 }): Promise<ModelOutputBudget> {
+  const model = await ModelModel.findByProviderAndModelId(
+    params.provider,
+    params.modelName,
+  );
   return modelOutputBudget({
     provider: params.provider,
-    model: await ModelModel.findByProviderAndModelId(
-      params.provider,
-      params.modelName,
+    model,
+    outputLength: await LlmProviderApiKeyModelLinkModel.resolveOutputLength(
+      model,
+      params.chatApiKeyId,
     ),
     unknownOutputLength: params.unknownOutputLength,
   });
@@ -486,13 +665,12 @@ export async function resolveModelOutputBudget(params: {
 function modelOutputBudget(params: {
   provider: SupportedProvider;
   model: Model | null;
+  outputLength: number | null;
   /** Output cap to assume when the catalog has none for the model. */
   unknownOutputLength?: number;
 }): ModelOutputBudget {
   const { model } = params;
-  const outputLength = model
-    ? ModelModel.resolveEffectiveOutputLength(model)
-    : null;
+  const outputLength = params.outputLength;
   const contextLength = model
     ? ModelModel.resolveEffectiveContextLength(model)
     : null;
@@ -676,7 +854,7 @@ async function getAvailableRankedModels(params: {
 }
 
 /**
- * A member/organization default level as the acting user can run it: kept
+ * An organization default level as the acting user can run it: kept
  * when its key is one they may use or the agent's own key (used through the
  * agent); otherwise its model paired with a key they may use that serves it,
  * or no level at all. A per-user provider model (e.g. GitHub Copilot) is kept
@@ -745,20 +923,20 @@ function resolveDefaultLlmFromEnv(): {
       getProviderEnvApiKey(provider) &&
       !providerRequiresPerUserCredential(provider)
     ) {
-      return { model: DEFAULT_MODELS[provider], provider };
+      return { model: PROVIDER_MODEL_TIERS[provider].normal, provider };
     }
   }
 
   if (isVertexAiEnabled()) {
     logger.info(
-      { model: DEFAULT_MODELS.gemini },
+      { model: PROVIDER_MODEL_TIERS.gemini.normal },
       "resolveDefaultLlmFromEnv: Vertex AI is enabled",
     );
-    return { model: DEFAULT_MODELS.gemini, provider: "gemini" };
+    return { model: PROVIDER_MODEL_TIERS.gemini.normal, provider: "gemini" };
   }
 
   return {
-    model: config.chat.defaultModel,
-    provider: config.chat.defaultProvider,
+    model: PROVIDER_MODEL_TIERS.anthropic.normal,
+    provider: "anthropic",
   };
 }

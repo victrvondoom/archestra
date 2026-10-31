@@ -10,6 +10,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import { z } from "zod";
+import { ensureToolCallsHaveResults } from "@/agents/tool-call-results";
 import { serviceAccountUserId } from "@/auth/service-account-user-id";
 import logger from "@/logging";
 import {
@@ -40,6 +41,7 @@ import type {
   A2AContext,
   A2AMessage,
   AgentRunCompletionTarget,
+  AgentRunLimits,
   AgentRunRecord,
 } from "@/types";
 import { isTerminalA2ATaskState } from "@/types/a2a-task";
@@ -178,12 +180,21 @@ interface A2AManagerConfig {
 export interface A2ASystemParams {
   /** New A2A task, retained runtime workspace: terminal tasks remain immutable. */
   resumeFromTaskId?: string;
+  /** Caller-owned runtime title; bypasses automatic title generation. */
+  runtimeTitle?: string;
+  /** The run's tier and limits, already resolved against the Agent's settings. */
+  runtimeLimits?: AgentRunLimits;
   sessionId?: string;
   /** Project assigned by an interactive Chat execution launcher. */
   projectId?: string;
   source?: InteractionSource;
   routeCategory?: RouteCategory;
   completionTarget?: AgentRunCompletionTarget;
+  /** Awaited after persistence, before launch: register delivery without awaiting network I/O. */
+  onRuntimeSessionCreated?: (session: {
+    taskId: string;
+    workspaceId: string;
+  }) => Promise<void>;
   /**
    * Interactive is reserved for a person opening the execution terminal in
    * Chat. Every other durable task is one-shot so delegation surfaces can
@@ -327,6 +338,18 @@ export class A2AManager {
       ]);
       if (!agent) {
         throw new A2AError(A2AErrorKind.AgentNotFound);
+      }
+
+      if (
+        fullTaskMode &&
+        actor.oauthExecution &&
+        resolveAgentRuntime(agent) &&
+        (params.taskRun?.createTask || request.message.taskId)
+      ) {
+        throw new A2AError(
+          A2AErrorKind.UnsupportedOperation,
+          "OAuth applications cannot use Agent Runtime; use an in-process agent instead.",
+        );
       }
 
       const contextAccessOptions = {
@@ -509,6 +532,7 @@ export class A2AManager {
       // the model-window threshold) before building the request.
       if (!this.config.stateless && context && contextDbMessages.length > 0) {
         const compactionResult = await applyA2AContextCompaction({
+          oauthExecution: actor.oauthExecution,
           contextId: context.id,
           messages: contextDbMessages,
           agent: {
@@ -531,8 +555,9 @@ export class A2AManager {
       const contextUiMessages = coerceMalformedToolInputs(
         contextDbMessages.map((m) => m.content as UIMessage),
       );
-      const requestMessages: ModelMessage[] =
-        await convertToModelMessages(contextUiMessages);
+      const requestMessages: ModelMessage[] = ensureToolCallsHaveResults(
+        await convertToModelMessages(contextUiMessages),
+      );
 
       // The executor owns building the current user turn: it applies
       // model-aware, provider-specific attachment handling, so we pass the
@@ -673,6 +698,7 @@ export class A2AManager {
               return runTaskInAgentRuntime({
                 resumeFromTaskId,
                 runtime,
+                limits: systemParams?.runtimeLimits,
                 // Each task is a turn; continuations share the retained
                 // Sandbox identity and adoption never repeats a started turn.
                 taskId: runOpts.taskId,
@@ -681,7 +707,9 @@ export class A2AManager {
                 organizationId: actor.organizationId,
                 projectId: systemParams?.projectId,
                 completionTarget: systemParams?.completionTarget,
+                onRuntimeSessionCreated: systemParams?.onRuntimeSessionCreated,
                 task: executedTurnText,
+                title: systemParams?.runtimeTitle,
                 modelId: agent.modelId,
                 llmApiKeyId: agent.llmApiKeyId,
                 runMode: systemParams?.runtimeMode ?? "one_shot",
@@ -701,6 +729,7 @@ export class A2AManager {
               messages: requestMessages,
               organizationId: actor.organizationId,
               userId: a2aActorUserId(actor),
+              oauthExecution: actor.oauthExecution,
               sessionId,
               source: systemParams?.source,
               // A chat posts a paused review to the requester (see ChatOps).
@@ -1746,7 +1775,7 @@ export class A2AManager {
     const { tasks, totalSize } = await A2ATaskModel.listForActor({
       actorKind: params.actor.kind,
       actorId: params.actor.id,
-      agentId: params.agentId,
+      agentIds: [params.agentId],
       contextId: request.contextId,
       state: request.status,
       statusChangedAfter: request.statusTimestampAfter
@@ -1794,12 +1823,20 @@ export class A2AManager {
     }
 
     const organizationId = tokenAuth.organizationId;
+    const oauthExecution = tokenAuth.oauthClientId
+      ? {
+          tokenId: tokenAuth.tokenId,
+          clientId: tokenAuth.oauthClientId,
+          serviceAccountId: tokenAuth.serviceAccountId,
+        }
+      : undefined;
 
     if (tokenAuth.serviceAccountId) {
       return {
         id: tokenAuth.serviceAccountId,
         kind: "serviceAccount",
         organizationId,
+        oauthExecution,
       };
     }
 
@@ -1823,6 +1860,7 @@ export class A2AManager {
         id: tokenAuth.oauthClientId,
         kind: "oauthClient",
         organizationId,
+        oauthExecution,
       };
     }
 

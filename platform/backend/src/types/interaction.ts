@@ -10,6 +10,8 @@ import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
 import { schema } from "@/database";
 import { AgentTypeSchema } from "./agent";
+import { AttributionLabelsSchema } from "./attribution-label";
+import { AudioAuditRequestSchema, AudioAuditResponseSchema } from "./audio";
 import { SelectConversationChatErrorSchema } from "./conversation-chat-error";
 import { ToolCallBlockSchema } from "./interaction-guardrails";
 import {
@@ -24,6 +26,7 @@ import {
   Groq,
   Jev,
   Kimi,
+  KimiCode,
   Microsoft365Copilot,
   Minimax,
   Mistral,
@@ -36,6 +39,14 @@ import {
   Xai,
   Zhipuai,
 } from "./llm-providers";
+import {
+  PassthroughRequestSchema,
+  PassthroughResponseSchema,
+} from "./passthrough";
+import {
+  RealtimeInteractionRequestSchema,
+  RealtimeInteractionResponseSchema,
+} from "./realtime";
 import { VirtualApiKeyTypeSchema } from "./virtual-api-key";
 import { ResourceVisibilityScopeSchema } from "./visibility";
 
@@ -50,6 +61,12 @@ export const InteractionSessionPreviewSchema = z.object({
   contentNotStored: z.boolean(),
   lastUserMessagePreview: z.string().nullable(),
   claudeCodeTitle: z.string().nullable(),
+  /**
+   * What the request produced: the tools its response asked for, else the
+   * start of its reply. Rows written before these existed have neither.
+   */
+  responseToolNames: z.array(z.string()).optional(),
+  responseTextPreview: z.string().nullable().optional(),
 });
 export type InteractionSessionPreview = z.infer<
   typeof InteractionSessionPreviewSchema
@@ -172,6 +189,7 @@ export const InteractionErrorResponseSchema = z.object({ error: z.string() });
  * These are used for the database schema definition
  */
 export const InteractionRequestSchema = z.union([
+  AudioAuditRequestSchema,
   OpenAi.API.ChatCompletionRequestSchema,
   OpenAi.API.EmbeddingRequestSchema,
   Gemini.API.GenerateContentRequestSchema,
@@ -190,12 +208,17 @@ export const InteractionRequestSchema = z.union([
   DeepSeek.API.ChatCompletionRequestSchema,
   GithubCopilot.API.ChatCompletionRequestSchema,
   Kimi.API.ChatCompletionRequestSchema,
+  KimiCode.API.ChatCompletionRequestSchema,
   Microsoft365Copilot.API.ChatCompletionRequestSchema,
   Minimax.API.ChatCompletionRequestSchema,
   OpenAi.API.ResponsesRequestSchema,
   Azure.API.ChatCompletionRequestSchema,
   Azure.API.ResponsesRequestSchema,
+  Azure.API.ImageGenerationRequestSchema,
+  Azure.API.RealtimeTurnRequestSchema,
   Jev.API.DecisionsRequestSchema,
+  PassthroughRequestSchema,
+  RealtimeInteractionRequestSchema,
 ]);
 
 /**
@@ -222,6 +245,7 @@ const EmbeddingInteractionResponseSchema =
   });
 
 export const InteractionResponseSchema = z.union([
+  AudioAuditResponseSchema,
   OpenAi.API.ChatCompletionResponseSchema,
   EmbeddingInteractionResponseSchema,
   Gemini.API.GenerateContentResponseSchema,
@@ -240,6 +264,7 @@ export const InteractionResponseSchema = z.union([
   DeepSeek.API.ChatCompletionResponseSchema,
   GithubCopilot.API.ChatCompletionResponseSchema,
   Kimi.API.ChatCompletionResponseSchema,
+  KimiCode.API.ChatCompletionResponseSchema,
   Microsoft365Copilot.API.ChatCompletionResponseSchema,
   Minimax.API.ChatCompletionResponseSchema,
   OpenAi.API.ResponsesResponseSchema,
@@ -248,8 +273,11 @@ export const InteractionResponseSchema = z.union([
   OpenAi.API.ResponsesCompactedResponseSchema,
   Azure.API.ChatCompletionResponseSchema,
   Azure.API.ResponsesResponseSchema,
+  Azure.API.ImageGenerationResponseSchema,
   Jev.API.DecisionsResponseSchema,
   InteractionErrorResponseSchema,
+  PassthroughResponseSchema,
+  RealtimeInteractionResponseSchema,
 ]);
 
 /**
@@ -284,6 +312,7 @@ const BaseSelectInteractionSchema = createSelectSchema(
     // Required on read: the column is NOT NULL, so every row carries a concrete
     // BillingMode. (The default override belongs on the insert schema only.)
     billingMode: BillingModeSchema,
+    attributionLabels: AttributionLabelsSchema.nullable(),
   },
 );
 
@@ -317,6 +346,22 @@ const INTERNAL_ENCRYPTION_COLUMNS = {
   encryptedChatConversationId: true,
 } as const;
 
+/**
+ * Which GitHub Copilot credential served a request: an organization's
+ * subscription (a GitHub App key, billed to that organization) or a member's
+ * own sign-in.
+ */
+export const CopilotCredentialSourceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("organization"),
+    organization: z.string().nullable(),
+  }),
+  z.object({ kind: z.literal("personal") }),
+]);
+export type CopilotCredentialSource = z.infer<
+  typeof CopilotCredentialSourceSchema
+>;
+
 const BaseSelectInteractionResponseSchema = BaseSelectInteractionSchema.omit({
   ...DELTA_ENCODING_COLUMNS,
   ...INTERNAL_ENCRYPTION_COLUMNS,
@@ -328,6 +373,12 @@ const BaseSelectInteractionResponseSchema = BaseSelectInteractionSchema.omit({
    * that do not resolve it.
    */
   connectorName: z.string().nullable().optional(),
+  /**
+   * For a GitHub Copilot request: the organization subscription or personal
+   * sign-in that served it. Null when unknown; absent on endpoints that do
+   * not resolve it.
+   */
+  copilotCredentialSource: CopilotCredentialSourceSchema.nullable().optional(),
   /**
    * `virtualKeyId` resolved to its key and owner, within the caller's
    * organization. Null when the request used no standard virtual key (or the
@@ -363,6 +414,7 @@ export const InteractionSummarySchema = BaseSelectInteractionSchema.pick({
   baselineModel: true,
   billingMode: true,
   inputTokens: true,
+  inputTokensEstimated: true,
   outputTokens: true,
   cacheReadTokens: true,
   cacheWriteTokens: true,
@@ -370,12 +422,30 @@ export const InteractionSummarySchema = BaseSelectInteractionSchema.pick({
   baselineCost: true,
   durationMs: true,
   createdAt: true,
+  providerApiKeyId: true,
+  modelPoolId: true,
+  attempt: true,
+  attemptOutcome: true,
+  failureReason: true,
 }).extend({
+  attributionLabels: AttributionLabelsSchema.nullish(),
   type: SupportedProvidersDiscriminatorSchema,
   externalAgentIdLabel: z.string().nullable(),
   requestType: RequestTypeSchema,
   /** Origin of the call (`chat`, `chat:compaction`, …). Used to badge sub-agent rows. */
   source: InteractionSourceSchema.nullable().optional(),
+  /**
+   * The latest user text this request carried, from its stored preview: names
+   * a turn by the prompt it served. Null when none was captured.
+   */
+  userMessagePreview: z.string().nullable().optional(),
+  /**
+   * What this request produced, from its stored preview: the tools its
+   * response asked for, else the start of its reply. One prompt drives many
+   * requests in an agent loop, so this is what tells them apart.
+   */
+  responseToolNames: z.array(z.string()).nullable().optional(),
+  responseTextPreview: z.string().nullable().optional(),
 });
 
 /**
@@ -410,6 +480,14 @@ const withErrorResponse = <T extends z.ZodTypeAny>(schema: T) =>
  * Discriminated union schema for API responses
  * This provides type safety based on the type field
  */
+/**
+ * A Gemini row's request as logged: an image edit's row also names its
+ * reference images, as OpenAI edits do.
+ */
+const GeminiLoggedRequestSchema = Gemini.API.GenerateContentRequestSchema.and(
+  z.object({ input_files: z.record(z.string(), z.unknown()).optional() }),
+);
+
 export const SelectInteractionSchema = z.discriminatedUnion("type", [
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["openai:chatCompletions"]),
@@ -479,7 +557,7 @@ export const SelectInteractionSchema = z.discriminatedUnion("type", [
   }),
   BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["gemini:generateContent"]),
-    request: withReadFallback(Gemini.API.GenerateContentRequestSchema),
+    request: withReadFallback(GeminiLoggedRequestSchema),
     processedRequest: withReadFallback(Gemini.API.GenerateContentRequestSchema)
       .nullable()
       .optional(),
@@ -667,6 +745,17 @@ export const SelectInteractionSchema = z.discriminatedUnion("type", [
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["kimi-code:chatCompletions"]),
+    request: withReadFallback(KimiCode.API.ChatCompletionRequestSchema),
+    processedRequest: withReadFallback(KimiCode.API.ChatCompletionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(KimiCode.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["github-copilot:chatCompletions"]),
     request: withReadFallback(GithubCopilot.API.ChatCompletionRequestSchema),
     processedRequest: withReadFallback(
@@ -719,6 +808,47 @@ export const SelectInteractionSchema = z.discriminatedUnion("type", [
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
   BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:realtime"]),
+    request: withReadFallback(Azure.API.RealtimeTurnRequestSchema),
+    processedRequest: withReadFallback(Azure.API.RealtimeTurnRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ChatCompletionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:audio"]),
+    request: withReadFallback(AudioAuditRequestSchema),
+    processedRequest: withReadFallback(AudioAuditRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(AudioAuditResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:audio"]),
+    request: withReadFallback(AudioAuditRequestSchema),
+    processedRequest: withReadFallback(AudioAuditRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(AudioAuditResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["azure:images", "openai:images"]),
+
+    request: withReadFallback(Azure.API.ImageGenerationRequestSchema),
+    processedRequest: withReadFallback(Azure.API.ImageGenerationRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(Azure.API.ImageGenerationResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
     type: z.enum(["azure:responses"]),
     request: withReadFallback(Azure.API.ResponsesRequestSchema),
     processedRequest: withReadFallback(Azure.API.ResponsesRequestSchema)
@@ -759,6 +889,26 @@ export const SelectInteractionSchema = z.discriminatedUnion("type", [
       .optional(),
     response: withErrorResponse(Jev.API.DecisionsResponseSchema),
     /** Resolved prompt name if externalAgentId matches a prompt ID */
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:realtime"]),
+    request: withReadFallback(RealtimeInteractionRequestSchema),
+    processedRequest: withReadFallback(RealtimeInteractionRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(RealtimeInteractionResponseSchema),
+    requestType: RequestTypeSchema.optional(),
+    externalAgentIdLabel: z.string().nullable().optional(),
+  }),
+  BaseSelectInteractionResponseSchema.extend({
+    type: z.enum(["openai:passthrough", "anthropic:passthrough"]),
+    request: withReadFallback(PassthroughRequestSchema),
+    processedRequest: withReadFallback(PassthroughRequestSchema)
+      .nullable()
+      .optional(),
+    response: withErrorResponse(PassthroughResponseSchema),
+    requestType: RequestTypeSchema.optional(),
     externalAgentIdLabel: z.string().nullable().optional(),
   }),
 ]);
@@ -807,6 +957,7 @@ export const InsertInteractionSchema = createInsertSchema(
     // Optional on write: the column has a DB default ("metered"), so callers may
     // omit it. The proxy write path sets it explicitly (buildInteractionRecord).
     billingMode: BillingModeSchema.optional(),
+    attributionLabels: AttributionLabelsSchema.nullish(),
     type: SupportedProvidersDiscriminatorSchema,
     request: InteractionRequestSchema,
     processedRequest: InteractionRequestSchema.nullable().optional(),
@@ -816,6 +967,15 @@ export const InsertInteractionSchema = createInsertSchema(
   // Override profileId - required for proxy interactions, nullable for system interactions
   // (e.g., knowledge base embeddings/reranking have no associated profile)
   profileId: z.string().uuid().nullable(),
+  /** Accounting metadata is stored separately from encrypted log content. */
+  billingAttribution: z
+    .custom<import("@/utils/billable-usage").BillingAttribution>()
+    .optional(),
+  billingUsage: z
+    .custom<import("@/utils/billable-usage").PricedBillingUsage>()
+    .optional(),
+  /** The auto-routing decision this request was routed by; its usage is recorded with the row. */
+  autoRoutingDecisionId: z.string().uuid().optional(),
 });
 
 export type UserInfo = z.infer<typeof UserInfoSchema>;
@@ -851,12 +1011,20 @@ export const SessionLineageSchema = z.object({
 });
 
 export const SessionSummarySchema = z.object({
+  attributionLabels: AttributionLabelsSchema.nullish().describe(
+    "Captured attribution labels of lastInteractionId, the request shown in the row. Other requests in the session may have different labels. Null means no snapshot was captured.",
+  ),
   sessionId: z.string().nullable(),
   sessionSource: z.string().nullable(),
   source: InteractionSourceSchema.nullable(),
   sources: z.array(InteractionSourceSchema),
   interactionId: z.string().nullable(), // Only set for single interactions (null session)
   requestCount: z.number(),
+  failedOverCount: z
+    .number()
+    .describe(
+      "Requests a model pool retried on another member. Each is also counted in requestCount. Only one cut off by a timeout carries tokens or cost: an estimate of the input it read.",
+    ),
   totalInputTokens: z.number(),
   totalOutputTokens: z.number(),
   totalCacheReadTokens: z.number(),
@@ -907,6 +1075,8 @@ export const SessionSummarySchema = z.object({
    * Empty when no request in the session used a virtual key.
    */
   virtualKeys: z.array(InteractionVirtualKeySchema),
+  /** For GitHub Copilot requests: the credentials that served them. */
+  copilotCredentialSources: z.array(CopilotCredentialSourceSchema).optional(),
   /**
    * Short preview of the session's last user message, computed server-side
    * from the reconstructed request. The raw request body is intentionally
@@ -935,6 +1105,12 @@ export const SessionSummarySchema = z.object({
     ),
   conversationTitle: z.string().nullable(),
   claudeCodeTitle: z.string().nullable(),
+  connectorName: z
+    .string()
+    .nullable()
+    .describe(
+      "Name of the knowledge-base connector a knowledge:* session ran for, when exactly one connector owns it.",
+    ),
 });
 
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;

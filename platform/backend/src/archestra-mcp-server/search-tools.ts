@@ -6,6 +6,7 @@ import {
   isRequiredOpenAppaToolShortName,
   isRunControlArchestraToolShortName,
   isYellToolShortName,
+  type ModelSelection,
   parseFullToolName,
   TOOL_ASK_USER_SHORT_NAME,
   TOOL_LIST_PEER_MESSAGES_SHORT_NAME,
@@ -14,11 +15,12 @@ import {
   TOOL_RUN_COMMAND_SHORT_NAME,
   TOOL_RUN_TOOL_SHORT_NAME,
   TOOL_SEARCH_TOOLS_SHORT_NAME,
-  TOOL_START_RUN_SHORT_NAME,
+  TOOL_START_AGENT_RUN_SHORT_NAME,
 } from "@archestra/shared";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import safeRegex from "safe-regex2";
 import { z } from "zod";
+import type { TargetInstallCaller } from "@/clients/mcp-client";
 import logger from "@/logging";
 import {
   AgentModel,
@@ -44,6 +46,7 @@ import {
 import { filterToolsByCallerCatalogAccess } from "@/services/caller-catalog-access";
 import { getGuardrailsDeployment } from "@/services/guardrails-deployment";
 import { buildKnowledgeSourcesDescription } from "@/services/knowledge-sources-description";
+import { describeToolsForCaller } from "@/services/mcp-install-tool-descriptions";
 import { isSkillSandboxAvailableForAgent } from "@/skills/skill-sandbox-availability";
 import { APP_LAUNCH_TOOL_NAME } from "@/types/app";
 import { archestraMcpBranding } from "./branding";
@@ -236,6 +239,8 @@ const registry = defineArchestraTools([
         userId: context.userId,
         conversationId: context.conversationId,
         delegationChain: context.delegationChain,
+        parentLlm: context.parentLlm,
+        tokenAuth: context.tokenAuth,
       });
 
       let matches: SearchCandidate[];
@@ -410,6 +415,8 @@ async function getSearchableTools(params: {
   userId?: string;
   conversationId?: string;
   delegationChain?: string;
+  parentLlm?: ModelSelection;
+  tokenAuth?: TargetInstallCaller;
 }): Promise<SearchCandidate[]> {
   const { agentId, conversationId, organizationId, userId } = params;
   const delegatedRun = isAppaDelegatedRun(agentId, params.delegationChain);
@@ -442,6 +449,13 @@ async function getSearchableTools(params: {
     organizationId,
     exclusionSets,
   });
+  // Describe each third-party tool the way the installation its run_tool call
+  // would use describes it, before ranking reads the descriptions.
+  const describedTools = await describeToolsForCaller({
+    tools: [...assignedTools, ...discoverableTools],
+    agentId,
+    tokenAuth: params.tokenAuth,
+  });
   // OpenAPPA runtime and policy read tools are reachable on every agent when
   // the feature is on; policy writes come only from assignment or Auto mode.
   const injectedOpenappaTools = delegatedRun
@@ -457,6 +471,8 @@ async function getSearchableTools(params: {
           organizationId,
           userId,
           skipAccessCheck: userId === "system",
+          parentLlm: params.parentLlm,
+          delegationChain: params.delegationChain,
         })
       : [];
   const hasTaskStarter =
@@ -464,7 +480,7 @@ async function getSearchableTools(params: {
     assignedTools.some(
       (tool) =>
         archestraMcpBranding.getToolShortName(tool.name) ===
-        TOOL_START_RUN_SHORT_NAME,
+        TOOL_START_AGENT_RUN_SHORT_NAME,
     );
   // Match tools/list's implicit run-handle controls, including gateways with
   // no assigned tools. They are assignment-exempt at dispatch, but still pass
@@ -492,10 +508,7 @@ async function getSearchableTools(params: {
   const searchSpace = [
     ...injectedOpenappaTools,
     ...implicitRuntimeControls,
-    ...assignedTools.filter((tool) => !injectedOpenappaNames.has(tool.name)),
-    ...discoverableTools.filter(
-      (tool) => !injectedOpenappaNames.has(tool.name),
-    ),
+    ...describedTools.filter((tool) => !injectedOpenappaNames.has(tool.name)),
   ].filter(
     (tool) =>
       !(

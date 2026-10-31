@@ -9,7 +9,10 @@ import {
   SupportedEmbeddingDimensionsSchema,
   SupportedProvidersSchema,
 } from "@archestra/shared";
-import { isValidModelPrice } from "@archestra/shared/model-price";
+import {
+  isValidModelPrice,
+  normalizeModelPrice,
+} from "@archestra/shared/model-price";
 import {
   createInsertSchema,
   createSelectSchema,
@@ -154,6 +157,7 @@ export type CreateModel = z.infer<typeof CreateModelSchema>;
  *
  * - `custom`: admin-set override.
  * - `models_dev`: synced from the models.dev registry.
+ * - `provider`: published by the selected provider instance.
  * - `derived_multiplier`: cache price derived from the input price via a provider
  *   multiplier (used only for cache prices when the registry omits them).
  * - `default`: estimated flat fallback — a guess, surfaced as such in the UI.
@@ -161,11 +165,31 @@ export type CreateModel = z.infer<typeof CreateModelSchema>;
 export const PriceSourceSchema = z.enum([
   "custom",
   "models_dev",
+  "provider",
   "aws",
   "derived_multiplier",
   "default",
 ]);
 export type PriceSource = z.infer<typeof PriceSourceSchema>;
+
+const MediaRateSchema = z.object({
+  /** What the rate meters: text, image or audio, or text and image together. */
+  kind: z.enum(["text", "image", "audio", "text_and_image"]),
+  usd: z.number(),
+});
+
+/**
+ * A media model's rates as its vendor publishes them: per million tokens (image
+ * and audio tokens priced apart from text), per million characters of speech
+ * input, or per minute of transcribed audio. These are the rates the proxy
+ * charges media calls by; the per-token chat prices do not apply to them.
+ */
+export const MediaPricingSchema = z.object({
+  per: z.enum(["million_tokens", "million_characters", "minute"]),
+  input: z.array(MediaRateSchema),
+  output: z.array(MediaRateSchema),
+});
+export type MediaPricing = z.infer<typeof MediaPricingSchema>;
 
 /**
  * Model capabilities for API responses.
@@ -202,6 +226,8 @@ export const ModelCapabilitiesSchema = SelectModelSchema.pick({
   pricePerMillionCacheWrite: z.string().nullable(),
   /** Source of the effective cache price (null when cache is unpriced) */
   cachePriceSource: PriceSourceSchema.nullable(),
+  /** Media rates, for an image, speech or transcription model; else null */
+  mediaPricing: MediaPricingSchema.nullable(),
 });
 export type ModelCapabilities = z.infer<typeof ModelCapabilitiesSchema>;
 
@@ -218,9 +244,19 @@ const CustomModelTokenLimitSchema = z
   .nullable()
   .optional();
 
-/**
- * Schema for updating model details (pricing + modalities) from the edit dialog.
- */
+/** Canonicalize validated prices before passing them to PostgreSQL. */
+const CustomModelPriceSchema = z
+  .string()
+  .refine(
+    isValidModelPrice,
+    "Prices must be decimal numbers between 0 and 99999999.99",
+  )
+  .transform(normalizeModelPrice)
+  .pipe(z.string())
+  .nullable()
+  .optional();
+
+/** Schema for updating model details (pricing + modalities) from the edit dialog. */
 export const PatchModelBodySchema = createUpdateSchema(
   schema.modelsTable,
   fieldsToExtend,
@@ -230,6 +266,11 @@ export const PatchModelBodySchema = createUpdateSchema(
     customPricePerMillionOutput: true,
     customPricePerMillionCacheRead: true,
     customPricePerMillionCacheWrite: true,
+    longContextThreshold: true,
+    longContextPricePerMillionInput: true,
+    longContextPricePerMillionOutput: true,
+    longContextPricePerMillionCacheRead: true,
+    longContextPricePerMillionCacheWrite: true,
     customContextLength: true,
     customOutputLength: true,
     ignored: true,
@@ -239,10 +280,21 @@ export const PatchModelBodySchema = createUpdateSchema(
     configuredParameters: true,
   })
   .extend({
-    customPricePerMillionInput: z.string().nullable().optional(),
-    customPricePerMillionOutput: z.string().nullable().optional(),
-    customPricePerMillionCacheRead: z.string().nullable().optional(),
-    customPricePerMillionCacheWrite: z.string().nullable().optional(),
+    customPricePerMillionInput: CustomModelPriceSchema,
+    customPricePerMillionOutput: CustomModelPriceSchema,
+    customPricePerMillionCacheRead: CustomModelPriceSchema,
+    customPricePerMillionCacheWrite: CustomModelPriceSchema,
+    longContextThreshold: z
+      .number()
+      .int("Must be a whole number of tokens")
+      .min(1, "Must be 1 or greater")
+      .max(MAX_CUSTOM_MODEL_TOKEN_LIMIT)
+      .nullable()
+      .optional(),
+    longContextPricePerMillionInput: CustomModelPriceSchema,
+    longContextPricePerMillionOutput: CustomModelPriceSchema,
+    longContextPricePerMillionCacheRead: CustomModelPriceSchema,
+    longContextPricePerMillionCacheWrite: CustomModelPriceSchema,
     /**
      * Admin-set context window / max output tokens, overriding whatever the
      * provider reported (including nothing at all). `null` clears the override
@@ -326,19 +378,24 @@ export const PatchModelBodySchema = createUpdateSchema(
   )
   .refine(
     (data) => {
-      for (const value of [
-        data.customPricePerMillionInput,
-        data.customPricePerMillionOutput,
-        data.customPricePerMillionCacheRead,
-        data.customPricePerMillionCacheWrite,
-      ]) {
-        if (value != null) {
-          if (!isValidModelPrice(value)) return false;
-        }
-      }
-      return true;
+      // The threshold and its four prices are written together, all set or all null.
+      const fields = [
+        data.longContextThreshold,
+        data.longContextPricePerMillionInput,
+        data.longContextPricePerMillionOutput,
+        data.longContextPricePerMillionCacheRead,
+        data.longContextPricePerMillionCacheWrite,
+      ];
+      return (
+        fields.every((value) => value === undefined) ||
+        fields.every((value) => value === null) ||
+        fields.every((value) => value != null)
+      );
     },
-    { message: "Prices must be decimal numbers between 0 and 99999999.99" },
+    {
+      message:
+        "Long-context threshold and all four long-context prices must be set together or all be null",
+    },
   );
 export type PatchModelBody = z.infer<typeof PatchModelBodySchema>;
 
@@ -398,6 +455,8 @@ export const ModelWithApiKeysSchema = SelectModelSchema.extend({
   pricePerMillionCacheWrite: z.string().nullable(),
   /** Source of the effective cache price (null when cache is unpriced) */
   cachePriceSource: PriceSourceSchema.nullable(),
+  /** Media rates, for an image, speech or transcription model; else null */
+  mediaPricing: MediaPricingSchema.nullable(),
   /** True when the provider charges nothing for this model (both raw prices are zero). */
   isFree: z.boolean(),
   /**

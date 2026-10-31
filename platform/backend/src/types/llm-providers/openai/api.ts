@@ -38,7 +38,8 @@ const ChoiceSchema = z
     // Some OpenAI-compatible upstreams omit `index` on choices; without
     // optional() the response fails serialization (500).
     index: z.number().optional(),
-    logprobs: z.any().nullable(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
     message: z
       .object({
         // Tool-call-only replies often omit `content` entirely; requiring the
@@ -88,10 +89,32 @@ export const ChatCompletionRequestSchema = z
     // AI-SDK converts automatically), and `reasoning_effort` is how callers
     // bound or disable reasoning — both have to survive this schema.
     max_completion_tokens: z.number().int().positive().nullable().optional(),
+    prompt_cache_key: z.string().nullable().optional(),
+    prompt_cache_retention: z.enum(["in-memory", "24h"]).nullable().optional(),
+    prompt_cache_options: z
+      .object({
+        mode: z.enum(["implicit", "explicit"]).optional(),
+        ttl: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
     // Some OpenAI-compatible providers accept "max" reasoning effort.
     // Forward it unchanged; the upstream model decides which efforts it supports.
     reasoning_effort: z
       .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+      .nullable()
+      .optional(),
+    // Audio generation is opt-in. Preserve these fields through validation so
+    // audio-capable Chat Completions deployments receive the requested modality.
+    modalities: z
+      .array(z.enum(["text", "audio"]))
+      .nullable()
+      .optional(),
+    audio: z
+      .object({
+        voice: z.string(),
+        format: z.enum(["wav", "aac", "mp3", "flac", "opus", "pcm16"]),
+      })
       .nullable()
       .optional(),
     stream: z.boolean().nullable().optional(),

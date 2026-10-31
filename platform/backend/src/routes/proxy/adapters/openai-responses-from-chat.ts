@@ -14,8 +14,15 @@ import {
   chatCompletionToResponses,
   type OpenaiResponsesContext,
 } from "./openai-responses-translator";
-import { formatResponsesStreamErrorFrame } from "./responses-stream-error-frame";
-import { formatResponsesFunctionCallFrames } from "./responses-tool-call-rewrite";
+import {
+  carriesResponsesTerminal,
+  formatResponsesStreamErrorFrame,
+} from "./responses-stream-error-frame";
+import {
+  formatResponsesFunctionCallFrames,
+  RESPONSES_STREAM_END,
+  toSse,
+} from "./responses-tool-call-rewrite";
 import { toResponsesUsage } from "./responses-usage";
 
 type OpenAiResponse = OpenAi.Types.ChatCompletionsResponse;
@@ -169,6 +176,10 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
     return this.inner.state;
   }
 
+  get clientResponse() {
+    return { id: this.ctx.responseId, model: this.ctx.requestedModel };
+  }
+
   setTextSuffix(getSuffix: (completedText: string) => string): void {
     this.getTextSuffix = getSuffix;
   }
@@ -192,7 +203,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
     let sseData = "";
     if (textDelta) {
       sseData += this.ensureOutputStarted();
-      sseData += this.toSse({
+      sseData += toSse({
         type: "response.output_text.delta",
         item_id: this.itemId,
         output_index: 0,
@@ -220,7 +231,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
   formatTextDeltaSSE(text: string): string {
     return [
       this.ensureOutputStarted(),
-      this.toSse({
+      toSse({
         type: "response.output_text.delta",
         item_id: this.itemId,
         output_index: 0,
@@ -245,13 +256,13 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
       };
 
       return [
-        this.toSse({
+        toSse({
           type: "response.output_item.added",
           output_index: index,
           sequence_number: this.nextSequenceNumber(),
           item,
         }),
-        this.toSse({
+        toSse({
           type: "response.function_call_arguments.done",
           item_id: itemId,
           output_index: index,
@@ -259,7 +270,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
           arguments: toolCall.arguments,
           name: toolCall.name,
         }),
-        this.toSse({
+        toSse({
           type: "response.output_item.done",
           output_index: index,
           sequence_number: this.nextSequenceNumber(),
@@ -274,7 +285,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
     this.inner.formatCompleteTextSSE(text);
     return [
       this.ensureOutputStarted(),
-      this.toSse({
+      toSse({
         type: "response.output_text.delta",
         item_id: this.itemId,
         output_index: 0,
@@ -303,7 +314,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
       nextSequenceNumber: () => this.nextSequenceNumber(),
     });
     frames.push(
-      this.toSse({
+      toSse({
         type: "response.completed",
         sequence_number: this.nextSequenceNumber(),
         response: {
@@ -320,7 +331,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
   // appear in a terminal envelope and each response completes exactly once.
   formatEndSSE(): string {
     if (this.outputCompleted) {
-      return "data: [DONE]\n\n";
+      return RESPONSES_STREAM_END;
     }
     const footer =
       this.replacedText === null &&
@@ -334,7 +345,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
     const suffix = footer ? `\n\n${footer}` : "";
     const text = `${this.state.text}${suffix}`;
     const suffixDelta = suffix ? this.formatTextDeltaSSE(suffix) : "";
-    return `${suffixDelta}${this.completeOutput(text)}data: [DONE]\n\n`;
+    return `${suffixDelta}${this.completeOutput(text)}${RESPONSES_STREAM_END}`;
   }
 
   toProviderResponse(): TResponse {
@@ -350,7 +361,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
 
     this.outputStarted = true;
     return [
-      this.toSse({
+      toSse({
         type: "response.created",
         sequence_number: this.nextSequenceNumber(),
         response: {
@@ -362,7 +373,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
           output: [],
         },
       }),
-      this.toSse({
+      toSse({
         type: "response.output_item.added",
         output_index: 0,
         sequence_number: this.nextSequenceNumber(),
@@ -374,7 +385,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
           content: [],
         },
       }),
-      this.toSse({
+      toSse({
         type: "response.content_part.added",
         item_id: this.itemId,
         output_index: 0,
@@ -398,7 +409,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
     const text = textOverride ?? this.state.text;
     return [
       this.outputStarted ? "" : this.ensureOutputStarted(),
-      this.toSse({
+      toSse({
         type: "response.output_text.done",
         item_id: this.itemId,
         output_index: 0,
@@ -407,7 +418,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
         text,
         logprobs: [],
       }),
-      this.toSse({
+      toSse({
         type: "response.content_part.done",
         item_id: this.itemId,
         output_index: 0,
@@ -419,7 +430,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
           annotations: [],
         },
       }),
-      this.toSse({
+      toSse({
         type: "response.output_item.done",
         output_index: 0,
         sequence_number: this.nextSequenceNumber(),
@@ -437,7 +448,7 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
           ],
         },
       }),
-      this.toSse({
+      toSse({
         type: "response.completed",
         sequence_number: this.nextSequenceNumber(),
         // The builder omits usage entirely for an unobserved turn, which is
@@ -538,10 +549,6 @@ class ResponsesFromChatStreamAdapter<TChunk, TResponse>
       }),
     }));
   }
-
-  private toSse(event: unknown): string {
-    return `data: ${JSON.stringify(event)}\n\n`;
-  }
 }
 
 export function makeResponsesFromChatAdapterFactory<
@@ -561,6 +568,7 @@ export function makeResponsesFromChatAdapterFactory<
     // shaped too, or the client parses it as an unknown chunk and the failure
     // reaches the user as a blank turn.
     formatStreamErrorFrame: formatResponsesStreamErrorFrame,
+    carriesStreamTerminal: carriesResponsesTerminal,
     createResponseAdapter(response) {
       return new ResponsesFromChatAdapter(
         provider.createResponseAdapter(response),

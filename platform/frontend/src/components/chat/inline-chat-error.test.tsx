@@ -1,3 +1,4 @@
+import { OUTPUT_LIMIT_REACHED_MESSAGE } from "@archestra/shared";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { toast } from "sonner";
@@ -93,6 +94,65 @@ describe("InlineChatError", () => {
     expect(
       screen.getByRole("button", { name: "Copy error details" }),
     ).toBeInTheDocument();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps output-limit guidance with slim mode=%s without offering an unchanged retry", (slim) => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "incomplete_response",
+              message: OUTPUT_LIMIT_REACHED_MESSAGE,
+              isRetryable: false,
+            }),
+          )
+        }
+        onRetry={vi.fn()}
+        slimChatErrorUi={slim}
+      />,
+    );
+
+    expect(
+      screen.getByText(/output limit before producing a reply/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/try a smaller task/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/increase the output-token limit/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /try again/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps other incomplete replies neutral in slim mode", () => {
+    render(
+      <InlineChatError
+        error={
+          new Error(
+            JSON.stringify({
+              code: "incomplete_response",
+              message: "private provider detail",
+              isRetryable: false,
+            }),
+          )
+        }
+        slimChatErrorUi
+      />,
+    );
+
+    expect(
+      screen.getByText("The model stopped before completing a reply."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/increase the output-token limit/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("private provider detail"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows curated error copy in slim mode without a support message", () => {
@@ -497,29 +557,6 @@ describe("InlineChatError", () => {
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Sign in with/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("does not suggest an ordinary Vault key for an exact subscription gate", () => {
-    vi.mocked(useFeature).mockReturnValue(true);
-
-    render(
-      <ProviderAuthRequiredCard
-        provider="xai"
-        providerLabel="SuperGrok"
-        agentName="Research Agent"
-        variant="preflight"
-      />,
-    );
-
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      /managed secret storage, or choose an agent\/model/i,
-    );
-    expect(screen.getByRole("alert")).not.toHaveTextContent(
-      /provider API key from Vault/i,
-    );
-    expect(
-      screen.queryByRole("button", { name: "Sign in with Grok" }),
     ).not.toBeInTheDocument();
   });
 

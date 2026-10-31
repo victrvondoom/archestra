@@ -12,6 +12,16 @@ import { useOrganization } from "@/lib/organization.query";
 import { makeOrganization } from "@/mocks/data/organization";
 import { AgentCreatePage } from "./agent-create-page";
 
+vi.mock("@/lib/agent-runtime-templates.query", () => ({
+  useRuntimeTemplateCatalog: () => ({
+    data: [],
+    isFetching: false,
+    isPending: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useResolveRuntimeTemplate: () => ({ isPending: false, mutate: vi.fn() }),
+}));
 vi.mock("next/navigation");
 vi.mock("@/lib/organization.query");
 vi.mock("@/lib/auth/auth.query");
@@ -135,7 +145,7 @@ describe("AgentCreatePage", () => {
       screen
         .getAllByRole("heading", { level: 2 })
         .map((heading) => heading.textContent),
-    ).toEqual(["Coding agents Beta", "External agents"]);
+    ).toEqual(["Agent Runtimes Beta", "External agents"]);
     expect(screen.getByText("Agent Runtime unavailable.")).toBeVisible();
     expect(
       screen.queryByText(/sandboxes\.agents\.x-k8s\.io/),
@@ -150,6 +160,9 @@ describe("AgentCreatePage", () => {
       "OpenCode",
       "Hermes",
       "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
     ]) {
       const card = screen.getByRole("button", { name: new RegExp(name, "i") });
       expect(card).toBeDisabled();
@@ -192,6 +205,36 @@ describe("AgentCreatePage", () => {
     }
   });
 
+  it("allows ordinary agents but denies runtime templates without Configure runtime", () => {
+    vi.mocked(useFeature).mockImplementation((feature) =>
+      feature === "agentRuntime" ? true : undefined,
+    );
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.agent?.includes("configure-runtime"),
+          isPending: false,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    renderAgentCreatePage();
+    expect(
+      screen.getByText("Configure runtime permission required"),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: /new archestra agent/i }),
+    ).toBeEnabled();
+    for (const name of [/codex/i, /custom image/i]) {
+      const choice = screen.getByRole("button", { name });
+      expect(choice).toBeDisabled();
+      expect(choice).toHaveAccessibleDescription(
+        "Requires Configure runtime permission.",
+      );
+    }
+    expect(
+      screen.getByRole("button", { name: /connect via a2a/i }),
+    ).toBeEnabled();
+  });
+
   it("offers maintained Agent templates and prefills the existing create wizard", async () => {
     const user = userEvent.setup();
     vi.mocked(useFeature).mockImplementation((feature) =>
@@ -205,19 +248,22 @@ describe("AgentCreatePage", () => {
     renderAgentCreatePage();
 
     expect(
-      screen.getByRole("heading", { level: 2, name: "Coding agents Beta" }),
+      screen.getByRole("heading", { level: 2, name: "Agent Runtimes Beta" }),
     ).toBeInTheDocument();
     expect(
       screen
         .getAllByRole("heading", { level: 2 })
         .map((heading) => heading.textContent),
-    ).toEqual(["Coding agents Beta", "External agents"]);
+    ).toEqual(["Agent Runtimes Beta", "External agents"]);
     for (const name of [
       "Claude Code",
       "Codex",
       "OpenCode",
       "Hermes",
       "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
     ]) {
       expect(
         screen.getByRole("button", { name: new RegExp(name, "i") }),
@@ -225,7 +271,7 @@ describe("AgentCreatePage", () => {
     }
     // The platform's own harness is offered on its own, not as a coding agent.
     const codingAgents = screen
-      .getByRole("heading", { level: 2, name: "Coding agents Beta" })
+      .getByRole("heading", { level: 2, name: "Agent Runtimes Beta" })
       .closest("section") as HTMLElement;
     expect(
       within(codingAgents)
@@ -237,6 +283,9 @@ describe("AgentCreatePage", () => {
       "OpenCode",
       "Hermes",
       "OpenClaw",
+      "Grok Build",
+      "Kimi Code",
+      "GitHub Copilot CLI",
       "Custom image",
     ]);
     expect(formProps).not.toHaveBeenCalled();

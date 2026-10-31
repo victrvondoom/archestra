@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
 import type { ScopedResource } from "@archestra/shared";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { canUseAgent } from "@/auth/permission-gated";
 import db, { schema, withDbTransaction } from "@/database";
 import logger from "@/logging";
+import { readConfig } from "@/services/config-cache";
 import type { AgentAccessContext, LabelWithDetails } from "@/types";
 import AgentModel from "./agent";
 import { findAgentAccessContextById } from "./agent-access-context";
@@ -11,6 +13,7 @@ import ResourcePermissionSubjectModel, {
   type GrantPrincipal,
   type PrincipalSource,
 } from "./resource-permission-subject";
+import TeamModel from "./team";
 import TeamLabelModel from "./team-label";
 
 class AgentTeamModel {
@@ -70,8 +73,9 @@ class AgentTeamModel {
   }
 
   /**
-   * Check if a user has access to a specific agent: a grant decides for an
-   * agent or MCP gateway; see the end of the method for an LLM proxy.
+   * Check if a user has access to a specific agent: an LLM proxy serves its
+   * organization's members (any proxy for an admin); a grant decides for an
+   * agent or MCP gateway.
    */
   static async userHasAgentAccess(params: {
     userId: string;
@@ -99,48 +103,62 @@ class AgentTeamModel {
     if (!agent) {
       return false;
     }
+    if (
+      !(await canUseAgent(agentId, {
+        userId,
+        organizationId: agent.organizationId,
+      }))
+    )
+      return false;
+    // Agents and MCP gateways are reached through grants alone. An LLM proxy
+    // has no grant namespace of its own: the organization's proxy serves every
+    // member, and an administrator reaches any proxy row.
+    if (agent.agentType === "llm_proxy")
+      return (
+        isAgentAdmin ||
+        AgentModel.isOrganizationLlmProxyFor({ agentId, userId })
+      );
 
     const table = schema.agentsTable;
     const principal = await ResourcePermissionSubjectModel.resolvePrincipalFrom(
       lookups,
       { organizationId: agent.organizationId, userId },
     );
-    const [granted] = await db
-      .select({ id: table.id })
-      .from(table)
-      .where(
-        and(
-          eq(table.id, agentId),
-          or(
+    return readConfig(
+      `agent-grant\0${action}\0${agentId}\0${agent.organizationId}\0${userId}`,
+      async () => {
+        const [granted] = await db
+          .select({ id: table.id })
+          .from(table)
+          .where(
             and(
-              inArray(table.agentType, ["agent", "profile"]),
-              ResourcePermissionPolicyModel.grantCondition({
-                ...principal,
-                resource: "agent",
-                scopeColumn: table.id,
-                action,
-              }),
+              eq(table.id, agentId),
+              or(
+                and(
+                  inArray(table.agentType, ["agent", "profile"]),
+                  ResourcePermissionPolicyModel.grantCondition({
+                    ...principal,
+                    resource: "agent",
+                    scopeColumn: table.id,
+                    action,
+                  }),
+                ),
+                and(
+                  eq(table.agentType, "mcp_gateway"),
+                  ResourcePermissionPolicyModel.grantCondition({
+                    ...principal,
+                    resource: "mcpGateway",
+                    scopeColumn: table.id,
+                    action,
+                  }),
+                ),
+              ),
             ),
-            and(
-              eq(table.agentType, "mcp_gateway"),
-              ResourcePermissionPolicyModel.grantCondition({
-                ...principal,
-                resource: "mcpGateway",
-                scopeColumn: table.id,
-                action,
-              }),
-            ),
-          ),
-        ),
-      )
-      .limit(1);
-    if (granted) return true;
-    // Agents and MCP gateways are reached through grants alone. An LLM proxy
-    // has no grant namespace of its own: the organization's proxy serves every
-    // member, and an administrator reaches any proxy row.
-    if ((await AgentModel.getAgentType(agentId)) !== "llm_proxy") return false;
-    if (isAgentAdmin) return true;
-    return AgentModel.isOrganizationLlmProxyFor({ agentId, userId });
+          )
+          .limit(1);
+        return granted !== undefined;
+      },
+    );
   }
 
   /**
@@ -152,6 +170,27 @@ class AgentTeamModel {
     return (
       (await AgentTeamModel.getTeamsForAgents([agentId])).get(agentId) ?? []
     );
+  }
+
+  /**
+   * The agent's teams a call belongs to: those the caller is in, directly or
+   * through a sub-team. Team limits and usage use this, so another team's
+   * limit on a shared agent never applies to the caller.
+   */
+  static async getCallerTeamsForAgent(params: {
+    agentId: string;
+    userId: string | null | undefined;
+    teamSource?: AgentTeamSource;
+  }): Promise<string[]> {
+    if (!params.userId) return [];
+    const [agentTeamIds, callerTeamIds] = await Promise.all([
+      params.teamSource
+        ? params.teamSource.agentTeamIds(params.agentId)
+        : AgentTeamModel.getTeamsForAgent(params.agentId),
+      TeamModel.getUserTeamIds(params.userId),
+    ]);
+    const callerTeams = new Set(callerTeamIds);
+    return agentTeamIds.filter((teamId) => callerTeams.has(teamId));
   }
 
   /**

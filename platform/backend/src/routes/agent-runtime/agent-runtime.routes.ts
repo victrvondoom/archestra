@@ -11,7 +11,10 @@ import {
   requireAgentModifyPermission,
   userHasPermission,
 } from "@/auth";
-import { actorFromUserId } from "@/auth/service-account-user-id";
+import {
+  actorFromUserId,
+  serviceAccountUserId,
+} from "@/auth/service-account-user-id";
 import logger from "@/logging";
 import {
   A2ATaskModel,
@@ -37,6 +40,11 @@ import { getResolvedAgentRuntimeModelCompatibility } from "@/services/agent-runt
 import { resolveAgentRuntime } from "@/services/agent-runtime/pod-run";
 import { agentRunReconciler } from "@/services/agent-runtime/reconciler";
 import {
+  createAgentRunAccessChecker,
+  mayAttachAgentRun,
+} from "@/services/agent-runtime/run-access";
+import { resolveAgentRunLimits } from "@/services/agent-runtime/runtime-tiers";
+import {
   cancelDetachedAgentTask,
   startDetachedAgentTask,
 } from "@/services/agent-runtime/start-task";
@@ -50,6 +58,7 @@ import {
 import { ResourcePermissions } from "@/services/resource-permissions";
 import {
   type Agent,
+  AgentRunLimitsRequestSchema,
   type AgentRunSession,
   AgentRunSessionResponseSchema,
   type AgentRunStartupProgress,
@@ -267,11 +276,6 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
     {
       schema: {
         operationId: RouteId.StartClaudeCodeSignIn,
-        body: z
-          .object({
-            vaultReference: z.string().trim().min(1).max(2048).optional(),
-          })
-          .nullish(),
         tags: ["Agents"],
         params: z.object({ id: z.string().uuid() }),
         response: constructResponseSchema(ClaudeCodeAccountSchema),
@@ -284,10 +288,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
         ...owner,
         inspectFlow: false,
       });
-      const after = await claudeCodeAccountManager.start({
-        ...owner,
-        ...request.body,
-      });
+      const after = await claudeCodeAccountManager.start(owner);
       request.auditBefore = {
         claudeCodeAccount: {
           state: before.state,
@@ -525,15 +526,24 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
         agentId: request.params.id,
         organizationId: request.organizationId,
       });
-      return reply.send(
-        runs.map((run) => ({
+      const canAttach = createAgentRunAccessChecker({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+      const items = [];
+      // Bound permission work to distinct actors, without flooding the pool
+      // when an Agent has a long history or many different service accounts.
+      for (const run of runs) {
+        items.push({
           ...run,
+          canAttach: !run.endedAt && (await canAttach(run)),
           shareTeamNames:
             run.actorUserId === request.user.id ? run.shareTeamNames : null,
           shareUserNames:
             run.actorUserId === request.user.id ? run.shareUserNames : null,
-        })),
-      );
+        });
+      }
+      return reply.send(items);
     },
   );
 
@@ -549,6 +559,8 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
           message: z.string().trim().min(1).max(100_000),
           projectId: z.string().uuid().optional(),
           attachments: agentRunAttachmentsSchema(),
+          /** Each value must stay within the Agent's own; a larger one is refused. */
+          limits: AgentRunLimitsRequestSchema.optional(),
         }),
         response: constructResponseSchema(StartAgentRunResponseSchema),
       },
@@ -617,6 +629,10 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
         );
       }
 
+      const limits = resolveAgentRunLimits({
+        runtime,
+        requested: request.body.limits,
+      });
       const task = await startDetachedAgentTask({
         actor: {
           ...actorFromUserId(request.user.id),
@@ -630,6 +646,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
           source: "chat",
           projectId: request.body.projectId,
           runtimeMode: "interactive",
+          runtimeLimits: limits,
         },
       });
       request.auditResourceId = { value: task.id };
@@ -648,6 +665,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
         prompt: request.body.message,
         projectId: request.body.projectId ?? null,
         createdAt: task.createdAt,
+        limits,
       });
     },
   );
@@ -755,19 +773,30 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
               }
             : null,
           viewerRole: "owner" as const,
+          canAttach: true,
           startupProgress: await inspectStartupProgress(owned),
         });
       }
 
-      // Non-owners may still open the run read-only when a share grants
-      // them access. Attaching interactively stays owner-only (enforced in the
-      // WebSocket attach handler) because attach runs under the owner's
-      // credentials; a share only unlocks the log stream.
-      const shared = await AgentRunModel.findSessionByTaskId({
+      // Shares unlock output only. Managing the owning service account can
+      // separately authorize its terminal without granting run ownership.
+      let shared = await AgentRunModel.findSessionByTaskId({
         taskId: request.params.taskId,
         organizationId: request.organizationId,
       });
       if (shared) {
+        const canAttach = await mayAttachAgentRun(shared, {
+          userId: request.user.id,
+          organizationId: request.organizationId,
+        });
+        if (canAttach && shared.actorKind === "serviceAccount") {
+          shared =
+            (await AgentRunModel.findCurrentSessionForActor({
+              taskId: shared.taskId,
+              actorUserId: serviceAccountUserId(shared.actorId),
+              organizationId: request.organizationId,
+            })) ?? shared;
+        }
         // SPDX-SnippetBegin
         // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
         // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
@@ -785,13 +814,14 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
               userId: request.user.id,
             })
           : false;
-        if (explicitlyShared || sharedThroughProject) {
+        if (explicitlyShared || sharedThroughProject || canAttach) {
           return reply.send({
             ...shared,
             terminalRetained: agentRunReconciler.hasRetainedTerminal(
               shared.taskId,
             ),
             viewerRole: "shared" as const,
+            canAttach,
             startupProgress: null,
           });
         }
@@ -876,6 +906,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
         prompt: request.body.message,
         projectId: run.projectId,
         createdAt: task.createdAt,
+        limits: session?.runtimeLimits ?? null,
       });
     },
   );
@@ -1082,7 +1113,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (request, reply) => {
-      const ticket = workspaceTransferTickets.resolve(
+      const ticket = await workspaceTransferTickets.resolve(
         request.params.transferId,
         bearerToken(request.headers.authorization),
       );
@@ -1131,7 +1162,7 @@ const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
       },
     },
     async (request, reply) => {
-      const ticket = workspaceTransferTickets.resolve(
+      const ticket = await workspaceTransferTickets.resolve(
         request.params.transferId,
         bearerToken(request.headers.authorization),
       );

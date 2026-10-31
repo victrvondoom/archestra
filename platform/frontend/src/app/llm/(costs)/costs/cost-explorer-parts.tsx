@@ -134,10 +134,12 @@ export function QueryChip<T extends string>({
 }
 
 export function ChartKindToggle({
+  linesDisabled = false,
   value,
   onChange,
 }: {
   value: ChartKind;
+  linesDisabled?: boolean;
   onChange: (v: ChartKind) => void;
 }) {
   const items: { id: ChartKind; label: string; icon: ReactNode }[] = [
@@ -153,10 +155,11 @@ export function ChartKindToggle({
           type="button"
           title={it.label}
           aria-label={it.label}
+          disabled={it.id === "lines" && linesDisabled}
           aria-pressed={value === it.id}
           onClick={() => onChange(it.id)}
           className={cn(
-            "inline-flex h-full items-center rounded-[5px] px-2 text-muted-foreground transition-colors [&_svg]:size-4",
+            "inline-flex h-full items-center rounded-[5px] px-2 text-muted-foreground transition-colors disabled:opacity-40 [&_svg]:size-4",
             value === it.id
               ? "bg-accent text-foreground"
               : "hover:text-foreground",
@@ -183,11 +186,14 @@ export function Sparkline({
 }) {
   if (values.length < 2)
     return <span className="text-muted-foreground">—</span>;
-  const max = Math.max(...values, 1e-9);
+  const min = Math.min(0, ...values);
+  const max = Math.max(0, ...values);
+  const range = Math.max(max - min, 1e-9);
+  const y = (value: number) =>
+    height - 2 - ((value - min) / range) * (height - 4);
   const step = width / (values.length - 1);
   const pts = values.map(
-    (v, i) =>
-      `${(i * step).toFixed(1)},${(height - 2 - (v / max) * (height - 4)).toFixed(1)}`,
+    (v, i) => `${(i * step).toFixed(1)},${y(v).toFixed(1)}`,
   );
   return (
     <svg
@@ -198,7 +204,7 @@ export function Sparkline({
       aria-hidden="true"
     >
       <polyline
-        points={`0,${height} ${pts.join(" ")} ${width},${height}`}
+        points={`0,${y(0)} ${pts.join(" ")} ${width},${y(0)}`}
         fill={color}
         fillOpacity={0.12}
         stroke="none"
@@ -501,7 +507,7 @@ function PivotTooltip({
 }) {
   if (!active || !payload?.length) return null;
   const items = [...payload]
-    .filter((p) => Number(p.value) > 0)
+    .filter((p) => Number(p.value) !== 0)
     .sort((a, b) => Number(b.value) - Number(a.value));
   const total = items.reduce((a, p) => a + Number(p.value), 0);
   return (
@@ -563,7 +569,7 @@ export function SummaryTable({
     [cube.buckets],
   );
   const rank = new Map(cube.rows.map((r, i) => [r.key, i]));
-  const peakOf = (r: CubeRow) => Math.max(0, ...r.series);
+  const peakOf = (r: CubeRow) => (r.series.length ? Math.max(...r.series) : 0);
   const rows = [...cube.rows].sort((a, b) => {
     const v = (r: CubeRow) =>
       sort.key === "label"
@@ -818,7 +824,7 @@ export function PivotTable({
 }) {
   const cols = pivotColumns(cube, bySplit);
   const matrix = cube.rows.map((r) => pivotValues(r, cube, bySplit));
-  const max = Math.max(1e-9, ...matrix.flat());
+  const max = Math.max(1e-9, ...matrix.flat().map(Math.abs));
   const colTotals = cols.map((_, j) =>
     matrix.reduce((a, row) => a + row[j], 0),
   );
@@ -876,8 +882,8 @@ export function PivotTable({
                   className="border-b border-l border-l-background px-1.5 py-1.5 text-right font-mono tabular-nums"
                   style={{
                     background:
-                      v > 0
-                        ? `color-mix(in oklch, var(--chart-1) ${Math.round(8 + Math.sqrt(v / max) * 62)}%, transparent)`
+                      v !== 0
+                        ? `color-mix(in oklch, var(--chart-1) ${Math.round(8 + Math.sqrt(Math.abs(v) / max) * 62)}%, transparent)`
                         : undefined,
                   }}
                 >
@@ -957,8 +963,9 @@ export function copyCsv({
   bySplit: boolean;
 }) {
   const esc = (s: string | number) => {
-    const t = String(s);
-    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    let t = String(s);
+    if (typeof s === "string" && /^[=+@\-\t\r]/.test(t)) t = `'${t}`;
+    return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
   };
   const num = (v: number) => (Number.isInteger(v) ? v : v.toFixed(4));
   let lines: (string | number)[][];
@@ -1071,42 +1078,6 @@ function Tag({ text }: { text: string }) {
 
 function RowGroup({ children }: { children: ReactNode }) {
   return <>{children}</>;
-}
-
-/**
- * Saved-view pills. One swipeable row on phones (bleeding to the page gutter),
- * wrapping from `sm` up.
- */
-export function ViewPills({
-  label,
-  items,
-}: {
-  label: string;
-  items: { id: string; label: string; active: boolean; onSelect: () => void }[];
-}) {
-  return (
-    <nav
-      aria-label={label}
-      className="-mx-4 flex gap-1.5 overflow-x-auto px-4 [scrollbar-width:none] sm:mx-0 sm:flex-wrap sm:overflow-visible sm:px-0 [&::-webkit-scrollbar]:hidden"
-    >
-      {items.map((it) => (
-        <UnstyledButton
-          key={it.id}
-          type="button"
-          aria-pressed={it.active}
-          onClick={it.onSelect}
-          className={cn(
-            "h-7 shrink-0 whitespace-nowrap rounded-full border px-3 text-xs transition-colors",
-            it.active
-              ? "border-foreground bg-foreground text-background"
-              : "bg-background text-muted-foreground hover:border-foreground/40 hover:text-foreground dark:bg-input/30",
-          )}
-        >
-          {it.label}
-        </UnstyledButton>
-      ))}
-    </nav>
-  );
 }
 
 export function Segmented<T extends string>({

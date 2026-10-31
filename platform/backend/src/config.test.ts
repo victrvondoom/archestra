@@ -36,10 +36,12 @@ import config, {
   parseAnthropicWifConfig,
   parseBodyLimit,
   parseChatMaxOutputTokens,
+  parseChatopsWebhookBaseUrl,
   parseChatRateMeteredMaxOutputTokens,
   parseClampedFloat,
   parseClampedInt,
   parseClampedIntOrZero,
+  parseClusterDnsIps,
   parseCodeRuntimeDaggerRunnerHost,
   parseCommaSeparatedList,
   parseConnectorSyncMaxDuration,
@@ -76,9 +78,12 @@ import config, {
   parseRetentionDays,
   parseSampleRate,
   parseSandboxMemoryMaxBytes,
+  parseShutdownSeconds,
+  parseSreApiServerCidrs,
   parseTrustProxy,
   parseVirtualKeyDefaultExpiration,
   resolveAllowedOrigins,
+  validateShutdownPodGrace,
 } from "./config";
 
 // Mock the logger
@@ -437,6 +442,29 @@ describe("parseFrontendBaseUrl", () => {
     expect(parseFrontendBaseUrl(" https://app.example.com// ")).toBe(
       "https://app.example.com",
     );
+  });
+});
+
+describe("parseChatopsWebhookBaseUrl", () => {
+  test("leaves existing URL selection in place when unset", () => {
+    expect(parseChatopsWebhookBaseUrl(undefined)).toBeUndefined();
+    expect(parseChatopsWebhookBaseUrl("  ")).toBeUndefined();
+  });
+
+  test("normalizes whitespace and trailing slashes", () => {
+    expect(
+      parseChatopsWebhookBaseUrl(" https://hooks.example.com/base/// "),
+    ).toBe("https://hooks.example.com/base");
+  });
+
+  test.each([
+    "not a URL",
+    "file:///tmp/hooks",
+    "https://user:password@example.com",
+    "https://hooks.example.com/?token=example",
+    "https://hooks.example.com/#part",
+  ])("rejects an unsafe base URL: %s", (url) => {
+    expect(() => parseChatopsWebhookBaseUrl(url)).toThrow();
   });
 });
 
@@ -1626,6 +1654,27 @@ describe("encrypted chat escrow config", () => {
   });
 });
 
+describe("platform version", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  test.each([
+    ["platform-v1.5.0-rc.4", "v1.5.0-rc.4"],
+    ["v1.4.1", "v1.4.1"],
+    ["1.4.1", "v1.4.1"],
+    [
+      "f12beffe7b60b380558b47c052fa7a00533cd312",
+      "f12beffe7b60b380558b47c052fa7a00533cd312",
+    ],
+  ])("exposes %s as %s to API consumers", async (buildVersion, expected) => {
+    vi.stubEnv("ARCHESTRA_VERSION", buildVersion);
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.api.version).toBe(expected);
+  });
+});
+
 describe("Agent Runtime catalog images", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -1642,7 +1691,7 @@ describe("Agent Runtime catalog images", () => {
     const { default: cfg } = await import("./config");
 
     expect(cfg.agentRuntime.catalogImages["claude-code"]).toBe(
-      "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/agent-claude-code:latest",
+      "ghcr.io/archestra-ai/agent-claude-code:latest",
     );
   });
 
@@ -1651,7 +1700,7 @@ describe("Agent Runtime catalog images", () => {
     const { default: cfg } = await import("./config");
 
     expect(cfg.agentRuntime.catalogImages.codex).toBe(
-      "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/agent-codex:1.4.0-beta.2",
+      "ghcr.io/archestra-ai/agent-codex:1.4.0-beta.2",
     );
   });
 
@@ -2477,6 +2526,25 @@ describe("parseSandboxMemoryMaxBytes", () => {
   });
 });
 
+describe("parseClusterDnsIps", () => {
+  test("keeps IPv4 and IPv6 resolver addresses", () => {
+    expect(parseClusterDnsIps(" 172.20.0.10 , fd00:ec2::10 ")).toEqual([
+      "172.20.0.10",
+      "fd00:ec2::10",
+    ]);
+    expect(parseClusterDnsIps(undefined)).toEqual([]);
+  });
+
+  // Each entry becomes a single-host ipBlock on the DNS rule. A CIDR or a
+  // hostname would either be rejected by the Kubernetes API or open port 53 to
+  // more than the resolver, so it is dropped and discovery fills the gap.
+  test("drops entries that are not a single IP address", () => {
+    expect(
+      parseClusterDnsIps("172.20.0.10,0.0.0.0/0,kube-dns.kube-system,"),
+    ).toEqual(["172.20.0.10"]);
+  });
+});
+
 describe("parseEngineDeniedCidrs", () => {
   test("returns an empty list when unset or empty", () => {
     expect(parseEngineDeniedCidrs(undefined)).toEqual([]);
@@ -2530,6 +2598,34 @@ describe("parseEngineDeniedCidrs", () => {
     expect(parseEngineDeniedCidrs(`10.1.0.0/16,${bad},192.0.2.0/24`)).toEqual([
       "10.1.0.0/16",
       "192.0.2.0/24",
+    ]);
+  });
+});
+
+describe("parseSreApiServerCidrs", () => {
+  test("returns an empty list when unset or empty", () => {
+    expect(parseSreApiServerCidrs(undefined)).toEqual([]);
+    expect(parseSreApiServerCidrs(" , ")).toEqual([]);
+  });
+
+  test("keeps IPv4 and IPv6 CIDRs, trimmed and deduplicated", () => {
+    expect(
+      parseSreApiServerCidrs(" 10.0.0.1/32, 2001:db8::/64 ,10.0.0.1/32"),
+    ).toEqual(["10.0.0.1/32", "2001:db8::/64"]);
+  });
+
+  test.each([
+    "10.0.0.1", // no prefix
+    "10.0.0.0/33",
+    "2001:db8::/129",
+    "10.0.0.0/8/8",
+    "10.0.0.0/x",
+    "010.0.0.0/8",
+    "api.example.com/32",
+  ])("drops the invalid entry %s", (bad) => {
+    expect(parseSreApiServerCidrs(`10.0.0.1/32,${bad},fd00::/8`)).toEqual([
+      "10.0.0.1/32",
+      "fd00::/8",
     ]);
   });
 });
@@ -3482,6 +3578,40 @@ describe("parseOtelCaptureContent", () => {
 });
 
 describe("OpenAPPA feature configuration", () => {
+  test.each([
+    undefined,
+    "",
+    "false",
+    "true",
+    " true ",
+  ])("requires explicit opt-in for external reports independently of analytics (%s)", (forwarding) => {
+    for (const analytics of ["disabled", "enabled", undefined]) {
+      vi.stubEnv("ARCHESTRA_ANALYTICS", analytics);
+      for (const environment of ["production", "development"]) {
+        vi.stubEnv("NODE_ENV", environment);
+        expect(
+          parseOpenAppaConfig({ yellForwardingEnabled: forwarding })
+            .yellForwardingEnabled,
+        ).toBe(forwarding?.trim() === "true");
+        expect(getAnalyticsConfig().enabled).toBe(
+          analytics ? analytics !== "disabled" : environment === "production",
+        );
+      }
+    }
+  });
+
+  test.each([
+    "TRUE",
+    "enabled",
+    "1",
+    "yes",
+    "disabled",
+  ])("rejects invalid external reporting configuration (%s)", (yellForwardingEnabled) => {
+    expect(() => parseOpenAppaConfig({ yellForwardingEnabled })).toThrow(
+      "ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED must be true or false",
+    );
+  });
+
   test("reporting defaults on and supports an explicit opt-out", () => {
     expect(parseOpenAppaConfig().yellEnabled).toBe(true);
     expect(parseOpenAppaConfig({ yellEnabled: "true" }).yellEnabled).toBe(true);
@@ -3490,22 +3620,6 @@ describe("OpenAPPA feature configuration", () => {
         false,
       );
     }
-  });
-
-  test("keeps annotators for earlier conversations 30 days by default, for a whole number of days, or for good with 0", () => {
-    expect(parseOpenAppaConfig().keptAnnotatorHorizonDays).toBe(30);
-    expect(
-      parseOpenAppaConfig({ keptAnnotatorHorizonDays: " 7 " })
-        .keptAnnotatorHorizonDays,
-    ).toBe(7);
-    expect(
-      parseOpenAppaConfig({ keptAnnotatorHorizonDays: "0" })
-        .keptAnnotatorHorizonDays,
-    ).toBe(0);
-    for (const invalid of ["-1", "1.5", "soon", "3651"])
-      expect(() =>
-        parseOpenAppaConfig({ keptAnnotatorHorizonDays: invalid }),
-      ).toThrow("ARCHESTRA_OPENAPPA_KEPT_ANNOTATOR_HORIZON_DAYS");
   });
 
   test.each([
@@ -3533,9 +3647,9 @@ describe("OpenAPPA feature configuration", () => {
     expect(parseOpenAppaConfig()).toEqual({
       enabled: true,
       yellEnabled: true,
+      yellForwardingEnabled: false,
       offerSigningSecret: "",
       postgresMaxConnections: 4,
-      keptAnnotatorHorizonDays: 30,
     });
     expect(
       parseOpenAppaConfig({
@@ -3678,5 +3792,64 @@ describe("OpenAPPA feature configuration", () => {
         `ARCHESTRA_OPENAPPA_REVIEW_SUMMARY_PROVIDER "${provider}" does not support chat completions`,
       );
     });
+  });
+});
+
+describe("shutdown durations", () => {
+  test("accepts whole seconds and uses defaults only when absent", () => {
+    expect(parseShutdownSeconds(undefined, 60)).toBe(60);
+    expect(parseShutdownSeconds("180", 60)).toBe(180);
+    expect(parseShutdownSeconds("0008", 60)).toBe(8);
+    expect(parseShutdownSeconds("86400", 60)).toBe(86400);
+  });
+  test.each([
+    "",
+    "0",
+    "-1",
+    "1.5",
+    "1s",
+    " 60",
+    "Infinity",
+    "86401",
+    "9007199254740992",
+  ])("rejects invalid duration %s", (value) => {
+    expect(() => parseShutdownSeconds(value, 60)).toThrow();
+  });
+  test("reserves at least five seconds for cleanup", () => {
+    expect(() => parseShutdownSeconds("4", 20, 5)).toThrow();
+    expect(parseShutdownSeconds("5", 20, 5)).toBe(5);
+  });
+});
+
+describe("resolved pod shutdown budgets", () => {
+  test("preserves imported worker and drain durations when the pod covers them", () => {
+    expect(() => validateShutdownPodGrace(150, 60, 20, 90)).not.toThrow();
+    expect(() => validateShutdownPodGrace(60, 15, 5, 15)).not.toThrow();
+    expect(() => validateShutdownPodGrace(240, 180, 20, 30)).not.toThrow();
+    expect(() => validateShutdownPodGrace(260, 200, 20, 30)).not.toThrow();
+  });
+  test("rejects hidden imported values exceeding the rendered pod budget", () => {
+    expect(() => validateShutdownPodGrace(120, 60, 20, 90)).toThrow(
+      "at least 150s",
+    );
+    expect(() => validateShutdownPodGrace(120, 180, 20, 30)).toThrow(
+      "at least 240s",
+    );
+    expect(() => validateShutdownPodGrace(120, 60, 60, 30)).toThrow(
+      "at least 160s",
+    );
+  });
+  test("does not impose a Kubernetes budget on Docker or standalone servers", () => {
+    expect(() =>
+      validateShutdownPodGrace(undefined, 200, 20, 90),
+    ).not.toThrow();
+  });
+  test("accepts a derived pod budget beyond the maximum individual duration", () => {
+    expect(
+      parseShutdownSeconds("172840", 120, 1, Number.MAX_SAFE_INTEGER),
+    ).toBe(172840);
+    expect(() =>
+      validateShutdownPodGrace(172840, 86400, 86400, 86400),
+    ).not.toThrow();
   });
 });

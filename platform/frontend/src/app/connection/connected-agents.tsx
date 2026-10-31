@@ -84,10 +84,21 @@ export function useConnectedAgents(): {
 function connectClientOf(record: ConnectedClient): ConnectClient {
   const listed = CONNECT_CLIENTS.find((c) => c.id === record.clientId);
   if (listed) return listed;
+  // Pi's native OAuth registration uses the name "pi". Recognize its mark
+  // for display only: retain the opaque connection id and generic actions.
+  const piDisplay =
+    record.clientId.startsWith("oauth:") &&
+    record.name.trim().toLowerCase() === "pi"
+      ? CONNECT_CLIENTS.find((c) => c.id === "pi")
+      : undefined;
   return {
     ...GENERIC_CLIENT,
     id: record.clientId,
-    label: record.name,
+    label: piDisplay?.label ?? record.name,
+    svg: piDisplay?.svg,
+    svgViewBox: piDisplay?.svgViewBox,
+    iconColor: piDisplay?.iconColor,
+    tileBg: piDisplay?.tileBg,
     sub: "Signed in to the gateway",
     iconOverride: {
       ...GENERIC_CLIENT.iconOverride,
@@ -407,10 +418,12 @@ function HowToDisconnect({
           data={data}
           client={client}
           revoke={
-            <p className="text-muted-foreground">
-              Once it's connected, open Manage on this page, press Disconnect,
-              then Revoke access.
-            </p>
+            client.id === "chatgpt" ? null : (
+              <p className="text-muted-foreground">
+                Once it's connected, open Manage on this page, press Disconnect,
+                then Revoke access.
+              </p>
+            )
           }
         />
         <DialogFooter>
@@ -442,17 +455,33 @@ function RevokeEffect({ client }: { client: ConnectClient }) {
   );
 }
 
-/** What the setup added to this agent, and the prompt that removes it. */
-function DisconnectSteps({
-  data,
-  client,
-  revoke,
-}: {
+interface DisconnectStepsProps {
   data: ConnectPageData;
   client: ConnectClient;
   /** Step 2's body: how, or the button, to revoke access. */
   revoke: ReactNode | null;
-}) {
+}
+
+function DisconnectSteps(props: DisconnectStepsProps) {
+  if (props.client.id === "chatgpt") {
+    return (
+      <DialogBody className="space-y-3 text-sm">
+        <h3 className="font-medium">Remove the plugin connection in ChatGPT</h3>
+        <p className="text-muted-foreground">
+          Open ChatGPT Plugins and remove the gateway's plugin connection. Also
+          remove it from any dot that uses it. Remove the uploaded plugin to
+          remove its bundled skills too. This setup added no local provider
+          configuration or startup scripts.
+        </p>
+        {props.revoke}
+      </DialogBody>
+    );
+  }
+  return <LocalDisconnectSteps {...props} />;
+}
+
+/** What the setup added to this agent, and the prompt that removes it. */
+function LocalDisconnectSteps({ data, client, revoke }: DisconnectStepsProps) {
   const manualOnly = !readsPrompts(client);
   const skills = data.footprintFor(client).skillsInstalled;
   const guard = startupGuardStem(client.id);
@@ -481,7 +510,7 @@ function DisconnectSteps({
           <CopyPrompt text={disconnectPrompt(data, client, origin)} />
         )}
       </div>
-      {!manualOnly && guard && (
+      {!manualOnly && (guard || client.id === "pi") && (
         <div className="space-y-2">
           <p className="text-muted-foreground">
             If {nameOf(client)}
@@ -489,9 +518,11 @@ function DisconnectSteps({
           </p>
           <CopyPrompt
             text={
-              windows
-                ? `$env:ARCHESTRA_GUARD_ACTION='disconnect'; try { & "$HOME\\.archestra\\${guard}-startup-guard.ps1" } finally { Remove-Item Env:ARCHESTRA_GUARD_ACTION }`
-                : `ARCHESTRA_GUARD_ACTION=disconnect bash ~/.archestra/${guard}-startup-guard.sh`
+              client.id === "pi"
+                ? "arcpi --disconnect"
+                : windows
+                  ? `$env:ARCHESTRA_GUARD_ACTION='disconnect'; try { & "$HOME\\.archestra\\${guard}-startup-guard.ps1" } finally { Remove-Item Env:ARCHESTRA_GUARD_ACTION }`
+                  : `ARCHESTRA_GUARD_ACTION=disconnect bash ~/.archestra/${guard}-startup-guard.sh`
             }
           />
         </div>

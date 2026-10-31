@@ -17,7 +17,6 @@ import {
   openappaDeclarations,
   type PolicyResolution,
 } from "@/openappa/declarations";
-import type { Rebinding } from "@/openappa/retired-annotators";
 import { CredentialAccess } from "@/services/credential-access";
 import { ApiError } from "@/types";
 import type { GuardrailsPolicy } from "@/types/guardrails-policy";
@@ -75,12 +74,7 @@ function duplicateEntryErrors(resolution: PolicyResolution): string[] {
  * it; one the document introduces is an error. Either way the held-back
  * batteries are named with it, since they are what the refusal is fixed by.
  * A held-back battery the document composes without is no refusal; its status
- * is the effective policy's to report. A document that composes is warned
- * about each annotator the effective policy declares and it would drop. A
- * name it binds differently from a policy sessions opened under is an error,
- * since those sessions would be redirected; one the revision being replaced
- * already binds that way is a warning, since the document changes nothing
- * for them.
+ * is the effective policy's to report.
  */
 async function deploymentRefusal(params: {
   organizationId: string;
@@ -91,74 +85,33 @@ async function deploymentRefusal(params: {
   const submitted = await openappaBatteriesService.composeInDeployment({
     organizationId,
     content,
-    previous,
   });
-  const inDeployment = (line: string) => `in this deployment: ${line}`;
-  // What the revision being replaced already meets is not this document's
-  // doing: it is warned about, while what this document introduces is an error.
-  const before =
+  if (submitted.refusal.length === 0) return { errors: [], warnings: [] };
+  const kept = new Set(
     previous === content
-      ? submitted
-      : submitted.refusal.length === 0 && submitted.rebound.length === 0
-        ? null
-        : await openappaBatteriesService.composeInDeployment({
+      ? submitted.refusal
+      : (
+          await openappaBatteriesService.composeInDeployment({
             organizationId,
             content: previous,
-          });
-  // A rebinding is carried only while the name stays bound as the revision
-  // being replaced binds it; binding it a third way redirects sessions again.
-  const carried = new Map(
-    (before?.rebound ?? []).map((rebinding) => [
-      rebinding.name,
-      rebinding.current,
-    ]),
+          })
+        ).refusal,
   );
-  const isCarried = (rebinding: Rebinding) =>
-    carried.get(rebinding.name) === rebinding.current;
-  const rebindingErrors = submitted.rebound
-    .filter((rebinding) => !isCarried(rebinding))
-    .map((rebinding) => inDeployment(rebindingError(rebinding)));
-  const rebindingWarnings = submitted.rebound
-    .filter(isCarried)
-    .map((rebinding) => inDeployment(rebindingWarning(rebinding)));
-  if (submitted.refusal.length === 0)
-    return {
-      errors: rebindingErrors,
-      warnings: [...submitted.retiring, ...rebindingWarnings],
-    };
-  const kept = new Set(before?.refusal ?? []);
   const introduced = submitted.refusal.filter((error) => !kept.has(error));
+  const inDeployment = (line: string) => `in this deployment: ${line}`;
   const keptNote =
     " (the current revision is refused the same way; the runtime keeps enforcing the last composition that opened)";
   if (introduced.length > 0)
     return {
-      errors: [
-        ...[...introduced, ...submitted.heldBack].map(inDeployment),
-        ...rebindingErrors,
-      ],
+      errors: [...introduced, ...submitted.heldBack].map(inDeployment),
       warnings: [],
     };
   return {
-    errors: rebindingErrors,
-    warnings: [
-      ...[...submitted.refusal, ...submitted.heldBack].map(
-        (line) => inDeployment(line) + keptNote,
-      ),
-      ...rebindingWarnings,
-    ],
+    errors: [],
+    warnings: [...submitted.refusal, ...submitted.heldBack].map(
+      (line) => inDeployment(line) + keptNote,
+    ),
   };
-}
-
-/** A rebinding this document introduces: sessions opened earlier would be redirected. */
-function rebindingError(rebinding: Rebinding): string {
-  const { name, current, earlier } = rebinding;
-  return `annotator "${name}" is bound to ${current} in this revision, but sessions opened under earlier policies were answered by ${earlier.join(" or ")} and would be redirected. Declare the new binding under a new annotator name so those sessions keep theirs.`;
-}
-
-/** A rebinding the revision being replaced already carries: this document changes nothing for those sessions. */
-function rebindingWarning(rebinding: Rebinding): string {
-  const { name, current, earlier } = rebinding;
-  return `annotator "${name}" stays bound to ${current}; sessions opened under earlier policies were answered by ${earlier.join(" or ")} and have been answered by ${current} since the revision that rebound it. This revision changes nothing for them.`;
 }
 
 /** The 409 a lost revision race answers with; a retrying writer waits for this one. */
@@ -331,7 +284,7 @@ export const guardrailsPolicyService = {
       } catch {
         logger.warn(
           { organizationId },
-          "Could not queue informational validation after a policy change",
+          "OpenAPPA could not queue informational validation after a policy change",
         );
       }
     }
@@ -398,18 +351,26 @@ ${ARCHESTRA_BATTERY} = ["${archestraMcpBranding.serverName}"]
 [aliases.host]
 ${CLAUDE_CODE_BATTERY} = ["archestra"]
 
-# The coding battery's tools under Codex's and OpenCode's spellings.
+# The coding battery's tools under Codex's, OpenCode's, Claude Desktop
+# Cowork's and Kimi Code's spellings. Kimi Code shares Claude Code's other tool
+# names; the proxy also evaluates its Read, Write and Edit \`path\` as
+# \`file_path\`.
 [aliases.tool.${CODING_BATTERY}]
 shell = [
   { name = "host/archestra/exec_command", args = { command = "cmd" } },
   { name = "host/archestra/shell", args = { command = "command" } },
   { name = "host/archestra/bash", args = { command = "command" } },
+  { name = "host/archestra/mcp__workspace__bash", args = { command = "command" }, confined = true },
 ]
 read_file = [{ name = "host/archestra/read", args = { file_path = "filePath" } }]
 search_files = [{ name = "host/archestra/grep", args = { path = "path" } }]
 write_file = [{ name = "host/archestra/write", args = { file_path = "filePath" } }]
 edit_file = [{ name = "host/archestra/edit", args = { file_path = "filePath" } }]
-fetch_url = [{ name = "host/archestra/webfetch", args = { url = "url" } }]
+fetch_url = [
+  { name = "host/archestra/webfetch", args = { url = "url" } },
+  { name = "host/archestra/mcp__workspace__web_fetch", args = { url = "url" } },
+  { name = "host/archestra/FetchURL", args = { url = "url" } },
+]
 
 [policy]
 version = 2
@@ -486,6 +447,16 @@ delta = {}
 # \`Task\` is the earlier name of \`Agent\`.
 [[policy.tool]]
 name = "host/archestra/Task"
+delta = {}
+
+# Claude Desktop Code tab's local turn UI tools (the desktop equivalents of
+# EndConversation and TodoWrite) render inside the session's own window.
+[[policy.tool]]
+name = "host/archestra/mcp__ccd_turn__wrap_up"
+delta = {}
+
+[[policy.tool]]
+name = "host/archestra/mcp__ccd_turn__update_plan"
 delta = {}
 
 [[policy.tool]]

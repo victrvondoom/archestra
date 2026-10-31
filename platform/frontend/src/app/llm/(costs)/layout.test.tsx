@@ -2,10 +2,12 @@ import { render, screen } from "@testing-library/react";
 import { usePathname } from "next/navigation";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { usePermissionMap } from "@/lib/auth/auth.query";
+import { useTeamLimitAccess } from "@/lib/limits-access";
 import CostsLayout from "./layout";
 
 vi.mock("next/navigation");
 vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/limits-access");
 
 vi.mock("@/components/page-layout", () => ({
   PageLayout: ({
@@ -63,6 +65,17 @@ describe("CostsLayout", () => {
     expect(screen.getByTestId("tabs")).toBeEmptyDOMElement();
   });
 
+  it("hides the redundant tab bar for delegated team admins", () => {
+    setPermissions({ canReadCosts: false, canReadLimits: false });
+    vi.mocked(usePathname).mockReturnValue("/llm/limits");
+    vi.mocked(useTeamLimitAccess).mockReturnValue({
+      canRead: true,
+      isTeamAdmin: true,
+    } as ReturnType<typeof useTeamLimitAccess>);
+    render(<CostsLayout>content</CostsLayout>);
+    expect(screen.getByTestId("tabs")).toBeEmptyDOMElement();
+  });
+
   it("keeps every tab for a reader who may open them all", () => {
     setPermissions({
       canReadCosts: true,
@@ -86,7 +99,7 @@ describe("CostsLayout", () => {
     render(<CostsLayout>content</CostsLayout>);
 
     expect(screen.getByTestId("description")).toHaveTextContent(
-      /across teams, agents, and models/i,
+      /track spend, token usage and requests across your organization/i,
     );
   });
 });

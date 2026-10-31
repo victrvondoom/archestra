@@ -3,13 +3,17 @@
 // and the REST call that returns the same data.
 
 import { ArrowRight, ClipboardCopy, Info, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { QueryLoadError } from "@/components/query-load-error";
 import { Button } from "@/components/ui/button";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { UnstyledButton } from "@/components/ui/unstyled-button";
 import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
 import { useAppName } from "@/lib/hooks/use-app-name";
+import { useProxyLabelKeys } from "@/lib/proxy-label-costs.query";
 import { cn } from "@/lib/utils/tailwind";
 import {
   formatCompact,
@@ -43,8 +47,8 @@ import {
   QueryChip,
   Segmented,
   SummaryTable,
-  ViewPills,
 } from "./cost-explorer-parts";
+import { getCostLimitsLabel, getCostLimitsLink } from "./cost-limit-link";
 import { fmtMetric, KpiTile } from "./cost-overview";
 
 export default function CostExplorer() {
@@ -52,19 +56,59 @@ export default function CostExplorer() {
   const appName = useAppName();
   const { data: canReadApps } = useHasPermissions({ app: ["read"] });
   const { data: canReadSkills } = useHasPermissions({ skill: ["read"] });
+  const poolsEnabled = useFeature("llmModelPoolsEnabled") === true;
+  const { data: canReadLimits } = useHasPermissions({ llmLimit: ["read"] });
   const canGroup = (group: DimId) =>
-    (group !== "app" || canReadApps) && (group !== "skill" || canReadSkills);
-  const [q, setQ] = useState<PivotQuery>(SAVED_VIEWS[0].q);
+    (group !== "app" || canReadApps) &&
+    (group !== "skill" || canReadSkills) &&
+    (group !== "pool" || poolsEnabled);
+  const [query, setQ] = useState<PivotQuery>(SAVED_VIEWS[0].q);
   const [focus, setFocus] = useState<Set<string>>(new Set());
   const [view, setView] = useState<"summary" | "pivot">("summary");
   const [pivotCols, setPivotCols] = useState<"days" | "split">("days");
 
+  const labelKeys = useProxyLabelKeys({
+    timeframe,
+    enabled: enabled && query.group === "label",
+  });
+  const labelKey = labelKeys.data?.includes(query.labelKey ?? "")
+    ? query.labelKey
+    : labelKeys.data?.[0];
+  const q = { ...query, labelKey };
+  useEffect(() => {
+    if (
+      query.group !== "label" ||
+      !labelKeys.isSuccess ||
+      query.labelKey === labelKey
+    )
+      return;
+    setQ((previous) => ({ ...previous, labelKey }));
+    setFocus(new Set());
+  }, [query.group, query.labelKey, labelKey, labelKeys.isSuccess]);
   const kpis = useKpis({ timeframe, enabled });
   const cube = usePivotCube(q, timeframe, enabled);
   const statistics = useCostStatistics({
     timeframe,
     enabled: enabled && (q.metric === "billed" || q.metric === "subscription"),
   });
+
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [settledHeight, setSettledHeight] = useState<number>();
+  const isLoadingLabels = q.group === "label" && labelKeys.isPending;
+  const labelKeysError = q.group === "label" && labelKeys.isError;
+  const isLoading = cube.isLoading || kpis.isCostPending || isLoadingLabels;
+  // A range change replaces a potentially long table with a few skeletons.
+  // Reserve its settled height until the response arrives so the browser does
+  // not clamp the page's scroll offset to the shorter loading layout.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || isLoading) return;
+    const observer = new ResizeObserver(() => {
+      setSettledHeight(content.getBoundingClientRect().height);
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [isLoading]);
 
   const update = (patch: Partial<PivotQuery>) => {
     setQ((prev) => normalize({ ...prev, ...patch }));
@@ -78,7 +122,10 @@ export default function CostExplorer() {
     });
 
   const metric = METRICS[q.metric];
-  const dim = DIMS[q.group];
+  const dim =
+    q.group === "label"
+      ? { label: q.labelKey ?? "Label", plural: "label values" }
+      : DIMS[q.group];
   const splits = splitOptions(q.metric, q.group);
   const hasSplit = q.split !== "none";
   const activeView = SAVED_VIEWS.find(
@@ -92,11 +139,15 @@ export default function CostExplorer() {
       : metric.note;
 
   const attributionNote =
-    q.group === "app" && ["billed", "requests", "tokens"].includes(q.metric)
-      ? "Inference attributed to app sessions. This does not mean every app itself runs a model."
-      : q.group === "key"
-        ? "Key names and recorded IDs are shown in full. Calls without an individual key ID cannot be distinguished further."
-        : null;
+    q.group === "label"
+      ? "Label priority: authenticated virtual key / OAuth client → billing team. First matching value wins; captured at request start."
+      : q.group === "app" && ["billed", "requests", "tokens"].includes(q.metric)
+        ? "Inference attributed to app sessions. This does not mean every app itself runs a model."
+        : q.group === "key"
+          ? "Key names and recorded IDs are shown in full. Calls without an individual key ID cannot be distinguished further."
+          : q.group === "providerKey" || q.group === "pool"
+            ? "A request a model pool failed over counts once per attempt. A failed attempt is free unless a timeout cut it off, which bills an estimate of the input it read. Pick Requests to see how many there were."
+            : null;
 
   const headline = useMemo(() => {
     const top = cube.rows[0];
@@ -124,9 +175,25 @@ export default function CostExplorer() {
     .filter((r) => focus.has(r.key))
     .map((r) => r.label);
   const pivotBySplit = hasSplit && pivotCols === "split";
+  const focusedRows = cube.rows.filter((row) => focus.has(row.key));
+  const limitsLink = canReadLimits
+    ? getCostLimitsLink(
+        q,
+        focusedRows.length === 1 ? focusedRows[0] : undefined,
+      )
+    : null;
+  const limitsLabel = getCostLimitsLabel(
+    q,
+    focusedRows.length === 1 ? focusedRows[0] : undefined,
+  );
 
   return (
-    <div className="space-y-4">
+    <div
+      ref={contentRef}
+      className="space-y-4"
+      aria-busy={isLoading}
+      style={isLoading ? { minHeight: settledHeight } : undefined}
+    >
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5 [&>*:last-child:nth-child(odd)]:col-span-2 md:[&>*:last-child:nth-child(odd)]:col-span-1">
         <KpiTile
           label="API spend"
@@ -134,8 +201,6 @@ export default function CostExplorer() {
           caption="Metered API-key charges"
           series={kpis.billed.series}
           pending={kpis.isCostPending}
-          active={q.metric === "billed"}
-          onClick={() => update({ metric: "billed" })}
         />
         <KpiTile
           label="Subscription usage estimate"
@@ -145,8 +210,6 @@ export default function CostExplorer() {
           series={kpis.subscription.series}
           estimate
           colorClass="text-muted-foreground"
-          active={q.metric === "subscription"}
-          onClick={() => update({ metric: "subscription" })}
         />
         <KpiTile
           label="Requests"
@@ -155,8 +218,6 @@ export default function CostExplorer() {
           series={kpis.requests.series}
           pending={kpis.isUsagePending}
           colorClass="text-chart-2"
-          active={q.metric === "requests"}
-          onClick={() => update({ metric: "requests" })}
         />
         <KpiTile
           label="Tokens"
@@ -165,30 +226,14 @@ export default function CostExplorer() {
           series={kpis.tokens.series}
           pending={kpis.isUsagePending}
           colorClass="text-chart-3"
-          active={q.metric === "tokens"}
-          onClick={() => update({ metric: "tokens" })}
         />
         <KpiTile
           label="Active people"
           value={String(kpis.people.value)}
           caption={`Using ${appName} in selected period`}
           pending={kpis.isPeoplePending}
-          active={q.group === "person"}
-          onClick={() => update({ metric: "requests", group: "person" })}
         />
       </div>
-      <ViewPills
-        label="Saved views"
-        items={SAVED_VIEWS.filter((v) => canGroup(v.q.group)).map((v) => ({
-          id: v.id,
-          label: v.label,
-          active: activeView?.id === v.id,
-          onSelect: () => {
-            setQ(v.q);
-            setFocus(new Set());
-          },
-        }))}
-      />
 
       <section
         aria-label="Cost explorer"
@@ -196,6 +241,32 @@ export default function CostExplorer() {
       >
         {/* Query bar */}
         <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-3 py-2.5">
+          {/* A saved view is a preset of the controls beside it; changing
+              any of them makes the view custom. */}
+          <QueryChip
+            label="View"
+            className="max-sm:grow"
+            value={activeView?.id ?? CUSTOM_VIEW}
+            options={[
+              ...SAVED_VIEWS.filter((v) => canGroup(v.q.group)).map((v) => ({
+                id: v.id,
+                label: v.label,
+              })),
+              ...(activeView
+                ? []
+                : [{ id: CUSTOM_VIEW, label: "Custom", disabled: true }]),
+            ]}
+            onChange={(id) => {
+              const view = SAVED_VIEWS.find((v) => v.id === id);
+              if (!view) return;
+              setQ(view.q);
+              setFocus(new Set());
+            }}
+          />
+          <span
+            aria-hidden="true"
+            className="mx-0.5 h-5 w-px bg-border max-sm:hidden"
+          />
           <QueryChip
             label="Show"
             className="max-sm:grow"
@@ -224,6 +295,22 @@ export default function CostExplorer() {
             }))}
             onChange={(group) => update({ group })}
           />
+          {q.group === "label" && !!labelKeys.data?.length && (
+            <SearchableSelect
+              size="sm"
+              ariaLabel="Label key"
+              value={q.labelKey ?? ""}
+              onValueChange={(labelKey) => update({ labelKey })}
+              items={(labelKeys.data ?? []).map((key) => ({
+                value: key,
+                label: key,
+              }))}
+              placeholder="Label key"
+              searchPlaceholder="Search label keys…"
+              emptyMessage="No matching label keys"
+              className="w-44 border-transparent bg-muted/60 shadow-none"
+            />
+          )}
           <QueryChip<SplitId>
             label="split by"
             className="max-sm:grow"
@@ -253,6 +340,18 @@ export default function CostExplorer() {
               onChange={(chart) => setQ((p) => ({ ...p, chart }))}
             />
           </div>
+          {limitsLink && (
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+              className="min-w-0 max-w-full"
+            >
+              <Link href={limitsLink} title={limitsLabel}>
+                <span className="max-w-64 truncate">{limitsLabel}</span>
+              </Link>
+            </Button>
+          )}
         </div>
 
         {/* Headline */}
@@ -275,17 +374,23 @@ export default function CostExplorer() {
             </div>
             {!cube.isLoading && headline.top && (
               <dl className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
-                <Stat label={`Top ${dim.label.toLowerCase()}`}>
-                  <span className="max-w-48 truncate">
-                    {headline.top.label}
-                  </span>
-                  <span className="text-muted-foreground">
-                    {(headline.topShare * 100).toFixed(0)}%
-                  </span>
-                </Stat>
-                <Stat label={dim.plural.replace(/^./, (c) => c.toUpperCase())}>
-                  {cube.rows.length}
-                </Stat>
+                {q.group !== "time" && (
+                  <>
+                    <Stat label={`Top ${dim.label.toLowerCase()}`}>
+                      <span className="max-w-48 truncate">
+                        {headline.top.label}
+                      </span>
+                      <span className="text-muted-foreground">
+                        {(headline.topShare * 100).toFixed(0)}%
+                      </span>
+                    </Stat>
+                    <Stat
+                      label={dim.plural.replace(/^./, (c) => c.toUpperCase())}
+                    >
+                      {cube.rows.length}
+                    </Stat>
+                  </>
+                )}
                 {headline.trend !== null && (
                   <Stat label="2nd half vs 1st">
                     <span
@@ -342,19 +447,28 @@ export default function CostExplorer() {
             }
           />
 
-          {Boolean(cube.error) && (
+          {Boolean(cube.error || labelKeysError) && (
             <QueryLoadError
               title="Could not load usage statistics"
               description="Check your access and connection, then retry."
-              onRetry={cube.retry}
+              onRetry={
+                labelKeysError ? () => void labelKeys.refetch() : cube.retry
+              }
             />
           )}
           {!cube.error &&
+            !labelKeysError &&
             q.chart !== "table" &&
-            (cube.isLoading ? (
+            (cube.isLoading || isLoadingLabels ? (
               <Skeleton className="h-[260px] w-full" />
             ) : cube.rows.length === 0 ? (
-              <Empty text={`No ${metric.label.toLowerCase()} in this range.`} />
+              <Empty
+                text={
+                  q.group === "label" && !q.labelKey
+                    ? "No labels captured on requests in this time range."
+                    : `No ${metric.label.toLowerCase()} in this range.`
+                }
+              />
             ) : (
               <PivotChart
                 cube={cube}
@@ -445,7 +559,7 @@ export default function CostExplorer() {
               <SummaryTable
                 cube={cube}
                 metric={q.metric}
-                dimLabel={dim.label}
+                dimLabel={q.group === "time" ? "Scope" : dim.label}
                 splitLabel={hasSplit ? DIMS[q.split as DimId].label : null}
                 focus={focus}
                 onToggle={toggleFocus}
@@ -454,7 +568,7 @@ export default function CostExplorer() {
               <PivotTable
                 cube={cube}
                 metric={q.metric}
-                dimLabel={dim.label}
+                dimLabel={q.group === "time" ? "Scope" : dim.label}
                 bySplit={pivotBySplit}
                 focus={focus}
                 onToggle={toggleFocus}
@@ -535,3 +649,5 @@ function Empty({ text }: { text: string }) {
     </div>
   );
 }
+
+const CUSTOM_VIEW = "custom";

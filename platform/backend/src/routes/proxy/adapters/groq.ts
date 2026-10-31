@@ -28,6 +28,7 @@ import type {
   LLMStreamAdapter,
   StreamAccumulatorState,
 } from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
 import {
   OpenAIRequestAdapter,
   OpenAIResponseAdapter,
@@ -148,8 +149,8 @@ class GroqStreamAdapter
   readonly provider = "groq" as const;
   private delegate: OpenAIStreamAdapter;
 
-  constructor() {
-    this.delegate = new OpenAIStreamAdapter();
+  constructor(request?: GroqRequest) {
+    this.delegate = new OpenAIStreamAdapter("openai", request);
   }
 
   get state() {
@@ -211,8 +212,10 @@ export const groqAdapterFactory: LLMProvider<
     return new GroqResponseAdapter(response);
   },
 
-  createStreamAdapter(): LLMStreamAdapter<GroqStreamChunk, GroqResponse> {
-    return new GroqStreamAdapter();
+  createStreamAdapter(
+    request?: GroqRequest,
+  ): LLMStreamAdapter<GroqStreamChunk, GroqResponse> {
+    return new GroqStreamAdapter(request);
   },
 
   extractApiKey(headers: GroqHeaders): string | undefined {
@@ -270,15 +273,9 @@ export const groqAdapterFactory: LLMProvider<
       stream_options: { include_usage: true },
     } as unknown as ChatCompletionCreateParamsStreaming;
 
-    const stream = await groqClient.chat.completions.create(groqRequest);
-
-    return {
-      [Symbol.asyncIterator]: async function* () {
-        for await (const chunk of stream) {
-          yield chunk as GroqStreamChunk;
-        }
-      },
-    };
+    return streamChatCompletionChunks<GroqStreamChunk>(
+      groqClient.chat.completions.create(groqRequest),
+    );
   },
 
   extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {

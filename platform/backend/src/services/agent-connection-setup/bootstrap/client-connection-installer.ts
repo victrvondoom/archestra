@@ -2,6 +2,7 @@ import {
   CONNECT_SETUP_PARTS,
   INSTALLER_CLIENT_IDS,
 } from "@archestra/shared/connection-setup";
+import { SETUP_STOPPED_EXIT_CODE } from "../types";
 
 /** Public bootstrap: secrets stay in process memory; only the approved script reaches disk. */
 export const CLIENT_CONNECTION_INSTALLER = String.raw`#!/usr/bin/env node
@@ -9,7 +10,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { closeSync, openSync, readSync } = require('node:fs');
 const { mkdtemp, open, writeFile, readFile, rm, access } = require('node:fs/promises');
-const { hostname, tmpdir } = require('node:os');
+const { hostname, tmpdir, homedir } = require('node:os');
 const { join } = require('node:path');
 
 async function main() {
@@ -228,6 +229,7 @@ async function applySetup({ scriptPath, origin, platform }) {
     const child = platform === 'windows'
       ? spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', filename], { stdio: 'inherit', env: installerEnv })
       : spawnSync('bash', [filename], { stdio: 'inherit', env: installerEnv });
+    if (child.status === ${SETUP_STOPPED_EXIT_CODE}) throw new Error('Setup stopped.');
     if (child.error || child.status !== 0) throw new Error('Setup failed. Review the output above and start the installer again after fixing the problem.');
     if (marker) return JSON.parse(Buffer.from(marker[1], 'base64').toString('utf8'));
     console.log('Setup applied. Restart or reload your client if needed. Complete its MCP sign-in if prompted.');
@@ -242,7 +244,10 @@ const installerEnv = { ...process.env, ARCHESTRA_CONNECT_INSTALLER: '1' };
 function finishSetup(ending, platform) {
   if (!ending) return;
   const paint = (code, text) => process.stdout.isTTY && !process.env.NO_COLOR ? '\x1b[' + code + 'm' + text + '\x1b[0m' : text;
-  console.log('\n' + paint('1;32', ending.label + ' is connected to ' + ending.appName + '.'));
+  const summary = ending.signIn
+    ? ending.label + ' connection settings are saved. MCP sign-in is still required.'
+    : ending.label + ' is connected to ' + ending.appName + '.';
+  console.log('\n' + paint('1;32', summary));
   if (ending.parts.length) {
     const width = Math.max(...ending.parts.map(part => part.name.length));
     console.log('\n' + ending.parts.map(part => '  ' + paint('1', part.name.padEnd(width)) + '   ' + part.detail).join('\n'));
@@ -256,10 +261,21 @@ function finishSetup(ending, platform) {
   try {
     if (ending.signIn) {
       console.log('\n' + paint('1', 'Authorize ' + ending.label + ' for the "' + ending.signIn.gatewayName + '" MCP gateway'));
-      const windowsLine = ending.signIn.command && platform === 'windows' ? windowsCommandLine(ending.signIn.command) : null;
-      const runnable = ending.signIn.command && (platform !== 'windows' || windowsLine !== null);
-      if (runnable && terminal !== null && ask(terminal, '  Authorize now? This opens ' + ending.appName + ' in your browser. [Y/n] ')) {
-        const child = windowsLine !== null
+      const piReconnect = ending.signIn.command?.length === 2 && ending.signIn.command[0] === 'arcpi' && ending.signIn.command[1] === '--reconnect';
+      // A Node.js helper the setup installed in the home directory runs with
+      // this Node.js on every platform, without a shell to expand its path.
+      const nodeHelper = !piReconnect && ending.signIn.command?.[0] === 'node' && /^~\/[\w./-]+$/.test(ending.signIn.command[1] ?? '');
+      const windowsLine = !piReconnect && !nodeHelper && ending.signIn.command && platform === 'windows' ? windowsCommandLine(ending.signIn.command) : null;
+      const runnable = ending.signIn.command && (piReconnect || nodeHelper || platform !== 'windows' || windowsLine !== null);
+      const signInQuestion = piReconnect
+        ? '  Authorize now? Keep your existing Pi login or choose to sign in again. [Y/n] '
+        : '  Authorize now? This opens ' + ending.appName + ' in your browser. [Y/n] ';
+      if (runnable && terminal !== null && ask(terminal, signInQuestion)) {
+        const child = piReconnect
+          ? spawnSync(process.execPath, [join(homedir(), '.archestra', 'pi', 'launch.cjs'), '--reconnect'], { stdio: [terminal, 'inherit', 'inherit'], shell: false })
+          : nodeHelper
+          ? spawnSync(process.execPath, [join(homedir(), ...ending.signIn.command[1].slice(2).split('/')), ...ending.signIn.command.slice(2)], { stdio: [terminal, 'inherit', 'inherit'], shell: false })
+          : windowsLine !== null
           ? spawnSync(windowsLine, { stdio: [terminal, 'inherit', 'inherit'], shell: true })
           : spawnSync(ending.signIn.command[0], ending.signIn.command.slice(1), { stdio: [terminal, 'inherit', 'inherit'] });
         console.log(!child.error && child.status === 0 ? paint('1;32', '  Signed in.') : '  Sign-in did not finish. ' + ending.signIn.howTo);

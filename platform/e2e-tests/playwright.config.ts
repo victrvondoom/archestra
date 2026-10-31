@@ -12,7 +12,6 @@ const projectNames = {
   setupAdmin: "setup-admin",
   setupUsers: "setup-users",
   setupTeams: "setup-teams",
-  credentialsWithVault: "credentials-with-vault",
   quickstart: "quickstart",
   quickstartRecovery: "quickstart-recovery",
   chromium: "chromium",
@@ -41,7 +40,6 @@ const testPatterns = {
   teamsSetup: /auth\.teams\.setup\.ts/,
   quickstart: "**/quickstart.spec.ts",
   // Special test files that need isolated execution
-  credentialsWithVault: "**/credentials-with-vault.ee.spec.ts",
   identityProviders: "**/identity-providers.ee.spec.ts",
   // Vault K8s startup test — runs in a dedicated CI job with Vault K8s auth
   vaultK8s: "**/vault-k8s-startup.spec.ts",
@@ -73,7 +71,6 @@ const uiTestMatch = [
   "**/context-window.spec.ts",
   "**/connection.spec.ts",
   "**/cost-chart-legend-mobile.spec.ts",
-  "**/credentials-with-vault.ee.spec.ts",
   "**/dynamic-credentials.spec.ts",
   "**/identity-providers.ee.spec.ts",
   "**/invitation.spec.ts",
@@ -154,7 +151,6 @@ const quickstartTestMatch = [
  * These tests run in their own dedicated projects for isolation.
  */
 const browserTestIgnore = [
-  testPatterns.credentialsWithVault,
   testPatterns.identityProviders,
   testPatterns.quickstart,
   testPatterns.llmProxy,
@@ -185,6 +181,15 @@ const chromiumShard2TestMatch = [
   "**/users-role-filter.spec.ts",
 ];
 const chromiumShard = process.env.E2E_CHROMIUM_SHARD;
+
+/**
+ * Slow hosts scale every timeout below, and set how many workers run at once.
+ * A 2-CPU Agent Runtime on the lite dev stack runs the browser, the dev
+ * servers and PostgreSQL on the same CPUs; `scripts/dev-lite.sh e2e` sets both
+ * from the CPUs it has. Timeouts written into a spec are not scaled.
+ */
+const TIMEOUT_SCALE = Math.max(1, Number(process.env.E2E_TIMEOUT_SCALE) || 1);
+const LOCAL_WORKERS = Math.max(1, Number(process.env.E2E_WORKERS) || 3);
 const chromiumTestFiles =
   chromiumShard === "2"
     ? {
@@ -208,7 +213,6 @@ const chromiumTestFiles =
  * to distribute test files across shards without pulling in entire project chains.
  *
  * The setup-teams project is the final setup step that all tests depend on.
- * Previously, we had inter-test dependencies (chromium → credentials-with-vault → identity-providers → api)
  * which caused each shard to run the same tests.
  */
 const dependencies = {
@@ -227,9 +231,9 @@ export default defineConfig({
   forbidOnly: IS_CI,
   /* Retry on CI only */
   retries: IS_CI ? 2 : 0,
-  workers: IS_CI ? "90%" : 3,
+  workers: IS_CI ? "90%" : LOCAL_WORKERS,
   /* Global timeout for each test */
-  timeout: 60_000,
+  timeout: 60_000 * TIMEOUT_SCALE,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
   reporter: IS_CI ? [["blob"], ["github"], ["line"]] : "line",
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
@@ -241,13 +245,13 @@ export default defineConfig({
     /* Take screenshot only when test fails */
     screenshot: "only-on-failure",
     /* Timeout for each action (click, fill, etc.) */
-    actionTimeout: 15_000,
+    actionTimeout: 15_000 * TIMEOUT_SCALE,
     /* Timeout for navigation actions */
-    navigationTimeout: 30_000,
+    navigationTimeout: 30_000 * TIMEOUT_SCALE,
   },
   /* Expect timeout for assertions */
   expect: {
-    timeout: 10_000,
+    timeout: 10_000 * TIMEOUT_SCALE,
   },
 
   /* Configure projects for major browsers */
@@ -271,18 +275,6 @@ export default defineConfig({
       testDir: "./",
       // Teams setup needs users to be created first
       dependencies: [projectNames.setupUsers],
-    },
-    // Vault integration tests - tests BYOS (Bring Your Own Secrets) with HashiCorp Vault
-    // Note: This test file manages its own secrets manager state (switches to Vault, then back to DB)
-    {
-      name: projectNames.credentialsWithVault,
-      testMatch: testPatterns.credentialsWithVault,
-      testDir: "./tests",
-      use: {
-        ...devices["Desktop Chrome"],
-        storageState: adminAuthFile,
-      },
-      dependencies: dependencies.testProjects,
     },
     // SAML is kept executable but off the merge queue until its previously
     // quarantined Keycloak flow has a green scheduled/manual history.

@@ -2,15 +2,15 @@
 
 import { ArrowLeft, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
-import { ConsultPayloads } from "@/app/consults/logs/_components/consult-detail-sheet";
-import type { ConsultView } from "@/app/consults/logs/_components/consult-details";
-import { ConsultOutcomeBadge } from "@/app/consults/logs/_components/consult-outcome-badge";
+import { ConsultPayloads } from "@/app/consults/logs/_parts/consult-detail-sheet";
+import type { ConsultView } from "@/app/consults/logs/_parts/consult-details";
+import { ConsultOutcomeBadge } from "@/app/consults/logs/_parts/consult-outcome-badge";
 import {
   CONSULT_BACKEND_TERMS,
   CONSULT_ROLE_TERMS,
   consultAnswerSummary,
   GuardrailTerm,
-} from "@/app/consults/logs/_components/guardrail-terms";
+} from "@/app/consults/logs/_parts/guardrail-terms";
 import { PaneHeader } from "@/components/log-detail/pane-header";
 import { Button } from "@/components/ui/button";
 import { formatDate } from "@/lib/utils/date-time";
@@ -35,7 +35,7 @@ export function ConsultDetails({
   verdict,
   onBack,
 }: {
-  /** The resizable pane height, applied from `lg`. */
+  /** The pane height, applied from `lg`. */
   height: number;
   view: ConsultView;
   /** The tool call the consult was raised for, when there was one. */

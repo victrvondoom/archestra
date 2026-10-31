@@ -77,6 +77,9 @@ beforeEach(() => {
   vi.mocked(useAppName).mockReturnValue("Test Platform");
   vi.mocked(useAppIconLogo).mockReturnValue("/logo-icon.svg");
   server.use(
+    http.get(`${origin}/api/agent-runtime-templates`, () =>
+      HttpResponse.json([]),
+    ),
     http.get(`${origin}/api/organization`, () =>
       HttpResponse.json(organization),
     ),
@@ -167,7 +170,7 @@ async function remove(name: string) {
 }
 
 function picker() {
-  return within(screen.getByRole("list", { name: "Coding agents" }));
+  return within(screen.getByRole("list", { name: "Agent Runtimes" }));
 }
 
 function savedOverrides(ids: string[]) {
@@ -182,12 +185,26 @@ function savedOverrides(ids: string[]) {
 async function ready() {
   await waitFor(() =>
     expect(
-      screen.queryByRole("status", { name: "Loading coding agents" }),
+      screen.queryByRole("status", { name: "Loading Agent Runtimes" }),
     ).not.toBeInTheDocument(),
   );
 }
 
 describe("popular agent configuration", () => {
+  it("preserves sparse saved positions in the creation catalog and runtime picker", async () => {
+    organization.popularAgentOverrides = { codex: { position: 3 } };
+    renderFlow();
+    await screen.findByRole("button", { name: /Claude Code / });
+    const section = screen
+      .getByRole("heading", { name: "Agent Runtimes Beta" })
+      .closest("section");
+    if (!section) throw new Error("Missing catalog section");
+    expect(within(section).getAllByRole("button")[0]).toHaveTextContent(
+      "Codex",
+    );
+    expect(screen.getAllByRole("radio")[1]).toHaveAccessibleName("Codex");
+  });
+
   it("revalidates restored settings without relying on a catalog elsewhere on the page", async () => {
     const previousClient = new QueryClient();
     previousClient.setQueryData(organizationKeys.details(), organization);
@@ -205,14 +222,14 @@ describe("popular agent configuration", () => {
         <IntegrationAvailabilitySection
           catalogKey="popularAgentOverrides"
           catalog={PopularAgentIdSchema.options}
-          title="Coding agents"
+          title="Agent Runtimes"
           options={PopularAgentIdSchema.options.map((id) => ({
             value: id,
             label: AGENT_CATALOG_TEMPLATE_NAMES[id],
           }))}
-          placeholder="Select coding agents…"
+          placeholder="Select Agent Runtimes…"
           emptyMessage="No agents found."
-          savedMessage="Coding agents updated"
+          savedMessage="Agent Runtimes updated"
         />
       </QueryClientProvider>,
     );
@@ -255,7 +272,7 @@ describe("popular agent configuration", () => {
       responseReady.resolve();
     }
     await waitFor(() =>
-      expect(screen.getAllByText("Could not load coding agents")).toHaveLength(
+      expect(screen.getAllByText("Could not load Agent Runtimes")).toHaveLength(
         2,
       ),
     );
@@ -313,6 +330,9 @@ describe("popular agent configuration", () => {
             "opencode",
             "hermes",
             "openclaw",
+            "grok",
+            "kimi",
+            "copilot",
           ]),
         },
       ]),
@@ -334,7 +354,7 @@ describe("popular agent configuration", () => {
     );
     renderFlow();
     await waitFor(() =>
-      expect(screen.getAllByText("Could not load coding agents")).toHaveLength(
+      expect(screen.getAllByText("Could not load Agent Runtimes")).toHaveLength(
         2,
       ),
     );
@@ -346,7 +366,7 @@ describe("popular agent configuration", () => {
     ).not.toBeInTheDocument();
     await userEvent.click(screen.getAllByRole("button", { name: "Retry" })[0]);
     await screen.findByRole("button", { name: /Claude Code / });
-    expect(screen.queryAllByText("Could not load coding agents")).toHaveLength(
+    expect(screen.queryAllByText("Could not load Agent Runtimes")).toHaveLength(
       0,
     );
     expect(
@@ -364,11 +384,11 @@ describe("popular agent configuration", () => {
       expect(screen.getByRole("radio", { name })).toBeInTheDocument();
     }
     expect(
-      screen.getByRole("button", { name: "Add coding agent" }),
+      screen.getByRole("button", { name: "Add Agent Runtime" }),
     ).toBeDisabled();
     await remove("Codex");
     expect(
-      screen.getByRole("button", { name: "Add coding agent" }),
+      screen.getByRole("button", { name: "Add Agent Runtime" }),
     ).toBeEnabled();
     expect(screen.getByRole("button", { name: /Codex / })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -388,6 +408,9 @@ describe("popular agent configuration", () => {
           "opencode",
           "hermes",
           "openclaw",
+          "grok",
+          "kimi",
+          "copilot",
         ]),
       },
     ]);
@@ -408,7 +431,7 @@ describe("popular agent configuration", () => {
     );
     renderFlow();
     await screen.findByRole("button", {
-      name: "Add coding agent",
+      name: "Add Agent Runtime",
     });
     await waitFor(() => expect(screen.getAllByRole("radio")).toHaveLength(2));
     expect(
@@ -419,7 +442,7 @@ describe("popular agent configuration", () => {
     ).toBeInTheDocument();
     await ready();
     const codingAgents = screen
-      .getByRole("heading", { name: "Coding agents Beta" })
+      .getByRole("heading", { name: "Agent Runtimes Beta" })
       .closest("section") as HTMLElement;
     expect(
       within(codingAgents)
@@ -434,11 +457,11 @@ describe("popular agent configuration", () => {
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "Add coding agent" }),
+        screen.getByRole("button", { name: "Add Agent Runtime" }),
       ).toBeEnabled(),
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "Add coding agent" }),
+      screen.getByRole("button", { name: "Add Agent Runtime" }),
     );
     await userEvent.click(screen.getByRole("button", { name: "Codex" }));
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -500,7 +523,7 @@ describe("popular agent configuration", () => {
     await ready();
     await remove("Codex");
     await userEvent.click(
-      screen.getByRole("button", { name: "Add coding agent" }),
+      screen.getByRole("button", { name: "Add Agent Runtime" }),
     );
     await userEvent.click(screen.getByRole("button", { name: "Codex" }));
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -512,6 +535,9 @@ describe("popular agent configuration", () => {
             "opencode",
             "hermes",
             "openclaw",
+            "grok",
+            "kimi",
+            "copilot",
             "codex",
           ]),
         },
@@ -528,6 +554,9 @@ describe("popular agent configuration", () => {
         "OpenCode",
         "Hermes",
         "OpenClaw",
+        "Grok Build",
+        "Kimi Code",
+        "GitHub Copilot CLI",
         "Codex",
         "Custom image",
       ]),
@@ -559,6 +588,9 @@ describe("popular agent configuration", () => {
             "opencode",
             "hermes",
             "openclaw",
+            "grok",
+            "kimi",
+            "copilot",
           ]),
         },
       ]),
@@ -568,7 +600,7 @@ describe("popular agent configuration", () => {
     await ready();
     expect(picker().getAllByRole("listitem")[0]).toHaveTextContent("Codex");
     const section = screen
-      .getByRole("heading", { name: "Coding agents Beta" })
+      .getByRole("heading", { name: "Agent Runtimes Beta" })
       .closest("section");
     if (!section) throw new Error("Missing catalog section");
     expect(within(section).getAllByRole("button")[0]).toHaveTextContent(
@@ -609,7 +641,7 @@ describe("popular agent configuration", () => {
     }))
       expect(button).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "Add coding agent" }),
+      screen.getByRole("button", { name: "Add Agent Runtime" }),
     ).toBeDisabled();
     expect(writes).toEqual([]);
   });

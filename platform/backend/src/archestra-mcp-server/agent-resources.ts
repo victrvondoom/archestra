@@ -899,8 +899,8 @@ async function resolveRuntimeAndModelForWrite(params: {
   runtimeInput: AgentRuntimeToolInput | null | undefined;
   llmApiKeyId: string | null | undefined;
   modelId: string | null | undefined;
-  existing: Pick<Agent, "runtime" | "llmApiKeyId" | "modelId"> | null;
-}): Promise<Partial<Pick<Agent, "runtime" | "llmApiKeyId" | "modelId">>> {
+  existing: Pick<Agent, AgentModelField> | null;
+}): Promise<Partial<Pick<Agent, AgentModelField>>> {
   const { context, runtimeInput, llmApiKeyId, modelId, existing } = params;
   const touchesModel = llmApiKeyId !== undefined || modelId !== undefined;
   if (runtimeInput === undefined && !touchesModel) return {};
@@ -921,10 +921,13 @@ async function resolveRuntimeAndModelForWrite(params: {
           input: runtimeInput,
           organizationId: context.organizationId,
         });
-  requireAgentRuntimePermission({
+  await requireAgentRuntimePermission({
     agentType: params.agentType,
     runtime,
     isAdmin: params.isAgentAdmin,
+    userId: context.userId,
+    organizationId: context.organizationId,
+    previous: existing?.runtime,
   });
   await assertCanBindRuntimeCredentials({
     organizationId: context.organizationId,
@@ -953,6 +956,7 @@ async function resolveRuntimeAndModelForWrite(params: {
     ...scope,
     runtime: merged.runtime,
     agent: merged,
+    selectsModel: touchesModel,
   });
 
   return {
@@ -961,6 +965,8 @@ async function resolveRuntimeAndModelForWrite(params: {
     ...(modelId !== undefined && { modelId }),
   };
 }
+
+type AgentModelField = "runtime" | "llmApiKeyId" | "modelId";
 
 function describeRuntime(runtime: AgentRuntime | null): string {
   if (!runtime) return "built-in chat harness";

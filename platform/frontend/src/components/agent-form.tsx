@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  type AgentCatalogId,
   type AgentScope,
   type AgentType,
   type archestraApiTypes,
@@ -10,6 +9,7 @@ import {
   DEFAULT_AGENT_SYSTEM_PROMPT,
   DocsPage,
   E2eTestId,
+  type GitHubActionsAccess,
   getAgentRuntimeModelCompatibility,
   getAgentRuntimeProviderCompatibility,
   getDocsUrl,
@@ -98,6 +98,10 @@ import { ClaudeCodeInferenceSettings } from "@/components/claude-code-inference-
 import { ClaudeProviderConnections } from "@/components/claude-provider-connections";
 import { EnvironmentSelector } from "@/components/environment-selector";
 import { ExternalDocsLink } from "@/components/external-docs-link";
+import {
+  GitHubActionsAccessSection,
+  gitHubActionsAccessError,
+} from "@/components/github-actions-access-section";
 import { IdentityFields } from "@/components/identity-fields";
 import {
   type InitialPermissionGrant,
@@ -131,7 +135,11 @@ import {
 } from "@/components/ui/collapsible";
 import { ExpandableText } from "@/components/ui/expandable-text";
 import { FieldDescription } from "@/components/ui/field-description";
-import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import {
+  InlineNotice,
+  InlineNoticeBody,
+  InlineNoticeText,
+} from "@/components/ui/inline-notice";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -210,6 +218,7 @@ import {
 import { isPersonalSubscription } from "@/lib/llm-key-subscription";
 import { type LlmModel, useLlmModelsByProvider } from "@/lib/llm-models.query";
 import { useAvailableLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
+import { useAvailableModelPools } from "@/lib/model-pools.query";
 import { useSkillsPaginated } from "@/lib/skills/skill.query";
 import { isReportedApiError } from "@/lib/utils/api";
 import { mergeById } from "@/lib/utils/merge-by-id";
@@ -939,7 +948,7 @@ export interface AgentFormProps {
   defaultIconType?: AgentIconVariant;
   /** Catalog/template defaults for a new Agent. Ignored in edit mode. */
   initialValues?: AgentFormInitialValues;
-  initialRuntimeId?: AgentCatalogId;
+  initialRuntimeId?: string;
   /** Callback when a new agent/profile is created (not called for updates) */
   onCreated?: (created: {
     id: string;
@@ -1067,6 +1076,9 @@ export function AgentForm({
   // overwriting them with the empty default.
   const shouldLoadKnowledgeSources = showToolsSections;
   const shouldLoadLlmConfiguration = agentType === "agent";
+  const { data: canConfigureRuntime } = useHasPermissions({
+    agent: ["configure-runtime"],
+  });
   const { data: canReadAgents } = useHasPermissions({ agent: ["read"] });
   const { data: canReadAgentTriggers } = useHasPermissions({
     organizationSettings: ["read"],
@@ -1117,6 +1129,10 @@ export function AgentForm({
     !!canReadSkills &&
     !agent?.builtIn &&
     (agentType === "mcp_gateway" || agentType === "profile");
+  // Set on a saved gateway, by someone who may edit it. A reader who cannot
+  // change it gets no section at all.
+  const showGitHubActionsAccess =
+    agentType === "mcp_gateway" && !!agent && !readOnly;
   const loadSkills = showSkills;
   const syncSkills = useUpdateAgentSkills();
   const syncSkillExclusions = useUpdateAgentSkillExclusions();
@@ -1286,6 +1302,9 @@ export function AgentForm({
   const [labels, setLabels] = useState<ProfileLabel[]>([]);
   const [llmApiKeyId, setLlmApiKeyId] = useState<string | null>(null);
   const [llmModel, setLlmModel] = useState<string | null>(null);
+  // A model pool in place of the key and model; the server stores one of its
+  // members as the key and model.
+  const [modelPoolId, setModelPoolId] = useState<string | null>(null);
   const [apiKeySelectorOpen, setApiKeySelectorOpen] = useState(false);
   const [selectedToolsCount, setSelectedToolsCount] = useState(0);
   // The tools editor's live selection (pending edits included), so the
@@ -1325,15 +1344,16 @@ export function AgentForm({
   const [knowledgeBaseIds, setKnowledgeBaseIds] = useState<string[]>([]);
   const [connectorIds, setConnectorIds] = useState<string[]>([]);
   const [passthroughHeaders, setPassthroughHeaders] = useState<string[]>([]);
+  const [githubActionsAccess, setGithubActionsAccess] =
+    useState<GitHubActionsAccess | null>(null);
   const [runtime, setAgentRuntime] = useState<AgentRuntimeConfig | null>(null);
   const originalRuntimeId =
     initialRuntimeId ??
     (initialValues?.runtime
       ? (resolveAgentCatalogId(initialValues.runtime) ?? "custom")
       : "chat");
-  const [selectedRuntimeId, setSelectedRuntimeId] = useState<
-    AgentCatalogId | "chat" | "custom"
-  >(originalRuntimeId);
+  const [selectedRuntimeId, setSelectedRuntimeId] =
+    useState<string>(originalRuntimeId);
   // The catalog already decided this is a built-in agent; there is no
   // runtime left to pick.
   const runsOnBuiltInHarness =
@@ -1551,9 +1571,11 @@ export function AgentForm({
   // The provider key + model pair: internal agents, built-in ones included.
   const showsModelControl = isInternalAgent || isBuiltIn;
   // Which model "Organization default" currently means, so the control can
-  // say so instead of leaving the reader to look it up.
+  // say so instead of leaving the reader to look it up. Agent Runtime agents
+  // are never auto routed, so they are shown the default model alone.
   const organizationDefaultModel = useOrganizationDefaultModel({
     enabled: showsModelControl,
+    followsRouting: !runtime,
   });
   // General now holds the four fields the reader came for — name, model,
   // description and instructions — so it is shown whenever any of them
@@ -1678,6 +1700,7 @@ export function AgentForm({
             labels: agentData.labels,
             llmApiKeyId: agentData.llmApiKeyId,
             llmModel: agentData.modelId,
+            modelPoolId: agentData.modelPoolId ?? null,
             identityProviderId: agentData.identityProviderId ?? undefined,
             environmentId: agentData.environmentId ?? undefined,
             knowledgeBaseIds: agentData.knowledgeBaseIds,
@@ -1685,6 +1708,7 @@ export function AgentForm({
             scope: agentData.scope,
             initialGrants: [],
             passthroughHeaders: agentData.passthroughHeaders ?? [],
+            githubActionsAccess: agentData.githubActionsAccess ?? null,
             runtime: (agentData.runtime as AgentRuntimeConfig | null) ?? null,
             toolExposureMode: agentData.toolExposureMode ?? "full",
             missingCredentialBehavior:
@@ -1708,6 +1732,7 @@ export function AgentForm({
             labels: [],
             llmApiKeyId: null,
             llmModel: null,
+            modelPoolId: null,
             identityProviderId: undefined,
             environmentId: undefined,
             knowledgeBaseIds: [],
@@ -1715,6 +1740,7 @@ export function AgentForm({
             scope: "personal",
             initialGrants: [],
             passthroughHeaders: [],
+            githubActionsAccess: null,
             runtime: initialValues?.runtime ?? null,
             // New agents default to "Auto" (implicit access to all tools);
             // admins can switch to "Custom" (explicitly assigned tools).
@@ -1732,6 +1758,7 @@ export function AgentForm({
       setSuggestedPromptsOpen(false);
       setLlmApiKeyId(nextValues.llmApiKeyId);
       setLlmModel(nextValues.llmModel);
+      setModelPoolId(nextValues.modelPoolId);
       setAssignedTeamIds(nextValues.assignedTeamIds);
       setAssignedUserIds(nextValues.assignedUserIds);
       setLabels(nextValues.labels);
@@ -1742,6 +1769,7 @@ export function AgentForm({
       setScope(nextValues.scope);
       setInitialGrants(nextValues.initialGrants);
       setPassthroughHeaders(nextValues.passthroughHeaders);
+      setGithubActionsAccess(nextValues.githubActionsAccess);
       setAgentRuntime(nextValues.runtime);
       setToolExposureMode(nextValues.toolExposureMode);
       setMissingCredentialBehavior(nextValues.missingCredentialBehavior);
@@ -1877,6 +1905,14 @@ export function AgentForm({
     () => availableApiKeys.find((k) => k.id === llmApiKeyId),
     [availableApiKeys, llmApiKeyId],
   );
+  // Pools are offered to agents the platform runs itself, not to runtimes.
+  const { data: modelPools = [] } = useAvailableModelPools({
+    enabled: isInternalAgent && !runtime,
+  });
+  const agentModelPoolId = runtime ? null : modelPoolId;
+  const agentModelPool = agentModelPoolId
+    ? modelPools.find((pool) => pool.id === agentModelPoolId)
+    : undefined;
   const requiredSubscriptionKind =
     !agent && runtime?.command?.[0] === "archestra-codex"
       ? "chatgpt"
@@ -2123,12 +2159,21 @@ export function AgentForm({
   const savedEnvironmentId = persistedAgent?.environmentId ?? null;
   const environmentChanged =
     !!persistedAgent && (environmentId ?? null) !== savedEnvironmentId;
+  // Saving it asks whether the editor may use its GitHub App, so it is sent
+  // only when it changed.
+  const githubActionsAccessChanged =
+    !!persistedAgent &&
+    hasUnsavedChanges(
+      persistedAgent.githubActionsAccess ?? null,
+      githubActionsAccess,
+    );
   // The API validates the key and the model against each other, so whichever
   // one moved, both go.
   const llmSelectionChanged =
     !!persistedAgent &&
     ((llmApiKeyId ?? null) !== (persistedAgent.llmApiKeyId ?? null) ||
-      (llmModel ?? null) !== (persistedAgent.modelId ?? null));
+      (llmModel ?? null) !== (persistedAgent.modelId ?? null) ||
+      agentModelPoolId !== (persistedAgent.modelPoolId ?? null));
   const hasCompleteLlmSelection = Boolean(llmApiKeyId) === Boolean(llmModel);
   const needsClaudeProviderKey =
     !agent &&
@@ -2244,6 +2289,7 @@ export function AgentForm({
             ...(llmSelectionChanged && {
               llmApiKeyId: llmApiKeyId || null,
               modelId: llmModel || null,
+              modelPoolId: agentModelPoolId,
             }),
           },
         });
@@ -2279,6 +2325,7 @@ export function AgentForm({
                 ...(llmSelectionChanged && {
                   llmApiKeyId: llmApiKeyId || null,
                   modelId: llmModel || null,
+                  modelPoolId: agentModelPoolId,
                 }),
               }),
             }),
@@ -2303,8 +2350,12 @@ export function AgentForm({
                 passthroughHeaders:
                   passthroughHeaders.length > 0 ? passthroughHeaders : null,
               }),
+              ...(showGitHubActionsAccess &&
+                githubActionsAccessChanged && { githubActionsAccess }),
             }),
-            ...(showRuntimeSection && runtimeEditable && { runtime }),
+            ...(showRuntimeSection &&
+              runtimeEditable &&
+              canConfigureRuntime === true && { runtime }),
             // The tools group: what the agent may reach, and how.
             ...(showToolsSections && {
               knowledgeBaseIds: knowledgeBaseIds,
@@ -2344,6 +2395,7 @@ export function AgentForm({
             systemPrompt: trimmedSystemPrompt || null,
             llmApiKeyId: llmApiKeyId || null,
             modelId: llmModel || null,
+            modelPoolId: agentModelPoolId,
             suggestedPrompts: validSuggestedPrompts,
             ...(activationSkillPolicy && { activationSkillPolicy }),
           }),
@@ -2583,6 +2635,7 @@ export function AgentForm({
     labels,
     llmApiKeyId,
     llmModel,
+    agentModelPoolId,
     llmSelectionChanged,
     identityProviderId,
     environmentId,
@@ -2632,6 +2685,9 @@ export function AgentForm({
     onSaved,
     supportsIdentityProvider,
     passthroughHeaders,
+    showGitHubActionsAccess,
+    githubActionsAccess,
+    githubActionsAccessChanged,
     toolExposureMode,
     missingCredentialBehavior,
     accessAllTools,
@@ -2640,6 +2696,7 @@ export function AgentForm({
     supportsSubagents,
     agentRuntimeEnabled,
     runtimeEditable,
+    canConfigureRuntime,
     runtime,
     channelAssignmentsDirty,
     isClaudeCodeRuntime,
@@ -2733,6 +2790,7 @@ export function AgentForm({
     labels,
     llmApiKeyId,
     llmModel,
+    modelPoolId,
     identityProviderId,
     environmentId,
     knowledgeBaseIds,
@@ -2740,6 +2798,7 @@ export function AgentForm({
     scope,
     initialGrants,
     passthroughHeaders,
+    githubActionsAccess,
     toolExposureMode,
     missingCredentialBehavior,
     accessAllTools,
@@ -2816,8 +2875,10 @@ export function AgentForm({
     !needsClaudeProviderKey &&
     !needsRuntimeContainer &&
     !runtimeModelIncompatibility &&
+    (!runtimeHasLocalChanges || canConfigureRuntime === true) &&
     mcpEnvConflicts.length === 0 &&
-    !environmentConflicts.blocksSave;
+    !environmentConflicts.blocksSave &&
+    !(showGitHubActionsAccess && gitHubActionsAccessError(githubActionsAccess));
   const footerState: AgentFormFooterState = {
     formId,
     isCreate: !agent,
@@ -2839,7 +2900,19 @@ export function AgentForm({
         onOpenChange={setApiKeySelectorOpen}
         onSelectKey={(keyId) => {
           cancelPendingCreatedKeySelection();
+          setModelPoolId(null);
           handleLlmApiKeyChange(keyId);
+          setApiKeySelectorOpen(false);
+        }}
+        pools={runtime ? [] : modelPools}
+        selectedPoolId={agentModelPoolId}
+        onSelectPool={(poolId) => {
+          cancelPendingCreatedKeySelection();
+          pendingModelAutoSelectionRef.current = null;
+          setModelPoolId(poolId);
+          setLlmApiKeyId(null);
+          setLlmModel(null);
+          lastAutoSelectedProviderRef.current = null;
           setApiKeySelectorOpen(false);
         }}
         onAddApiKey={onAddApiKey}
@@ -2852,9 +2925,13 @@ export function AgentForm({
         allowOrganizationDefault={
           !!agent || !isClaudeCodeRuntime || usesClaudeSubscription
         }
-        organizationDefaultSelected={!llmApiKeyId}
+        organizationDefaultSelected={!llmApiKeyId && !agentModelPoolId}
+        organizationDefaultDescription={
+          organizationDefaultModel.label ?? undefined
+        }
         onSelectOrganizationDefault={() => {
           cancelPendingCreatedKeySelection();
+          setModelPoolId(null);
           setLlmApiKeyId(null);
           setLlmModel(null);
           lastAutoSelectedProviderRef.current = null;
@@ -2867,7 +2944,7 @@ export function AgentForm({
   const setClaudeAuthentication = (
     authentication: "provider" | "subscription",
   ) => {
-    if (!runtime) return;
+    if (!runtime || canConfigureRuntime !== true) return;
     setAgentRuntime({
       ...runtime,
       claudeCode: {
@@ -2952,6 +3029,8 @@ export function AgentForm({
           unavailableModelHeading={
             runtime ? "Current model (unavailable)" : undefined
           }
+          // A pool is picked with the key; a model picked here is never pooled.
+          markPooledModels={!!runtime}
         />
       )}
     </>
@@ -2974,7 +3053,9 @@ export function AgentForm({
       ? `${requiredSubscription.label}. ${requiredSubscriptionSatisfied ? "Connected" : "Not connected yet"}`
       : needsClaudeProviderKey
         ? "Select a provider and Claude model"
-        : `${selectedApiKey?.name ?? "Organization default key"}, ${selectedLlmModelRow?.displayName ?? (llmApiKeyId ? "Select a model" : (organizationDefaultModel.label ?? "default model"))}`;
+        : agentModelPoolId
+          ? `Model pool ${agentModelPool?.name ?? ""}`.trim()
+          : `${selectedApiKey?.name ?? "Organization default key"}, ${selectedLlmModelRow?.displayName ?? (llmApiKeyId ? "Select a model" : (organizationDefaultModel.label ?? "default model"))}`;
   const modelBlock = (
     <div className="space-y-2">
       {(agent || !isInternalAgent || !agentRuntimeEnabled) && (
@@ -3014,6 +3095,7 @@ export function AgentForm({
             </Alert>
           )}
           {!isClaudeCodeRuntime &&
+            !agentModelPoolId &&
             (selectedApiKeyIsSubscription ? (
               <Alert>
                 <InfoIcon className="h-4 w-4" />
@@ -3033,48 +3115,52 @@ export function AgentForm({
               </p>
             ))}
           {isClaudeCodeRuntime ? (
-            <ClaudeCodeInferenceSettings
-              agentId={agent?.id ?? ""}
-              authentication={
-                usesClaudeSubscription ? "subscription" : "provider"
-              }
-              onAuthenticationChange={setClaudeAuthentication}
-              model={runtime?.claudeCode?.model}
-              onModelChange={(model) => {
-                if (!runtime) return;
-                setAgentRuntime({
-                  ...runtime,
-                  claudeCode: {
-                    authentication: "subscription",
-                    model,
-                  },
-                  credentials:
-                    runtime.credentials?.filter(
-                      ({ key }) => key !== "CLAUDE_CODE_OAUTH_TOKEN",
-                    ) ?? null,
-                });
-              }}
-              provider={
-                selectedApiKey?.provider ??
-                effectiveLlmModelRow?.provider ??
-                null
-              }
-              vertexEnabled={anthropicVertexAiEnabled}
-              apiKeySelector={claudeConnectionControl}
-              modelSelector={modelControl}
-              showModelSelector={
-                !!llmApiKeyId ||
-                availableApiKeys.some(
-                  (key) =>
-                    !isPersonalSubscription(key) &&
-                    runtimeProviderFilter(key.provider),
-                )
-              }
-            />
+            <fieldset disabled={canConfigureRuntime !== true}>
+              <ClaudeCodeInferenceSettings
+                agentId={agent?.id ?? ""}
+                authentication={
+                  usesClaudeSubscription ? "subscription" : "provider"
+                }
+                onAuthenticationChange={setClaudeAuthentication}
+                model={runtime?.claudeCode?.model}
+                onModelChange={(model) => {
+                  if (!runtime || canConfigureRuntime !== true) return;
+                  setAgentRuntime({
+                    ...runtime,
+                    claudeCode: {
+                      authentication: "subscription",
+                      model,
+                    },
+                    credentials:
+                      runtime.credentials?.filter(
+                        ({ key }) => key !== "CLAUDE_CODE_OAUTH_TOKEN",
+                      ) ?? null,
+                  });
+                }}
+                provider={
+                  selectedApiKey?.provider ??
+                  effectiveLlmModelRow?.provider ??
+                  null
+                }
+                vertexEnabled={anthropicVertexAiEnabled}
+                apiKeySelector={claudeConnectionControl}
+                modelSelector={modelControl}
+                showModelSelector={
+                  !!llmApiKeyId ||
+                  availableApiKeys.some(
+                    (key) =>
+                      !isPersonalSubscription(key) &&
+                      runtimeProviderFilter(key.provider),
+                  )
+                }
+              />
+            </fieldset>
           ) : (
             <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:flex-wrap sm:items-center">
               <div className="min-w-0">{providerKeyControl}</div>
-              <div className="min-w-0">{modelControl}</div>
+              {!agentModelPoolId && (
+                <div className="min-w-0">{modelControl}</div>
+              )}
             </div>
           )}
           {runtimeModelIncompatibility &&
@@ -3234,6 +3320,7 @@ export function AgentForm({
                   {!agent &&
                     isInternalAgent &&
                     agentRuntimeEnabled &&
+                    canConfigureRuntime === true &&
                     !runsOnBuiltInHarness && (
                       <div className="space-y-4 border-t pt-6">
                         <AgentRuntimePicker
@@ -3735,11 +3822,32 @@ export function AgentForm({
             agentType === "agent" &&
             runtimeEditable &&
             !isBuiltIn && (
-              <div className={cn(!isActiveSection("runtime") && "hidden")}>
-                <AgentRuntimeFields
-                  value={runtime}
-                  onChange={setAgentRuntime}
-                />
+              <div
+                className={cn(
+                  "space-y-6",
+                  !isActiveSection("runtime") && "hidden",
+                )}
+              >
+                {!canConfigureRuntime && (
+                  <InlineNotice variant="info">
+                    <InfoIcon className="size-4 shrink-0" />
+                    <InlineNoticeBody>
+                      <span className="font-medium">
+                        Runtime settings are read-only
+                      </span>
+                      <InlineNoticeText>
+                        Configure runtime permission is required to change this
+                        agent's runtime. Existing settings are preserved.
+                      </InlineNoticeText>
+                    </InlineNoticeBody>
+                  </InlineNotice>
+                )}
+                <fieldset disabled={canConfigureRuntime !== true}>
+                  <AgentRuntimeFields
+                    value={runtime}
+                    onChange={setAgentRuntime}
+                  />
+                </fieldset>
               </div>
             )}
 
@@ -4103,6 +4211,13 @@ export function AgentForm({
                 </SettingsSection>
               )}
 
+              {showGitHubActionsAccess && (
+                <GitHubActionsAccessSection
+                  value={githubActionsAccess}
+                  onChange={setGithubActionsAccess}
+                />
+              )}
+
               {/* Identity Provider for JWKS auth */}
               {supportsIdentityProvider && identityProviders.length > 0 && (
                 <SettingsSection
@@ -4280,12 +4395,14 @@ type AgentFormFields = {
   labels: ProfileLabel[];
   llmApiKeyId: string | null;
   llmModel: string | null;
+  modelPoolId: string | null;
   identityProviderId: string | null | undefined;
   environmentId: string | null | undefined;
   knowledgeBaseIds: string[];
   connectorIds: string[];
   scope: AgentScope;
   passthroughHeaders: string[];
+  githubActionsAccess: GitHubActionsAccess | null;
   runtime: AgentRuntimeConfig | null;
   toolExposureMode: ToolExposureMode;
   missingCredentialBehavior: MissingCredentialBehavior;

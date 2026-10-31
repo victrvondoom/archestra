@@ -18,18 +18,23 @@ import {
 import { actorFromUserId } from "@/auth/service-account-user-id";
 import config from "@/config";
 import db, { schema } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
 import { createPaginatedResult } from "@/database/utils/pagination";
+import { agentRunLlmSessionId } from "@/services/agent-runtime/runtime-contract";
 import type {
+  AgentRunFailure,
   AgentRunListItem,
   AgentRunRecord,
   AgentRunSession,
+  AgentRuntimeTier,
   InsertAgentRunRecord,
 } from "@/types";
-import { A2A_TERMINAL_TASK_STATES } from "@/types/a2a-task";
+import { A2A_TERMINAL_TASK_STATES, type A2ATaskState } from "@/types/a2a-task";
 import type { AgentWorkspace } from "@/types/agent-workspace";
 import type { ChatOpsProviderType } from "@/types/chatops";
 import { escapeLikePattern } from "@/utils/sql-search";
 import A2AMessageModel from "./a2a/message";
+import AgentRunAttentionNoticeModel from "./agent-run-attention-notice";
 import ResourcePermissionPolicyModel from "./resource-permission-policy";
 
 /**
@@ -103,11 +108,9 @@ class AgentRunModel {
   static async findByVirtualApiKeyId(
     virtualApiKeyId: string,
   ): Promise<AgentRunRecord | "ambiguous" | null> {
-    const rows = await db
-      .select()
-      .from(schema.agentRunsTable)
-      .where(eq(schema.agentRunsTable.virtualApiKeyId, virtualApiKeyId))
-      .limit(2);
+    const rows = await AgentRunModel.byVirtualApiKey
+      .get()
+      .execute({ virtualApiKeyId });
     if (rows.length === 1) return rows[0];
     return rows.length === 0 ? null : "ambiguous";
   }
@@ -146,6 +149,64 @@ class AgentRunModel {
     return run && (!workspace || run.workloadName === workspace.workloadName)
       ? run
       : null;
+  }
+
+  /**
+   * The current turn's task of a run addressed by its stable run id: the
+   * workspace id, or the task id of a run with no workspace. Null when the id
+   * names a later turn of a workspace rather than the run. Organization-scoped
+   * only; callers authorize access to the returned task.
+   */
+  static async findCurrentTurnTaskId(params: {
+    runId: string;
+    organizationId: string;
+  }): Promise<string | null> {
+    const workspaces = schema.agentWorkspacesTable;
+    const [workspace] = await db
+      .select({ lastTaskId: workspaces.lastTaskId })
+      .from(workspaces)
+      .where(
+        and(
+          eq(workspaces.id, params.runId),
+          eq(workspaces.organizationId, params.organizationId),
+        ),
+      )
+      .limit(1);
+    if (workspace) return workspace.lastTaskId;
+    const [laterTurn] = await db
+      .select({ id: schema.agentRunsTable.id })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        workspaces,
+        eq(workspaces.workloadName, schema.agentRunsTable.workloadName),
+      )
+      .where(eq(schema.agentRunsTable.taskId, params.runId))
+      .limit(1);
+    return laterTurn ? null : params.runId;
+  }
+
+  /** Stable run ids for task ids: the task's workspace id, else the task id. */
+  static async findRunIdsByTaskIds(
+    taskIds: string[],
+  ): Promise<Map<string, string>> {
+    if (taskIds.length === 0) return new Map();
+    const rows = await db
+      .select({
+        taskId: schema.agentRunsTable.taskId,
+        workspaceId: schema.agentWorkspacesTable.id,
+      })
+      .from(schema.agentRunsTable)
+      .innerJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
+      )
+      .where(inArray(schema.agentRunsTable.taskId, taskIds));
+    const runIds = new Map(taskIds.map((taskId) => [taskId, taskId]));
+    for (const row of rows) runIds.set(row.taskId, row.workspaceId);
+    return runIds;
   }
 
   /** Stream history metadata in bounded pages; cursor comparisons stay in PostgreSQL. */
@@ -241,6 +302,7 @@ class AgentRunModel {
     organizationId: string;
     actorKind: AgentRunRecord["actorKind"];
     actorId: string;
+    jiraRequesterAccountId?: string;
   }): Promise<{
     run: AgentRunRecord;
     workspace: Pick<
@@ -275,6 +337,9 @@ class AgentRunModel {
           eq(schema.agentRunsTable.organizationId, params.organizationId),
           eq(schema.agentRunsTable.actorKind, params.actorKind),
           eq(schema.agentRunsTable.actorId, params.actorId),
+          params.jiraRequesterAccountId
+            ? sql`${schema.agentRunsTable.completionTarget}->>'jiraRequesterAccountId' = ${params.jiraRequesterAccountId}`
+            : undefined,
         ),
       )
       .orderBy(
@@ -327,17 +392,32 @@ class AgentRunModel {
     taskId: string;
     attentionState: AgentRunRecord["attentionState"];
   }): Promise<boolean> {
-    const updated = await db
-      .update(schema.agentRunsTable)
-      .set({ attentionState: params.attentionState })
-      .where(
-        and(
-          eq(schema.agentRunsTable.taskId, params.taskId),
-          isNull(schema.agentRunsTable.endedAt),
-        ),
-      )
-      .returning({ id: schema.agentRunsTable.id });
-    return updated.length > 0;
+    return db.transaction(async (tx) => {
+      const [run] = await tx
+        .select()
+        .from(schema.agentRunsTable)
+        .where(
+          and(
+            eq(schema.agentRunsTable.taskId, params.taskId),
+            isNull(schema.agentRunsTable.endedAt),
+          ),
+        )
+        .for("update");
+      if (!run) return false;
+      const [task] = await tx
+        .select({ state: schema.a2aTasksTable.state })
+        .from(schema.a2aTasksTable)
+        .where(eq(schema.a2aTasksTable.id, params.taskId));
+      if (!task || A2A_TERMINAL_TASK_STATES.includes(task.state)) return false;
+      if (run.attentionState === params.attentionState) return true;
+      const [updated] = await tx
+        .update(schema.agentRunsTable)
+        .set({ attentionState: params.attentionState })
+        .where(eq(schema.agentRunsTable.id, run.id))
+        .returning();
+      await AgentRunAttentionNoticeModel.recordTransition(updated, tx);
+      return true;
+    });
   }
 
   /** Sessions whose pod should still exist, across every organization. */
@@ -405,10 +485,13 @@ class AgentRunModel {
         ...runColumns,
         state: schema.a2aTasksTable.state,
         statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
         stateChangedAt: schema.a2aTasksTable.stateChangedAt,
         hardDeadlineAt: hardDeadlineAtExpression(),
         lastModelActivityAt: lastModelActivityAtExpression(),
-        initiatorName: schema.usersTable.name,
+        initiatorName: sql<
+          string | null
+        >`coalesce(${schema.usersTable.name}, ${schema.serviceAccountsTable.name})`,
         // SPDX-SnippetBegin
         // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
         // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
@@ -437,6 +520,17 @@ class AgentRunModel {
         schema.usersTable,
         eq(schema.agentRunsTable.actorUserId, schema.usersTable.id),
       )
+      .leftJoin(
+        schema.serviceAccountsTable,
+        and(
+          eq(schema.agentRunsTable.actorKind, "serviceAccount"),
+          sql`${schema.agentRunsTable.actorId} = ${schema.serviceAccountsTable.id}::text`,
+          eq(
+            schema.agentRunsTable.organizationId,
+            schema.serviceAccountsTable.organizationId,
+          ),
+        ),
+      )
       .where(
         and(
           eq(schema.agentRunsTable.agentId, params.agentId),
@@ -451,6 +545,8 @@ class AgentRunModel {
     agentIds: string[];
     organizationId: string;
     limit: number;
+    state?: A2ATaskState;
+    failedSince?: Date;
     thread?: { bindingId: string; threadId: string };
   }) {
     if (params.agentIds.length === 0) return [];
@@ -458,6 +554,7 @@ class AgentRunModel {
     const rows = await db
       .select({
         taskId: schema.agentRunsTable.taskId,
+        runId: sql<string>`coalesce(${schema.agentWorkspacesTable.id}, ${schema.agentRunsTable.taskId})`,
         title: schema.agentRunsTable.title,
         actorKind: schema.agentRunsTable.actorKind,
         actorId: schema.agentRunsTable.actorId,
@@ -467,6 +564,7 @@ class AgentRunModel {
         endedAt: schema.agentRunsTable.endedAt,
         state: schema.a2aTasksTable.state,
         statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
         stateChangedAt: schema.a2aTasksTable.stateChangedAt,
         hardDeadlineAt: hardDeadlineAtExpression(),
         lastModelActivityAt: lastModelActivityAtExpression(),
@@ -490,6 +588,13 @@ class AgentRunModel {
       .innerJoin(
         schema.agentsTable,
         eq(schema.agentRunsTable.agentId, schema.agentsTable.id),
+      )
+      .leftJoin(
+        schema.agentWorkspacesTable,
+        eq(
+          schema.agentWorkspacesTable.workloadName,
+          schema.agentRunsTable.workloadName,
+        ),
       )
       .leftJoin(
         schema.usersTable,
@@ -524,9 +629,37 @@ class AgentRunModel {
             : undefined,
           inArray(schema.agentRunsTable.agentId, params.agentIds),
           eq(schema.agentRunsTable.organizationId, params.organizationId),
+          params.state
+            ? eq(schema.a2aTasksTable.state, params.state)
+            : undefined,
+          params.failedSince
+            ? and(
+                eq(schema.a2aTasksTable.state, "TASK_STATE_FAILED"),
+                // Bind UTC wall time explicitly for the timezone-less column.
+                sql`${schema.a2aTasksTable.stateChangedAt} >= ${params.failedSince.toISOString()}`,
+              )
+            : undefined,
+          // Alert correlation needs historical failed turns; normal lists keep
+          // one current turn per workspace.
+          params.failedSince
+            ? undefined
+            : or(
+                isNull(schema.agentWorkspacesTable.id),
+                eq(
+                  schema.agentWorkspacesTable.lastTaskId,
+                  schema.agentRunsTable.taskId,
+                ),
+              ),
         ),
       )
-      .orderBy(desc(schema.agentRunsTable.startedAt))
+      .orderBy(
+        desc(
+          params.failedSince
+            ? schema.a2aTasksTable.stateChangedAt
+            : schema.agentRunsTable.startedAt,
+        ),
+        desc(schema.agentRunsTable.id),
+      )
       .limit(params.limit);
 
     const prompts = await A2AMessageModel.findFirstUserPartsByTaskIds(
@@ -637,6 +770,19 @@ class AgentRunModel {
     return await AgentRunModel.addRunPrompts(rows);
   }
 
+  /** A warm Sandbox from a neighbouring pool changes the tier a run runs at. */
+  static async updateRuntimeLimitsTier(params: {
+    taskId: string;
+    tier: AgentRuntimeTier | null;
+  }): Promise<void> {
+    const current = await AgentRunModel.findByTaskId(params.taskId);
+    if (!current?.runtimeLimits) return;
+    await db
+      .update(schema.agentRunsTable)
+      .set({ runtimeLimits: { ...current.runtimeLimits, tier: params.tier } })
+      .where(eq(schema.agentRunsTable.taskId, params.taskId));
+  }
+
   static async updateTitleIfCurrent(params: {
     taskId: string;
     expectedTitle: string;
@@ -689,17 +835,23 @@ class AgentRunModel {
    * caller racing the reconciler can tell whether it owns the teardown.
    */
   static async close(params: { id: string; logs?: string }): Promise<boolean> {
-    const closed = await db
-      .update(schema.agentRunsTable)
-      .set({ endedAt: new Date(), logs: params.logs, attentionState: null })
-      .where(
-        and(
-          eq(schema.agentRunsTable.id, params.id),
-          isNull(schema.agentRunsTable.endedAt),
-        ),
-      )
-      .returning({ id: schema.agentRunsTable.id });
-    return closed.length > 0;
+    return db.transaction(async (tx) => {
+      const [closed] = await tx
+        .update(schema.agentRunsTable)
+        .set({ endedAt: new Date(), logs: params.logs, attentionState: null })
+        .where(
+          and(
+            eq(schema.agentRunsTable.id, params.id),
+            isNull(schema.agentRunsTable.endedAt),
+          ),
+        )
+        .returning();
+      if (!closed) return false;
+      // Closing already clears attention. Resolve any posted notice as part of
+      // that same write, without changing teardown or task lifecycle decisions.
+      await AgentRunAttentionNoticeModel.recordTransition(closed, tx);
+      return true;
+    });
   }
 
   static async clearVirtualApiKey(id: string): Promise<void> {
@@ -799,6 +951,7 @@ class AgentRunModel {
         ...runColumns,
         state: schema.a2aTasksTable.state,
         statusReason: schema.a2aTasksTable.statusReason,
+        failure: failureExpression(),
         stateChangedAt: schema.a2aTasksTable.stateChangedAt,
         hardDeadlineAt: hardDeadlineAtExpression(),
         lastModelActivityAt: lastModelActivityAtExpression(),
@@ -867,9 +1020,23 @@ class AgentRunModel {
     );
     return rows.map((row) => ({
       ...row,
+      llmSessionId: agentRunLlmSessionId(row),
       prompt: extractPrompt(prompts.get(row.taskId) ?? []),
     }));
   }
+  private static readonly byVirtualApiKey = new PreparedQuery((database) =>
+    database
+      .select()
+      .from(schema.agentRunsTable)
+      .where(
+        eq(
+          schema.agentRunsTable.virtualApiKeyId,
+          sql.placeholder("virtualApiKeyId"),
+        ),
+      )
+      .limit(2)
+      .prepare("archestra_agent_run_by_virtual_key"),
+  );
 }
 
 export default AgentRunModel;
@@ -887,6 +1054,20 @@ function extractPrompt(parts: unknown[]): string {
     )
     .join("")
     .trim();
+}
+
+/** A FAILED task's stored classification plus its status reason. */
+function failureExpression(): SQL<AgentRunFailure | null> {
+  const failure = schema.a2aTasksTable.failure;
+  return sql<AgentRunFailure | null>`
+    CASE WHEN ${schema.a2aTasksTable.state} = 'TASK_STATE_FAILED'
+      AND ${failure} IS NOT NULL
+    THEN jsonb_build_object(
+      'code', ${failure}->>'code',
+      'retriable', (${failure}->>'retriable')::boolean,
+      'message', COALESCE(${schema.a2aTasksTable.statusReason}, '')
+    ) END
+  `;
 }
 
 function hardDeadlineAtExpression(): SQL<Date> {

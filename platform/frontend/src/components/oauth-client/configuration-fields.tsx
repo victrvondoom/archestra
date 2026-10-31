@@ -4,11 +4,17 @@ import type { OAuthClientScope } from "@archestra/shared/oauth";
 import { useMutation } from "@tanstack/react-query";
 import { Bot, Network, Workflow } from "lucide-react";
 import { type UseFormReturn, useWatch } from "react-hook-form";
+import { AdvancedLabelsSection } from "@/components/advanced-labels-section";
+import type { ProfileLabelsRef } from "@/components/agent-labels";
 import type { AgentSelectorAgent } from "@/components/agent-selector";
 import {
   BudgetFields,
   UsersPayNotice,
 } from "@/components/credential-billing/budget-fields";
+import {
+  ModelPoolsField,
+  useCanSetModelPools,
+} from "@/components/credential-billing/model-pools-field";
 import { ProviderKeyList } from "@/components/credential-billing/provider-key-list";
 import type { LlmProviderApiKeyResponse } from "@/components/llm-provider-api-key-form";
 import { GatewayPicker } from "@/components/oauth-client/gateway-picker";
@@ -185,8 +191,10 @@ export function OAuthClientAccessFields({
 
 export function OAuthClientAdvancedFields({
   form,
+  labelsRef,
 }: {
   form: UseFormReturn<OAuthClientFormValues>;
+  labelsRef: React.Ref<ProfileLabelsRef>;
 }) {
   const values = useWatch({
     control: form.control,
@@ -231,6 +239,18 @@ export function OAuthClientAdvancedFields({
           />
         </section>
       )}
+      <AdvancedLabelsSection
+        ref={labelsRef}
+        attributionSource={
+          values.scopes.includes("llm:proxy") && !userMode
+            ? "credential"
+            : undefined
+        }
+        labels={values.labels ?? []}
+        onLabelsChange={(labels) =>
+          form.setValue("labels", labels, { shouldDirty: true })
+        }
+      />
     </div>
   );
 }
@@ -270,6 +290,7 @@ export function oauthClientFormBody(
         }
       : {
           providerApiKeys: values.providerApiKeys,
+          modelPoolIds: values.modelPoolIds,
           billingTeamId: values.billingTeamId,
           serviceAccountId: values.serviceAccountId,
         }),
@@ -347,6 +368,7 @@ function OAuthClientProviderAccessFields({
   const userMode = values.grantType === "authorization_code";
   const llm = values.scopes.includes("llm:proxy");
   const { data: capabilities } = useScopedCapabilities(!userMode && llm);
+  const canSetModelPools = useCanSetModelPools();
   const includeFutureProviders = values.includeFutureProviders ?? false;
   const canIncludeFutureProviders =
     capabilities?.some(
@@ -369,40 +391,50 @@ function OAuthClientProviderAccessFields({
   }
 
   return (
-    <ProviderAccessField
-      surface={providerAccessSurface}
-      credentialLabel="OAuth client"
-      label="LLM provider access"
-      apiKeysLabel="LLM API keys"
-      canIncludeFutureProviders={
-        canIncludeFutureProviders ||
-        (providerAccessSurface === "edit" && includeFutureProviders)
-      }
-      includeFutureProviders={includeFutureProviders}
-      onIncludeFutureProvidersChange={(value) => {
-        form.setValue("includeFutureProviders", value, { shouldDirty: true });
-        if (value) {
-          form.setValue("providerApiKeys", [], { shouldDirty: true });
+    <>
+      <ProviderAccessField
+        surface={providerAccessSurface}
+        credentialLabel="OAuth client"
+        label="LLM provider access"
+        apiKeysLabel="LLM API keys"
+        canIncludeFutureProviders={
+          canIncludeFutureProviders ||
+          (providerAccessSurface === "edit" && includeFutureProviders)
         }
-      }}
-      current={
-        <ProviderKeyList
-          alwaysOpen
-          label="LLM API keys"
-          showLabel={!includeFutureProviders}
-          allowBulkAdd={!includeFutureProviders}
-          emptyLabel={
-            includeFutureProviders
-              ? "Uses primary API keys — add a provider to choose a different key"
-              : "No providers selected — add one below"
+        includeFutureProviders={includeFutureProviders}
+        onIncludeFutureProvidersChange={(value) => {
+          form.setValue("includeFutureProviders", value, { shouldDirty: true });
+          if (value) {
+            form.setValue("providerApiKeys", [], { shouldDirty: true });
           }
-          value={values.providerApiKeys ?? []}
+        }}
+        current={
+          <ProviderKeyList
+            alwaysOpen
+            label="LLM API keys"
+            showLabel={!includeFutureProviders}
+            allowBulkAdd={!includeFutureProviders}
+            emptyLabel={
+              includeFutureProviders
+                ? "Uses primary API keys — add a provider to choose a different key"
+                : "No providers selected — add one below"
+            }
+            value={values.providerApiKeys ?? []}
+            onChange={(value) =>
+              form.setValue("providerApiKeys", value, { shouldDirty: true })
+            }
+            providerApiKeys={providerApiKeys as LlmProviderApiKeyResponse[]}
+          />
+        }
+      />
+      {canSetModelPools && (
+        <ModelPoolsField
+          value={values.modelPoolIds ?? []}
           onChange={(value) =>
-            form.setValue("providerApiKeys", value, { shouldDirty: true })
+            form.setValue("modelPoolIds", value, { shouldDirty: true })
           }
-          providerApiKeys={providerApiKeys as LlmProviderApiKeyResponse[]}
         />
-      }
-    />
+      )}
+    </>
   );
 }

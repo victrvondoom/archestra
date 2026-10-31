@@ -6,18 +6,15 @@ with only local tools. Anchor checks force review when the pinned CLI changes.
 """
 
 from pathlib import Path
-import json
-import subprocess
 import sys
 
-listing = json.loads(subprocess.check_output(["pnpm", "list", "--global", "--json", "openclaw"], text=True))
-package = Path(listing[0]["dependencies"]["openclaw"]["path"])
-files = list((package / "dist").glob("agent-bundle-mcp-materialize-*.js"))
+package = Path("/opt/agent-openclaw/node_modules/openclaw")
+files = list((package / "dist").glob("agent-bundle-mcp-materialize-*.mjs"))
 if len(files) != 1:
     sys.exit("OpenClaw MCP materialization changed; review openclaw-mcp-required.py")
 path = files[0]
 source = path.read_text()
-anchor = "\t\tcatalog = await params.runtime.getCatalog();\n"
+anchor = "\t\tconst catalog = await runtime.getCatalog();\n"
 if source.count(anchor) != 1:
     sys.exit("OpenClaw MCP catalog loading changed; review openclaw-mcp-required.py")
 source = 'import { spawnSync as reportArchestraMcpFailure } from "node:child_process";\n' + source

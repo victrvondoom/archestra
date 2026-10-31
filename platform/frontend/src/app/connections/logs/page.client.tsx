@@ -6,8 +6,8 @@ import { ErrorBoundary } from "@/app/_parts/error-boundary";
 import { useLogsHeaderAction } from "@/app/_parts/logs-section-layout";
 import { TimeRangePicker } from "@/components/time-range-picker/time-range-picker";
 import { useDateTimeRangePicker } from "@/lib/hooks/use-date-time-range-picker";
-import { ConnectionExplorer } from "./_components/connection-explorer";
-import type { ConnectionsWindow } from "./_components/connections-window";
+import { ConnectionExplorer } from "./_parts/connection-explorer";
+import type { ConnectionsWindow } from "./_parts/connections-window";
 
 /** What the page shows until a range is picked. */
 const DEFAULT_DAYS = 30;
@@ -28,6 +28,8 @@ export default function ConnectionLogsPage() {
     onDateRangeChange: useCallback(
       ({ startDate, endDate }) => {
         const params = new URLSearchParams(searchParams.toString());
+        params.delete("cursor");
+        params.delete("page");
         for (const [key, value] of Object.entries({ startDate, endDate })) {
           if (value) params.set(key, value);
           else params.delete(key);

@@ -1,4 +1,5 @@
 import {
+  AgentRuntimeTierSettingsSchema,
   BM25_B_MAX,
   BM25_B_MIN,
   BM25_K1_MAX,
@@ -16,6 +17,7 @@ import {
   RoleAssignmentSchema,
   SESSION_MAX_AGE_MAX_SECONDS,
   SESSION_MAX_AGE_MIN_SECONDS,
+  StoredAgentRuntimeTierSettingsSchema,
   StoredKnowledgeConnectorOverridesSchema,
   StoredMessagingChannelOverridesSchema,
   StoredModelProviderOverridesSchema,
@@ -345,7 +347,9 @@ const extendedFields = {
   defaultLlmProvider: SupportedProvidersSchema.nullable(),
   defaultUserLimitValue: z.number().int().positive().nullable(),
   defaultUserLimitModel: z.array(z.string()).nullable(),
-  defaultUserLimitCleanupInterval: LimitCleanupIntervalSchema.nullable(),
+  defaultUserLimitCleanupInterval: LimitCleanupIntervalSchema.exclude([
+    "minute",
+  ]).nullable(),
   defaultMemberRole: z.string().nullable(),
   defaultAgentId: z.string().uuid().nullable(),
   favicon: z.string().nullable(),
@@ -375,6 +379,7 @@ const extendedFields = {
   knowledgeConnectorOverrides:
     StoredKnowledgeConnectorOverridesSchema.nullable(),
   defaultNetworkPolicy: NetworkPolicySchema.nullable(),
+  agentRuntimeTiers: StoredAgentRuntimeTierSettingsSchema.nullable(),
   defaultEnvironmentTrustedImageRegistries:
     TrustedImageRegistriesSchema.nullable(),
 };
@@ -396,6 +401,34 @@ export const SelectOrganizationSchema = InternalSelectOrganizationSchema.omit({
   connectionDefaultProviderKeys: true,
   appsHackathonRecorderEnabled: true,
 });
+const OrganizationDefaultModelRefSchema = z.object({
+  id: z.string().uuid(),
+  provider: SupportedProvidersSchema,
+  displayName: z.string(),
+});
+export type OrganizationDefaultModelRef = z.infer<
+  typeof OrganizationDefaultModelRefSchema
+>;
+
+/** What "Organization default" runs on: the default model, routed across the trio while auto routing is active. */
+export const OrganizationDefaultModelSchema = z.object({
+  model: OrganizationDefaultModelRefSchema.nullable(),
+  autoRouting: z.discriminatedUnion("active", [
+    z.object({ active: z.literal(false) }),
+    z.object({
+      active: z.literal(true),
+      tiers: z.object({
+        fast: OrganizationDefaultModelRefSchema,
+        normal: OrganizationDefaultModelRefSchema,
+        smart: OrganizationDefaultModelRefSchema,
+      }),
+    }),
+  ]),
+});
+export type OrganizationDefaultModel = z.infer<
+  typeof OrganizationDefaultModelSchema
+>;
+
 export const InsertOrganizationSchema = createInsertSchema(
   schema.organizationsTable,
   extendedFields,
@@ -450,8 +483,10 @@ export const UpdateAppearanceSettingsSchema = z.object({
 });
 
 export const UpdateSecuritySettingsSchema = z.object({
+  playwrightMcpEnabled: z.boolean().optional(),
   allowChatFileUploads: z.boolean().optional(),
   allowUnauthenticatedLlmProxyRequests: z.boolean().optional(),
+  keepMediaInLogs: z.boolean().optional(),
   newAppsDisabledByDefault: z.boolean().optional(),
   newAppsLockedByDefault: z.boolean().optional(),
   /** @deprecated No longer gates anything; accepted for backwards-compat and ignored. */
@@ -460,6 +495,7 @@ export const UpdateSecuritySettingsSchema = z.object({
 
 export const UpdateMcpSettingsSchema = z.object({
   onlineMcpCatalogEnabled: z.boolean().optional(),
+  defaultPersonalAgentAccessAllTools: z.boolean().optional(),
   // SPDX-SnippetBegin
   // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
   // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
@@ -474,9 +510,13 @@ export const UpdateSkillsSettingsSchema = z.object({
 });
 
 export const UpdateAgentSettingsSchema = z.object({
+  /** Per-tier overrides of the Agent Runtime tiers; null restores every default. */
+  agentRuntimeTiers: AgentRuntimeTierSettingsSchema.nullable().optional(),
   defaultModelId: z.string().uuid().nullable().optional(),
   defaultLlmApiKeyId: z.string().uuid().nullable().optional(),
   defaultAgentId: z.string().uuid().nullable().optional(),
+  defaultFastModelId: z.string().uuid().nullable().optional(),
+  defaultSmartModelId: z.string().uuid().nullable().optional(),
 });
 
 export const UpdateKnowledgeSettingsSchema = z.object({

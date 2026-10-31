@@ -19,6 +19,7 @@ import {
   count,
   desc,
   eq,
+  getTableColumns,
   gte,
   inArray,
   isNotNull,
@@ -31,14 +32,15 @@ import {
   sql,
   sum,
 } from "drizzle-orm";
+import { getTableConfig } from "drizzle-orm/pg-core";
 import { CacheKey, cacheManager, LRUCacheManager } from "@/cache-manager";
 import {
-  decryptInteractionContent,
   encryptInteractionContent,
   readInteractionRow,
+  restoreWrittenInteractionContent,
 } from "@/content-encryption/audit-rows";
 import type { EncryptedChatAuditContext } from "@/content-encryption/encrypted-chat";
-import db, { schema } from "@/database";
+import db, { schema, type Transaction, withDbTransaction } from "@/database";
 import { notDeleted } from "@/database/schemas/soft-deletable-table";
 import {
   type CursorPaginatedResult,
@@ -51,9 +53,12 @@ import { buildTokenizedSearchFilter } from "@/database/utils/text-search";
 import {
   resolveLogContentMode,
   withholdInteractionContent,
+  withoutInteractionMedia,
 } from "@/log-content";
 import logger from "@/logging";
+import { parseClaudeMetadataParentSessionId } from "@/routes/proxy/utils/headers/session-id";
 import type {
+  CopilotCredentialSource,
   InsertInteraction,
   Interaction,
   InteractionAuthMethod,
@@ -71,22 +76,31 @@ import {
   LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH,
   normalizeInteractionResponse,
 } from "@/types";
+import type { AttributionLabels } from "@/types/attribution-label";
+import type { InsertRoutingUsage } from "@/types/auto-routing";
 import {
   type InteractionSessionPreview,
   InteractionSessionPreviewSchema,
 } from "@/types/interaction";
 import { trackBackgroundWork } from "@/utils/background-work";
+import { retryOnceOnDeadlock } from "@/utils/deadlock";
 import { repairLoneSurrogateText } from "@/utils/lone-surrogates";
+import { isMediaUsage } from "@/utils/media-usage";
+import { sizedChunks } from "@/utils/sized-chunks";
 import { isUuid, uuidv7 } from "@/utils/uuid";
 import AgentModel from "./agent";
 import AgentTeamModel from "./agent-team";
 import AgentUsageModel from "./agent-usage";
 import ConversationChatErrorModel from "./conversation-chat-error";
+import InteractionBillingModel from "./interaction-billing";
 import InteractionDeltaManager from "./interaction-delta-manager";
 import InteractionSessionHeadModel from "./interaction-session-head";
 import InteractionUserActivityModel from "./interaction-user-activity";
 import LimitModel from "./limit";
+import LlmProviderApiKeyModel from "./llm-provider-api-key";
 import { interactionBelongsToOrganization } from "./log-organization";
+import OrganizationModel from "./organization";
+import RoutingUsageModel from "./routing-usage";
 import VirtualApiKeyModel from "./virtual-api-key";
 
 /**
@@ -120,18 +134,28 @@ const GUARDRAIL_SKIP_SCAN_ROWS = 200;
 /** Rows per UPDATE when the session-preview backfill stores previews. */
 const SESSION_PREVIEW_UPDATE_ROWS = 50;
 
-/** A thread's row as fillThreadSessionPreviews loads it (raw SQL, snake_case). */
-type ThreadPreviewRow = {
+/**
+ * A row of a thread's skeleton as fillThreadSessionPreviews lists it (raw
+ * SQL, snake_case): no payload, just what the fold order and the chunks need.
+ */
+type ThreadSkeletonRow = {
   id: string;
   parent_id: string | null;
-  thread_id: string | null;
-  request_shared_prefix: number | null;
+  bytes: number | null;
+  missing: boolean;
+};
+
+/** A thread's row with its payload, as one chunk of the thread fill loads it. */
+type ThreadChunkRow = {
+  id: string;
+  parentId: string | null;
+  threadId: string | null;
+  requestSharedPrefix: number | null;
   request: unknown;
   source: InteractionSource | null;
-  session_source: string | null;
+  sessionSource: string | null;
   type: string;
-  encrypted_chat_conversation_id: string | null;
-  missing: boolean;
+  encryptedChatConversationId: string | null;
 };
 
 /**
@@ -233,6 +257,10 @@ function computeRequestType(
     return computeOpenCodeRequestType(request);
   }
 
+  if (hasTitleGenerationMarker(findMarkers(request, SESSION_PREVIEW_MARKERS))) {
+    return "subagent";
+  }
+
   // Only apply detection heuristics for Claude sessions (claude_metadata, plus
   // the legacy claude_code / claude_desktop values on older rows).
   if (!isClaudeSessionSource(sessionSource)) {
@@ -242,11 +270,20 @@ function computeRequestType(
   const req = request as {
     system?: string | Array<{ text?: string; type?: string }>;
     tools?: Array<{ name: string }>;
+    metadata?: {
+      agent_id?: unknown;
+      parent_session_id?: unknown;
+      user_id?: unknown;
+    };
     messages?: Array<{
       content: string | Array<{ text?: string; type?: string }>;
       role: string;
     }>;
   };
+
+  if (hasClaudeSubagentMarker(req)) {
+    return "subagent";
+  }
 
   const messages = req?.messages ?? [];
 
@@ -268,24 +305,83 @@ function computeRequestType(
     }
   }
 
-  // Claude Agent SDK tool sub-agents (e.g. web search) are marked by their
-  // system prompt. This is the reliable signal for Claude Desktop, whose main
-  // agent — unlike Claude Code's — does not carry the Task tool.
-  if (getMessageText(req?.system).includes("an assistant for performing a")) {
-    return "subagent";
-  }
-
   // Legacy rows only: newer Claude requests record session_source as
   // claude_metadata, which can no longer be distinguished from Claude Desktop,
   // so the Task-tool negative signal (unsafe for Desktop main agents) is not
   // applied to them — they fall through to the default below.
   if (sessionSource === LEGACY_CLAUDE_CODE_SESSION_SOURCE) {
     const tools = req?.tools ?? [];
-    const hasTaskTool = tools.some((tool) => tool.name === "Task");
+    const hasTaskTool = tools.some(
+      (tool) => tool.name === "Task" || tool.name === "Agent",
+    );
     return hasTaskTool ? "main" : "subagent";
   }
 
   return "main";
+}
+
+/**
+ * Whether a stored request is one of its session's own turns, by the rules
+ * the sessions list picks its tip with: not a guardrail's call, a title or
+ * prompt-suggestion request, nor a sub-agent or side turn.
+ */
+export function isSessionMainTurn(row: {
+  request: unknown;
+  sessionSource: string | null;
+  source: string | null;
+}): boolean {
+  if (isGuardrailSource(row.source)) return false;
+  const text = JSON.stringify(row.request) ?? "";
+  if (SESSION_PREVIEW_MARKERS.some((marker) => text.includes(marker))) {
+    return false;
+  }
+  return (
+    computeRequestType(row.request, row.sessionSource, row.source) === "main"
+  );
+}
+
+const CLAUDE_SUBAGENT_SYSTEM_MARKERS = [
+  "an assistant for performing a",
+  "You are a file search specialist",
+  "You are a command execution specialist",
+  "You are a software architect and planning specialist",
+  "You are a general-purpose agent",
+  "You are a security monitor for autonomous AI coding agents",
+  "cc_is_subagent=true",
+] as const;
+
+function hasClaudeSubagentMarker(request: unknown): boolean {
+  const req = request as {
+    system?: string | Array<{ text?: string; type?: string }>;
+    metadata?: {
+      agent_id?: unknown;
+      parent_session_id?: unknown;
+      user_id?: unknown;
+    };
+  } | null;
+  if (!req) return false;
+  if (
+    typeof req.metadata?.agent_id === "string" &&
+    req.metadata.agent_id.trim().length > 0
+  ) {
+    return true;
+  }
+  if (
+    typeof req.metadata?.parent_session_id === "string" &&
+    req.metadata.parent_session_id.trim().length > 0
+  ) {
+    return true;
+  }
+  if (
+    typeof req.metadata?.user_id === "string" &&
+    parseClaudeMetadataParentSessionId(req.metadata.user_id) !== null
+  ) {
+    return true;
+  }
+  const systemText = getMessageText(req.system);
+  return CLAUDE_SUBAGENT_SYSTEM_MARKERS.some((marker) =>
+    systemText.includes(marker),
+  );
 }
 
 function computeOpenCodeRequestType(request: unknown): "main" | "subagent" {
@@ -448,20 +544,48 @@ function buildExternalAgentDisplayName(
  *  - Unpaired UTF-16 surrogates, half an astral character left by a completion
  *    or tool result cut mid-character. JSONB is UTF-8, which cannot encode one.
  */
+/** The columns every interaction write needs back from the database. */
+type StoredInteractionKey = Pick<
+  typeof schema.interactionsTable.$inferSelect,
+  "id" | "profileId" | "createdAt"
+>;
+
+const interactionKeyColumns = {
+  id: schema.interactionsTable.id,
+  profileId: schema.interactionsTable.profileId,
+  createdAt: schema.interactionsTable.createdAt,
+};
+
 function stripUnstorableChars<T>(value: T): T {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") {
-    return repairLoneSurrogateText(value.replaceAll("\u0000", "")) as T;
+    return repairLoneSurrogateText(
+      value.includes("\u0000") ? value.replaceAll("\u0000", "") : value,
+    ) as T;
   }
+  // Structure-sharing: a clean subtree, the common case, is returned by
+  // reference instead of being copied.
   if (Array.isArray(value)) {
-    return value.map(stripUnstorableChars) as T;
+    let result: unknown[] | undefined;
+    for (let i = 0; i < value.length; i++) {
+      const stripped = stripUnstorableChars(value[i]);
+      if (stripped !== value[i]) {
+        result ??= value.slice();
+        result[i] = stripped;
+      }
+    }
+    return (result ?? value) as T;
   }
   if (typeof value === "object") {
-    const result: Record<string, unknown> = {};
+    let result: Record<string, unknown> | undefined;
     for (const [k, v] of Object.entries(value)) {
-      result[k] = stripUnstorableChars(v);
+      const stripped = stripUnstorableChars(v);
+      if (stripped !== v) {
+        if (!result) result = { ...(value as Record<string, unknown>) };
+        result[k] = stripped;
+      }
     }
-    return result as T;
+    return (result ?? value) as T;
   }
   return value;
 }
@@ -538,126 +662,31 @@ class InteractionModel {
    * conversation: its content columns are encrypted under that conversation's
    * browser-held key and the row is stamped with the discriminator, instead of
    * being encrypted under the server key (or left plaintext).
+   *
+   * Do not mutate the returned row: for a delta-encoded request its
+   * `request.messages` entries are shared with the reconstruction cache.
    */
   static async create(
     data: InsertInteraction,
     auditContext?: EncryptedChatAuditContext | null,
   ) {
-    // Snapshot the environment from the agent at creation time (single funnel
-    // for all interaction writes) so per-environment cost-limit usage stays
-    // stable under later agent reassignment. The agent is authoritative: when a
-    // profile is present its current environment wins over any caller-supplied
-    // value. Only profile-less system interactions may set it explicitly.
-    const environmentId = data.profileId
-      ? await AgentModel.findEnvironmentId(data.profileId)
-      : (data.environmentId ?? null);
-    // Enforced here, in the single funnel, so no writer can store content
-    // the deployment's Log Content mode withholds.
-    const withheld = resolveLogContentMode() === "metadata_only";
-    const record = withheld ? withholdInteractionContent(data) : data;
-    // A withheld row holds no content to encrypt under a conversation key, so
-    // it is written like the encrypted-chat fallback: unkeyed, marker in place.
-    const audit = withheld ? null : (auditContext ?? null);
-
-    // Sanitize JSONB fields to strip null bytes (\u0000) that PostgreSQL rejects
-    const sanitized = {
-      ...record,
-      environmentId,
-      request: stripUnstorableChars(record.request),
-      processedRequest: stripUnstorableChars(record.processedRequest),
-      response: stripUnstorableChars(record.response),
-    };
-
-    // Delta-encode Claude Code / Claude Desktop requests so we don't re-store the
-    // whole conversation on every row (no-op for all other interactions). Delta
-    // encoding stays active under content encryption: deltas are computed on
-    // plaintext before encryptInteractionContent runs below, and parent
-    // resolution matches on the always-plaintext hash columns.
-    //
-    // EncryptedChat rows are excluded outright. Today they could not qualify anyway
-    // (isEligible demands a Claude session source, and these are chat sources),
-    // but relying on that coincidence would be fragile: a delta chain mixes rows
-    // across requests and only the request that created a row carries its key,
-    // so a chain spanning keys could not be reconstructed by any reader.
-    //
-    // Withheld rows are excluded too: there is no conversation to share with
-    // a parent, and leaving their hash columns empty keeps a later full-content
-    // row from chaining onto a request that was never stored.
-    const { values, tip } =
-      audit || withheld
-        ? { values: sanitized, tip: null }
-        : await InteractionDeltaManager.encodeOnWrite(sanitized);
-
-    const interactionId = values.id ?? uuidv7();
-    const insertValues = {
-      ...encryptInteractionContent(
-        {
-          ...values,
-          sessionPreview: buildSessionPreview(sanitized, values.request),
-        },
-        audit,
-      ),
-      id: interactionId,
-    };
-    const insert = async () => {
-      const [created] = await db
-        .insert(schema.interactionsTable)
-        // Monotonic v7 id: created_at ties happen under load, and the delta
-        // manager's "most recent interaction" lookup breaks ties with the id.
-        .values(insertValues)
-        .onConflictDoNothing({ target: schema.interactionsTable.id })
-        .returning();
-      if (!created) {
-        const [existing] = await db
-          .select()
-          .from(schema.interactionsTable)
-          .where(eq(schema.interactionsTable.id, interactionId));
-        if (
-          !existing ||
-          existing.userId !== (data.userId ?? null) ||
-          existing.profileId !== (data.profileId ?? null) ||
-          existing.appId !== (data.appId ?? null) ||
-          existing.connectorId !== (data.connectorId ?? null)
-        )
-          throw new Error(
-            "Interaction id was already used for different attribution",
-          );
-        return existing;
-      }
-      return created;
-    };
-    const interaction =
-      data.userId == null
-        ? await insert()
-        : await InteractionUserActivityModel.append(insertValues);
-    // The RETURNING row is this method's public return value — decrypt it so
-    // callers never see envelopes. Safe for encrypted-chat rows too: this caller
-    // supplied the very key that just encrypted them.
-    decryptInteractionContent(interaction, audit);
-
-    if (tip) {
-      InteractionDeltaManager.commitTip(interaction.id, tip);
-    }
-
-    // Update usage tracking after interaction is created
-    // Run in background to not block the response
-    trackBackgroundWork(
-      InteractionModel.updateUsageAfterInteraction(
-        interaction as InsertInteraction & { id: string },
-      ).catch((error) => {
-        logger.error(
-          { error },
-          `Failed to update usage tracking for interaction ${interaction.id}`,
-        );
-      }),
-    );
-
-    AgentUsageModel.recordUseInBackground({
-      agentId: interaction.profileId,
-      usedAt: interaction.createdAt,
+    const interaction = await InteractionModel.write({
+      data,
+      auditContext,
+      returnRow: true,
     });
+    return interaction as typeof schema.interactionsTable.$inferSelect;
+  }
 
-    return interaction;
+  /**
+   * {@link create} for writers that do not read the stored row back: the
+   * database returns only its key columns instead of the whole row.
+   */
+  static async record(
+    data: InsertInteraction,
+    auditContext?: EncryptedChatAuditContext | null,
+  ): Promise<void> {
+    await InteractionModel.write({ data, auditContext, returnRow: false });
   }
 
   /**
@@ -676,6 +705,11 @@ class InteractionModel {
       sessionId?: string;
       startDate?: Date;
       endDate?: Date;
+      /**
+       * Only calls from this source, plus untagged older rows; leaves out
+       * auxiliary calls (guardrails, tool-call repair) inside the session.
+       */
+      turnSource?: InteractionSource;
     },
   ): Promise<PaginatedResult<Interaction>> {
     // Determine the ORDER BY clause based on sorting params
@@ -726,6 +760,15 @@ class InteractionModel {
     // Session ID filter
     if (filters?.sessionId) {
       conditions.push(matchesSessionKey(filters.sessionId));
+    }
+
+    if (filters?.turnSource) {
+      conditions.push(
+        or(
+          isNull(schema.interactionsTable.source),
+          eq(schema.interactionsTable.source, filters.turnSource),
+        ) as SQL,
+      );
     }
 
     // Date range filter
@@ -893,6 +936,7 @@ class InteractionModel {
           baselineModel: schema.interactionsTable.baselineModel,
           billingMode: schema.interactionsTable.billingMode,
           inputTokens: schema.interactionsTable.inputTokens,
+          inputTokensEstimated: schema.interactionsTable.inputTokensEstimated,
           outputTokens: schema.interactionsTable.outputTokens,
           cacheReadTokens: schema.interactionsTable.cacheReadTokens,
           cacheWriteTokens: schema.interactionsTable.cacheWriteTokens,
@@ -900,7 +944,18 @@ class InteractionModel {
           baselineCost: schema.interactionsTable.baselineCost,
           durationMs: schema.interactionsTable.durationMs,
           createdAt: schema.interactionsTable.createdAt,
+          providerApiKeyId: schema.interactionsTable.providerApiKeyId,
+          modelPoolId: schema.interactionsTable.modelPoolId,
+          attempt: schema.interactionsTable.attempt,
+          attemptOutcome: schema.interactionsTable.attemptOutcome,
+          failureReason: schema.interactionsTable.failureReason,
           source: schema.interactionsTable.source,
+          // The row's small stored preview (not the payload), so the trace can
+          // name a turn by the prompt it served; decrypted below.
+          attributionLabels: schema.interactionsTable.attributionLabels,
+          sessionPreview: schema.interactionsTable.sessionPreview,
+          encryptedChatConversationId:
+            schema.interactionsTable.encryptedChatConversationId,
           requestType: sql<"main" | "subagent">`
             CASE
               WHEN ${schema.interactionsTable.source} IN ('opencode:main', 'kilo:main')
@@ -956,13 +1011,37 @@ class InteractionModel {
       ),
     );
     return createPaginatedResult(
-      rows.map((row) => ({
-        ...row,
-        externalAgentIdLabel: resolveExternalAgentIdLabel(
-          row.externalAgentId,
-          agentNamesMap,
-        ),
-      })),
+      rows.map(({ sessionPreview, encryptedChatConversationId, ...row }) => {
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        // Locked-safe: a locked chat's preview stays a sentinel, which then
+        // fails the schema check and names nothing.
+        const read = readInteractionRow({
+          sessionPreview,
+          encryptedChatConversationId,
+        });
+        // SPDX-SnippetEnd
+        const preview = InteractionSessionPreviewSchema.safeParse(
+          read.sessionPreview,
+        );
+        return {
+          ...row,
+          externalAgentIdLabel: resolveExternalAgentIdLabel(
+            row.externalAgentId,
+            agentNamesMap,
+          ),
+          userMessagePreview: preview.success
+            ? preview.data.lastUserMessagePreview
+            : null,
+          responseToolNames: preview.success
+            ? (preview.data.responseToolNames ?? null)
+            : null,
+          responseTextPreview: preview.success
+            ? (preview.data.responseTextPreview ?? null)
+            : null,
+        };
+      }),
       Number(total),
       pagination,
     );
@@ -1422,6 +1501,9 @@ class InteractionModel {
         return;
       }
 
+      // Audio/image counts cannot be repriced using generic text-token tariffs.
+      if (isMediaUsage(interaction.response)) return;
+
       // Calculate token usage for this interaction
       const inputTokens = interaction.inputTokens || 0;
       const outputTokens = interaction.outputTokens || 0;
@@ -1446,10 +1528,14 @@ class InteractionModel {
         );
         return;
       }
-      // A credential's billing team takes the place of the agent's teams.
+      // A credential's billing team takes the place of the agent's teams the
+      // caller belongs to.
       const teamIds = interaction.billingTeamId
         ? [interaction.billingTeamId]
-        : await AgentTeamModel.getTeamsForAgent(interaction.profileId);
+        : await AgentTeamModel.getCallerTeamsForAgent({
+            agentId: interaction.profileId,
+            userId: interaction.userId,
+          });
       if (teamIds.length === 0) {
         logger.warn(
           `Profile ${interaction.profileId} has no team assignments for interaction ${interaction.id}`,
@@ -1854,7 +1940,7 @@ class InteractionModel {
         processedRequest: null,
       })),
     );
-    const responses = await InteractionModel.titleResponsesFor(rows);
+    const responses = await InteractionModel.responsesFor(rows);
     return InteractionModel.storeSessionPreviews(
       rows.map((row) =>
         InteractionModel.sessionPreviewValue(
@@ -1875,30 +1961,32 @@ class InteractionModel {
    * a time, as {@link fillSessionPreviews} does, loads the chain of every row
    * in the chunk and folds one whole conversation per row; on Claude Code
    * sessions of hundreds of turns that exhausted the worker's heap. Here the
-   * rows still missing a preview and every ancestor they fold from are loaded
-   * once, and each row is folded from its parent's fold, so what is held is
-   * those stored suffixes plus one fold at a time.
+   * rows still missing a preview and the ancestors their folds need are
+   * listed once without their payloads, then loaded parents first in chunks
+   * bounded by rows and stored bytes and folded one from the previous, so a
+   * thread of any size holds one chunk and one conversation at a time. A
+   * thread can be many times the size of its conversation: it stores the
+   * whole conversation again in a new head row whenever the client's tool
+   * list changes.
    *
    * Ancestors are loaded whether or not they have a preview: a row written by
    * a pod on the previous build during the rollout that introduced previews
-   * can sit between two rows that have one. A thread whose loaded rows exceed
-   * `storedBytesLimit` (compressed, as `pg_column_size` reports) is left
-   * alone, and its rows keep deriving the preview on read. A row that cannot
-   * be read fails together with its descendants, which cannot be folded
-   * without it; the rest of the thread is filled.
+   * can sit between two rows that have one. A row that cannot be read fails
+   * together with its descendants, which cannot be folded without it; the
+   * rest of the thread is filled. Past `deadline` the fill stops between
+   * chunks and reports `complete: false`; a later call resumes with the rows
+   * still missing, their filled ancestors folded again on the way.
    */
   static async fillThreadSessionPreviews(params: {
     sessionId: string;
     threadId: string;
-    storedBytesLimit: number;
-  }): Promise<{
-    filled: number;
-    failed: number;
-    skipped: boolean;
-    storedBytes: number;
-  }> {
-    // The rows to fill plus the ancestors their folds need, each once.
-    const chain = sql`
+    chunkRows: number;
+    chunkBytes: number;
+    deadline?: number;
+  }): Promise<{ filled: number; failed: number; complete: boolean }> {
+    // The rows to fill plus the ancestors their folds need, without
+    // payloads: the skeleton the fold walks and the chunks are cut from.
+    const { rows: skeleton } = await db.execute<ThreadSkeletonRow>(sql`
       WITH RECURSIVE chain AS (
         SELECT id, parent_id FROM interactions
         WHERE session_id = ${params.sessionId}
@@ -1909,171 +1997,172 @@ class InteractionModel {
         SELECT i.id, i.parent_id FROM interactions i
         JOIN chain c ON i.id = c.parent_id
       )
-    `;
-    const {
-      rows: [size],
-    } = await db.execute<{
-      rows: number;
-      missing: number;
-      bytes: string | number;
-    }>(sql`
-      ${chain}
-      SELECT count(*)::int AS rows,
-             count(*) FILTER (WHERE i.session_preview IS NULL)::int AS missing,
-             COALESCE(SUM(pg_column_size(i.request)), 0) AS bytes
-      FROM chain c JOIN interactions i ON i.id = c.id
-    `);
-    const storedBytes = Number(size?.bytes ?? 0);
-    const missing = Number(size?.missing ?? 0);
-    if (missing === 0) {
-      return { filled: 0, failed: 0, skipped: false, storedBytes };
-    }
-    if (storedBytes > params.storedBytesLimit) {
-      return { filled: 0, failed: missing, skipped: true, storedBytes };
-    }
-
-    const { rows } = await db.execute<ThreadPreviewRow>(sql`
-      ${chain}
-      SELECT i.id, i.parent_id, i.thread_id, i.request_shared_prefix, i.request,
-             i.source, i.session_source, i.type, i.encrypted_chat_conversation_id,
+      SELECT c.id, c.parent_id, pg_column_size(i.request) AS bytes,
              (i.session_preview IS NULL) AS missing
       FROM chain c JOIN interactions i ON i.id = c.id
       ORDER BY i.created_at, i.id
     `);
-    const values = InteractionModel.threadSessionPreviewValues(
-      rows,
-      await InteractionModel.titleResponsesFor(
-        rows.map((row) => ({
-          id: row.id,
-          source: row.source,
-          request: row.request,
-        })),
-      ),
-    );
-    // Counted from the rows as loaded, not from the sizing query: a
-    // concurrent run can fill rows between the two.
-    const targets = rows.filter((row) => row.missing).length;
-    const filled = await InteractionModel.storeSessionPreviews(values);
-    return {
-      filled,
-      failed: targets - values.length,
-      skipped: false,
-      storedBytes,
-    };
-  }
-
-  /**
-   * The previews of a thread's rows that lack one, folded from the loaded
-   * rows. Kept apart from the write so the rows can be collected before it.
-   */
-  private static threadSessionPreviewValues(
-    rows: ThreadPreviewRow[],
-    responses: Map<string, unknown>,
-  ): Array<{ id: string; sessionPreview: unknown }> {
-    const byId = new Map(rows.map((row) => [row.id, row]));
-    // SPDX-SnippetBegin
-    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
-    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
-    const unreadable = new Set<string>();
-    for (const row of rows) {
-      try {
-        readInteractionRow(row);
-      } catch (error) {
-        unreadable.add(row.id);
-        logger.warn(
-          { err: error, interactionId: row.id },
-          "Could not read an interaction while filling its thread's session previews; it and its descendants keep deriving the preview on read",
-        );
-      }
+    if (!skeleton.some((row) => row.missing)) {
+      return { filled: 0, failed: 0, complete: true };
     }
-    // SPDX-SnippetEnd
-    // A row below an unreadable one cannot be folded either. Resolved by
-    // walking parents, so the result does not depend on row order.
-    const broken = new Map<string, boolean>();
-    const isBroken = (id: string): boolean => {
-      const known = broken.get(id);
-      if (known !== undefined) return known;
-      const row = byId.get(id);
-      const result =
-        row !== undefined &&
-        (unreadable.has(id) ||
-          (row.parent_id !== null &&
-            byId.has(row.parent_id) &&
-            isBroken(row.parent_id)));
-      broken.set(id, result);
-      return result;
-    };
-    const readable = rows.filter((row) => !isBroken(row.id));
-
-    const values: Array<{ id: string; sessionPreview: unknown }> = [];
-    InteractionDeltaManager.foldLoadedRows(
-      readable.map((row) => ({
-        id: row.id,
-        parentId: row.parent_id,
-        threadId: row.thread_id,
-        requestSharedPrefix: row.request_shared_prefix,
-        request: row.request,
-      })),
-      readable.filter((row) => row.missing).map((row) => row.id),
-      (id, request) => {
-        const row = byId.get(id);
-        if (!row) return;
-        values.push(
-          InteractionModel.sessionPreviewValue(
-            {
-              id: row.id,
-              source: row.source,
-              sessionSource: row.session_source,
-              type: row.type,
-              request: row.request,
-            },
-            request,
-            responses.get(id) ?? null,
+    // The listed order only settles siblings; parentsFirst puts every parent
+    // ahead of its children, depth first, so a row's last child in this order
+    // is its last child at all and the folder can drop the fold with it.
+    const order = parentsFirst(skeleton);
+    const folder = InteractionDeltaManager.threadFolder(
+      order.map((row) => ({ id: row.id, parentId: row.parent_id })),
+    );
+    // Rows that could not be read or folded; their descendants cannot be
+    // folded either, and parents come first.
+    const unfoldable = new Set<string>();
+    let filled = 0;
+    let failed = 0;
+    const chunks = [
+      ...sizedChunks(
+        order,
+        { maxRows: params.chunkRows, maxBytes: params.chunkBytes },
+        (row) => Number(row.bytes ?? 0),
+      ),
+    ];
+    for (const [index, chunk] of chunks.entries()) {
+      if (
+        index > 0 &&
+        params.deadline !== undefined &&
+        Date.now() >= params.deadline
+      ) {
+        return { filled, failed, complete: false };
+      }
+      let loaded: ThreadChunkRow[];
+      let responses: Map<string, unknown>;
+      const unreadable = new Set<string>();
+      try {
+        const t = schema.interactionsTable;
+        loaded = await db
+          .select({
+            id: t.id,
+            parentId: t.parentId,
+            threadId: t.threadId,
+            requestSharedPrefix: t.requestSharedPrefix,
+            request: t.request,
+            source: t.source,
+            sessionSource: t.sessionSource,
+            type: t.type,
+            encryptedChatConversationId: t.encryptedChatConversationId,
+          })
+          .from(t)
+          .where(
+            inArray(
+              t.id,
+              chunk.map((row) => row.id),
+            ),
+          );
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        for (const row of loaded) {
+          try {
+            readInteractionRow(row);
+          } catch (error) {
+            unreadable.add(row.id);
+            logger.warn(
+              { err: error, interactionId: row.id },
+              "Could not read an interaction while filling its thread's session previews; it and its descendants keep deriving the preview on read",
+            );
+          }
+        }
+        // SPDX-SnippetEnd
+        // Ancestors are only folded; only the rows being filled read their
+        // response.
+        const filling = new Set(
+          chunk.filter((member) => member.missing).map((member) => member.id),
+        );
+        responses = await InteractionModel.responsesFor(
+          loaded.filter(
+            (row) => filling.has(row.id) && !unreadable.has(row.id),
           ),
         );
-      },
-    );
-    return values;
+      } catch (error) {
+        // Without this chunk nothing below it can be folded: the rest of the
+        // thread waits for the next pass.
+        logger.warn(
+          {
+            err: error,
+            sessionId: params.sessionId,
+            threadId: params.threadId,
+          },
+          "Could not load a chunk of a thread while filling its session previews; the rest of the thread keeps deriving them on read",
+        );
+        for (const rest of chunks.slice(index)) {
+          failed += rest.filter((row) => row.missing).length;
+        }
+        return { filled, failed, complete: true };
+      }
+
+      const byId = new Map(loaded.map((row) => [row.id, row]));
+      const values: Array<{ id: string; sessionPreview: unknown }> = [];
+      for (const member of chunk) {
+        const row = byId.get(member.id);
+        // member.parent_id and row.parentId are the same column, read by the
+        // skeleton query and by the chunk load.
+        const foldable =
+          row !== undefined &&
+          !unreadable.has(member.id) &&
+          (member.parent_id === null || !unfoldable.has(member.parent_id));
+        const full = foldable ? folder.fold(row) : null;
+        if (full === null) {
+          // Removed since the skeleton was read, unreadable, below an
+          // unreadable row, or (which parentsFirst rules out) ahead of its
+          // parent.
+          folder.skip({ id: member.id, parentId: member.parent_id });
+          unfoldable.add(member.id);
+          if (member.missing) failed += 1;
+          continue;
+        }
+        if (member.missing && row) {
+          values.push(
+            InteractionModel.sessionPreviewValue(
+              row,
+              full,
+              responses.get(row.id) ?? null,
+            ),
+          );
+        }
+      }
+      filled += await InteractionModel.storeSessionPreviews(values);
+    }
+    return { filled, failed, complete: true };
   }
 
   /**
-   * The responses of the title-generation turns among `rows`, by id. Only
-   * those turns read their response (for the title text); responses can
-   * dwarf requests, so the rest are never loaded.
+   * The responses of `rows`, by id: a preview names a request by what it
+   * produced (its tool calls or reply) and a title turn by its title. Only
+   * rows about to be written are passed, a bounded chunk at a time.
    */
-  private static async titleResponsesFor(
-    rows: Array<{
-      id: string;
-      source: InteractionSource | null;
-      request: unknown;
-    }>,
+  private static async responsesFor(
+    rows: Array<{ id: string }>,
   ): Promise<Map<string, unknown>> {
     const t = schema.interactionsTable;
-    const titleIds = rows
-      .filter(
-        (row) =>
-          !isGuardrailSource(row.source) &&
-          JSON.stringify(row.request ?? null).includes(
-            "Please write a 5-10 word title",
-          ),
-      )
-      .map((row) => row.id);
     const responses = new Map<string, unknown>();
-    if (titleIds.length === 0) return responses;
-    const titles = await db
+    if (rows.length === 0) return responses;
+    const loaded = await db
       .select({
         id: t.id,
         response: t.response,
         encryptedChatConversationId: t.encryptedChatConversationId,
       })
       .from(t)
-      .where(inArray(t.id, titleIds));
+      .where(
+        inArray(
+          t.id,
+          rows.map((row) => row.id),
+        ),
+      );
     // SPDX-SnippetBegin
     // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
     // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
-    for (const title of titles) {
-      readInteractionRow(title);
-      responses.set(title.id, title.response);
+    for (const row of loaded) {
+      readInteractionRow(row);
+      responses.set(row.id, row.response);
     }
     // SPDX-SnippetEnd
     return responses;
@@ -2441,6 +2530,7 @@ class InteractionModel {
         // For single interactions (no session), return the interaction ID for direct navigation
         interactionId: sql<string>`CASE WHEN MAX(${schema.interactionsTable.sessionId}) IS NULL THEN MAX(${schema.interactionsTable.id}::text) ELSE NULL END`,
         requestCount: count(),
+        failedOverCount: sql<number>`COUNT(*) FILTER (WHERE ${schema.interactionsTable.attemptOutcome} = 'failed_over')`,
         totalInputTokens: sum(schema.interactionsTable.inputTokens),
         totalOutputTokens: sum(schema.interactionsTable.outputTokens),
         totalCacheReadTokens: sum(schema.interactionsTable.cacheReadTokens),
@@ -2504,6 +2594,9 @@ class InteractionModel {
         virtualKeyIds: sql<
           string[]
         >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.virtualKeyId}::text), NULL)`,
+        copilotProviderApiKeyIds: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.providerApiKeyId}::text) FILTER (WHERE ${schema.interactionsTable.type} LIKE 'github-copilot:%'), NULL)`,
         passthroughVirtualKeyIds: sql<
           string[]
         >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.passthroughVirtualKeyId}::text), NULL)`,
@@ -2516,6 +2609,12 @@ class InteractionModel {
         conversationTitle: sql<
           string | null
         >`(SELECT ${schema.conversationsTable.title} FROM ${schema.conversationsTable} WHERE ${schema.conversationsTable.id} = CASE WHEN MAX(${schema.interactionsTable.sessionId}) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN MAX(${schema.interactionsTable.sessionId})::uuid END)`,
+        // The knowledge connector a knowledge:* row ran for, so the list can
+        // tell "Embedding documents" rows apart. Only when one connector owns
+        // every row; looked up by primary key once per session.
+        connectorName: sql<
+          string | null
+        >`CASE WHEN COUNT(DISTINCT ${schema.interactionsTable.connectorId}) = 1 THEN (SELECT ${schema.knowledgeBaseConnectorsTable.name} FROM ${schema.knowledgeBaseConnectorsTable} WHERE ${schema.knowledgeBaseConnectorsTable.id} = MAX(${schema.interactionsTable.connectorId}::text)::uuid) END`,
       })
       .from(schema.interactionsTable)
       .leftJoin(
@@ -2549,6 +2648,7 @@ class InteractionModel {
     const lastInteractionMap =
       await InteractionModel.getLastInteractionsForSessions(
         sessionKeys.filter((k): k is string => k !== null),
+        whereClause,
       );
 
     // Collect all external agent IDs to resolve prompt names
@@ -2567,6 +2667,11 @@ class InteractionModel {
         ...(s.passthroughVirtualKeyIds ?? []),
       ]),
     });
+
+    const copilotSources =
+      await LlmProviderApiKeyModel.findCopilotCredentialSources(
+        sessionsData.flatMap((s) => s.copilotProviderApiKeyIds ?? []),
+      );
 
     // Transform the data to the expected format
     const sessions = sessionsData.map((s) => {
@@ -2588,6 +2693,7 @@ class InteractionModel {
         sources: s.sources ?? [],
         interactionId: s.interactionId, // Only set for single interactions (null session)
         requestCount: Number(s.requestCount),
+        failedOverCount: Number(s.failedOverCount),
         totalInputTokens: Number(s.totalInputTokens) || 0,
         totalOutputTokens: Number(s.totalOutputTokens) || 0,
         totalCacheReadTokens: Number(s.totalCacheReadTokens) || 0,
@@ -2613,6 +2719,12 @@ class InteractionModel {
         userNames: s.userNames ?? [],
         userIds,
         unattributedReason: deriveUnattributedReason(userIds, authMethods),
+        copilotCredentialSources: dedupeCopilotSources(
+          (s.copilotProviderApiKeyIds ?? []).flatMap((id) => {
+            const source = copilotSources.get(id);
+            return source ? [source] : [];
+          }),
+        ),
         // Deduplicated across both columns: the two hold disjoint keys today
         // (each header rejects the other's key type), but a key reported twice
         // would render as two identical badges, so do not rely on that here.
@@ -2628,9 +2740,11 @@ class InteractionModel {
         lastUserMessagePreview: lastInteraction?.lastUserMessagePreview ?? null,
         lastInteractionId: lastInteraction?.lastInteractionId ?? null,
         lastInteractionType: lastInteraction?.lastInteractionType ?? null,
+        attributionLabels: lastInteraction?.attributionLabels ?? null,
         contentNotStored: lastInteraction?.contentNotStored ?? false,
         conversationTitle: s.conversationTitle,
         claudeCodeTitle: lastInteraction?.claudeCodeTitle ?? null,
+        connectorName: s.connectorName ?? null,
       };
     });
     return sessions;
@@ -2739,6 +2853,7 @@ class InteractionModel {
    */
   private static async getLastInteractionsForSessions(
     sessionKeys: string[],
+    whereClause: SQL | undefined,
   ): Promise<
     Map<
       string,
@@ -2746,6 +2861,7 @@ class InteractionModel {
         lastUserMessagePreview: string | null;
         lastInteractionId: string | null;
         lastInteractionType: string | null;
+        attributionLabels: AttributionLabels | null;
         contentNotStored: boolean;
         claudeCodeTitle: string | null;
       }
@@ -2781,6 +2897,7 @@ class InteractionModel {
       uuidKeys,
       newest: NEWEST_PER_SESSION,
       oldest: OLDEST_PER_SESSION,
+      whereClause,
     });
 
     // Group by session and find the "last main interaction" and "title interaction"
@@ -2790,6 +2907,7 @@ class InteractionModel {
         lastUserMessagePreview: string | null;
         lastInteractionId: string | null;
         lastInteractionType: string | null;
+        attributionLabels: AttributionLabels | null;
         contentNotStored: boolean;
         claudeCodeTitle: string | null;
       }
@@ -2829,22 +2947,22 @@ class InteractionModel {
         const isGuardrail = isGuardrailSource(interaction.source);
         const isOpenCodeSideTurn =
           interaction.preview?.isOpenCodeSideTurn ??
-          (isOpenCodeFamilySessionSource(interaction.sessionSource) &&
+          ((isOpenCodeFamilySessionSource(interaction.sessionSource) &&
             computeRequestType(
               interaction.request,
               interaction.sessionSource,
               interaction.source,
-            ) === "subagent");
+            ) === "subagent") ||
+            (isClaudeSessionSource(interaction.sessionSource) &&
+              hasClaudeSubagentMarker(interaction.request)));
 
-        // Check for title generation request (Claude Code)
-        if (interaction.isTitleGeneration && claudeCodeTitle === undefined) {
-          // Extract title from response
-          const response = interaction.response as {
-            content?: Array<{ text?: string }>;
-          };
-          claudeCodeTitle = interaction.preview
-            ? interaction.preview.claudeCodeTitle
-            : (response?.content?.[0]?.text ?? null);
+        // Check for title generation request (Claude Code / Claude Desktop)
+        if (interaction.isTitleGeneration) {
+          if (!claudeCodeTitle) {
+            claudeCodeTitle = interaction.preview
+              ? interaction.preview.claudeCodeTitle
+              : extractClaudeCodeTitle(interaction.response);
+          }
           continue;
         }
 
@@ -2852,9 +2970,8 @@ class InteractionModel {
         if (
           !lastMainInteraction &&
           (isGuardrail ||
-            (!isOpenCodeSideTurn &&
-              !interaction.isPromptSuggestion &&
-              !interaction.isTitleGeneration))
+            isOpenCodeSideTurn ||
+            (!interaction.isPromptSuggestion && !interaction.isTitleGeneration))
         ) {
           // Check if request has valid content - support both OpenAI/Anthropic and Gemini formats
           // We accept any interaction that has a valid request structure, not just text content.
@@ -2887,15 +3004,24 @@ class InteractionModel {
             (hasOpenAiContent ||
               hasResponsesContent ||
               hasGeminiContent ||
-              isLogContentNotStored(interaction.request))
+              isLogContentNotStored(interaction.request) ||
+              // Media, realtime and pass-through rows carry no message
+              // array; they are turns when their request summarises to text.
+              buildLastUserMessagePreview(
+                interaction.request,
+                interaction.type,
+              ) !== null)
           ) {
-            if (isGuardrail) guardrailTip ??= interaction;
-            else lastMainInteraction = interaction;
+            if (isGuardrail || isOpenCodeSideTurn) {
+              if (isGuardrail) guardrailTip ??= interaction;
+            } else {
+              lastMainInteraction = interaction;
+            }
           }
         }
 
-        // Early exit if we found both (undefined = not yet searched for title)
-        if (lastMainInteraction && claudeCodeTitle !== undefined) {
+        // Early exit if we found both (keep scanning if an earlier title-gen row had null text)
+        if (lastMainInteraction && claudeCodeTitle) {
           break;
         }
       }
@@ -2936,6 +3062,7 @@ class InteractionModel {
         // However many guardrail calls follow the last turn; a session of
         // nothing but them keeps the guardrail tip its sample found.
         skipGuardrails: true,
+        whereClause,
       });
       for (const [sessionKey, windowRows] of groupRowsBySession(deepRows)) {
         const deep = selectTip(windowRows);
@@ -2994,6 +3121,7 @@ class InteractionModel {
           : null,
         lastInteractionId: lastMainInteraction?.id ?? null,
         lastInteractionType: lastMainInteraction?.type ?? null,
+        attributionLabels: lastMainInteraction?.attributionLabels ?? null,
         contentNotStored: lastMainInteraction
           ? (lastMainInteraction.preview?.contentNotStored ??
             isLogContentNotStored(lastMainInteraction.request))
@@ -3020,12 +3148,14 @@ class InteractionModel {
     newest,
     oldest,
     skipGuardrails = false,
+    whereClause,
   }: {
     sessionKeys: string[];
     uuidKeys: string[];
     newest: number;
     oldest: number;
     skipGuardrails?: boolean;
+    whereClause: SQL | undefined;
   }): Promise<SessionWindowRow[]> {
     if (sessionKeys.length === 0) {
       return [];
@@ -3053,32 +3183,32 @@ class InteractionModel {
       oldest > 0
         ? sql`
         UNION ALL
-        (SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, type, created_at,
+        (SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, attribution_labels, type, created_at,
                 encrypted_chat_conversation_id
          FROM interactions
-         WHERE session_id = keys.key
+         WHERE session_id = keys.key AND ${whereClause ?? sql`true`}
          ORDER BY created_at ASC NULLS FIRST, id ASC
          LIMIT ${oldest})`
         : sql``;
     const newestFrom = skipGuardrails
       ? sql`(SELECT * FROM interactions
-             WHERE session_id = keys.key
+             WHERE session_id = keys.key AND ${whereClause ?? sql`true`}
              ORDER BY created_at DESC NULLS LAST, id DESC
              LIMIT ${GUARDRAIL_SKIP_SCAN_ROWS}) recent
            WHERE source IS NULL OR source NOT LIKE 'guardrail:%'`
-      : sql`interactions WHERE session_id = keys.key`;
+      : sql`interactions WHERE session_id = keys.key AND ${whereClause ?? sql`true`}`;
     const sessionlessBranch =
       uuidKeys.length > 0
         ? sql`
       UNION ALL
-      SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, type, created_at,
+      SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, attribution_labels, type, created_at,
              encrypted_chat_conversation_id
       FROM interactions
       WHERE id IN (${sql.join(
         uuidKeys.map((k) => sql`${k}::uuid`),
         sql`, `,
       )})
-        AND session_id IS NULL`
+        AND session_id IS NULL AND ${whereClause ?? sql`true`}`
         : sql``;
 
     // thread_id is selected so the chosen tip can be reconstructed from deltas.
@@ -3090,6 +3220,7 @@ class InteractionModel {
       thread_id: string | null;
       request: unknown;
       session_preview: unknown;
+      attribution_labels: AttributionLabels | null;
       type: string;
       // Raw SQL bypasses Drizzle's column mapping, so timestamps arrive as
       // whatever the driver hands back — a Date on one, a string on another.
@@ -3106,11 +3237,11 @@ class InteractionModel {
       -- insertion order (the same tiebreak the write path already uses to
       -- resolve a delta parent). Final ordering is applied in JS, since the
       -- per-key UNION below has no single ordering to inherit.
-      SELECT t.id, t.session_id, t.session_source, t.source, t.thread_id, t.request, t.session_preview, t.type,
+      SELECT t.id, t.session_id, t.session_source, t.source, t.thread_id, t.request, t.session_preview, t.attribution_labels, t.type,
              t.created_at, t.encrypted_chat_conversation_id
       FROM (SELECT DISTINCT k.key FROM unnest(ARRAY[${sessionKeyList}]::text[]) AS k(key)) keys
       CROSS JOIN LATERAL (
-        (SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, type, created_at,
+        (SELECT id, session_id, session_source, source, thread_id, CASE WHEN session_preview IS NULL THEN request ELSE NULL END AS request, session_preview, attribution_labels, type, created_at,
                 encrypted_chat_conversation_id
          FROM ${newestFrom}
          ORDER BY created_at DESC NULLS LAST, id DESC
@@ -3152,13 +3283,13 @@ class InteractionModel {
         threadId: row.thread_id,
         request: row.request,
         preview,
+        attributionLabels: row.attribution_labels,
         response: undefined,
         isTitleGeneration:
-          preview?.isTitleGeneration ??
-          requestText.includes("Please write a 5-10 word title"),
+          preview?.isTitleGeneration ?? hasTitleGenerationText(requestText),
         isPromptSuggestion:
           preview?.isPromptSuggestion ??
-          requestText.includes("prompt suggestion generator"),
+          requestText.includes(PROMPT_SUGGESTION_MARKER),
         type: row.type,
         createdAt: new Date(row.created_at).getTime(),
       });
@@ -3387,13 +3518,306 @@ class InteractionModel {
     `);
     return result.rows.map((row) => row.value);
   }
+
+  private static async write(params: {
+    data: InsertInteraction;
+    auditContext?: EncryptedChatAuditContext | null;
+    returnRow: boolean;
+  }) {
+    const { data, auditContext, returnRow } = params;
+    // Snapshot the environment from the agent at creation time (single funnel
+    // for all interaction writes) so per-environment cost-limit usage stays
+    // stable under later agent reassignment. The agent is authoritative: when a
+    // profile is present its current environment wins over any caller-supplied
+    // value. Only profile-less system interactions may set it explicitly.
+    const {
+      billingUsage,
+      billingAttribution,
+      autoRoutingDecisionId,
+      ...columns
+    } = data;
+    if (billingUsage && !billingAttribution)
+      throw new Error("Billing attribution is required for settlement");
+    // One cached read of the agent gives its environment and its
+    // organization's media setting.
+    const agentSettings = data.profileId
+      ? await AgentModel.findLogSettings(data.profileId)
+      : null;
+    const environmentId = billingAttribution
+      ? billingAttribution.environmentId
+      : data.profileId
+        ? (agentSettings?.environmentId ?? null)
+        : (data.environmentId ?? null);
+    // Enforced here, in the single funnel, so no writer can store content
+    // the deployment's Log Content mode withholds, or media the organization
+    // keeps out of its logs, whether the call came from Chat, an agent
+    // session or a client of the proxy.
+    const withheld = resolveLogContentMode() === "metadata_only";
+    const keepMedia =
+      withheld ||
+      (agentSettings?.keepMediaInLogs ??
+        (await OrganizationModel.keepsMediaInLogs({
+          organizationId: billingAttribution?.organizationId,
+          appId: data.appId,
+          connectorId: data.connectorId,
+          environmentId,
+        })));
+    const record = withheld
+      ? withholdInteractionContent(columns)
+      : keepMedia
+        ? columns
+        : withoutInteractionMedia(columns);
+    // A withheld row holds no content to encrypt under a conversation key, so
+    // it is written like the encrypted-chat fallback: unkeyed, marker in place.
+    const audit = withheld ? null : (auditContext ?? null);
+
+    // Sanitize JSONB fields to strip null bytes (\u0000) that PostgreSQL rejects
+    const sanitized = {
+      ...record,
+      environmentId,
+      request: stripUnstorableChars(record.request),
+      processedRequest: stripUnstorableChars(record.processedRequest),
+      response: stripUnstorableChars(record.response),
+    };
+
+    const claudeDesktopTitleDescription = !withheld
+      ? extractClaudeDesktopTitleDescription(sanitized.request)
+      : null;
+    if (claudeDesktopTitleDescription && sanitized.profileId) {
+      const matchedSession = await findMatchingClaudeDesktopMainSession({
+        profileId: sanitized.profileId,
+        userId: sanitized.userId ?? null,
+        currentSessionId: sanitized.sessionId ?? null,
+        description: claudeDesktopTitleDescription,
+      });
+      if (matchedSession) {
+        sanitized.sessionId = matchedSession.sessionId;
+        sanitized.sessionSource = matchedSession.sessionSource;
+      }
+    }
+
+    // Delta-encode Claude Code / Claude Desktop requests so we don't re-store the
+    // whole conversation on every row (no-op for all other interactions). Delta
+    // encoding stays active under content encryption: deltas are computed on
+    // plaintext before encryptInteractionContent runs below, and parent
+    // resolution matches on the always-plaintext hash columns.
+    //
+    // EncryptedChat rows are excluded outright. Today they could not qualify anyway
+    // (isEligible demands a Claude session source, and these are chat sources),
+    // but relying on that coincidence would be fragile: a delta chain mixes rows
+    // across requests and only the request that created a row carries its key,
+    // so a chain spanning keys could not be reconstructed by any reader.
+    //
+    // Withheld rows are excluded too: there is no conversation to share with
+    // a parent, and leaving their hash columns empty keeps a later full-content
+    // row from chaining onto a request that was never stored.
+    const { values, tip } =
+      audit || withheld
+        ? { values: sanitized, tip: null }
+        : await InteractionDeltaManager.encodeOnWrite(sanitized);
+
+    const interactionId = values.id ?? uuidv7();
+    const plaintext = {
+      ...values,
+      sessionPreview: buildSessionPreview(sanitized, values.request),
+    };
+    const insertValues = {
+      ...encryptInteractionContent({ ...plaintext }, audit),
+      id: interactionId,
+    };
+    const insert = async (tx?: Transaction) => {
+      const writer = tx ?? db;
+      const inserting = writer
+        .insert(schema.interactionsTable)
+        // Monotonic v7 id: created_at ties happen under load, and the delta
+        // manager's "most recent interaction" lookup breaks ties with the id.
+        .values(insertValues)
+        .onConflictDoNothing({ target: schema.interactionsTable.id });
+      const [created]: StoredInteractionKey[] = returnRow
+        ? await inserting.returning()
+        : await inserting.returning(interactionKeyColumns);
+      if (!created) {
+        const [existing] = await writer
+          .select()
+          .from(schema.interactionsTable)
+          .where(eq(schema.interactionsTable.id, interactionId));
+        if (
+          !existing ||
+          existing.userId !== (data.userId ?? null) ||
+          existing.profileId !== (data.profileId ?? null) ||
+          existing.appId !== (data.appId ?? null) ||
+          existing.connectorId !== (data.connectorId ?? null)
+        )
+          throw new Error(
+            "Interaction id was already used for different attribution",
+          );
+        return existing;
+      }
+      return created;
+    };
+    const routingUsage = routingUsageFor({
+      interactionId,
+      decisionId: autoRoutingDecisionId,
+      columns,
+    });
+    const write = (tx?: Transaction) =>
+      insertValues.userId == null
+        ? insert(tx)
+        : returnRow
+          ? InteractionUserActivityModel.append(insertValues, tx)
+          : InteractionUserActivityModel.appendReturningKey(insertValues, tx);
+    const interaction =
+      billingUsage && billingAttribution
+        ? await retainDeletedBillingAttribution({
+            values: insertValues,
+            run: () =>
+              retryOnceOnDeadlock(() =>
+                withDbTransaction(async (tx) => {
+                  const claimed = await InteractionBillingModel.claim({
+                    tx,
+                    interactionId,
+                    usage: billingUsage,
+                    attribution: billingAttribution,
+                    userId: data.userId ?? null,
+                    billingTeamId: data.billingTeamId ?? null,
+                    billingMode: data.billingMode ?? "metered",
+                    attributionLabels: data.attributionLabels,
+                    logIdentity: {
+                      profileId: data.profileId,
+                      appId: data.appId ?? null,
+                      connectorId: data.connectorId ?? null,
+                      serviceAccountId: data.serviceAccountId ?? null,
+                    },
+                  });
+                  if (!claimed) {
+                    const [existing] = await tx
+                      .select()
+                      .from(schema.interactionsTable)
+                      .where(eq(schema.interactionsTable.id, interactionId));
+                    if (existing) return existing;
+                  }
+                  if (claimed) {
+                    const [legacy] = await tx
+                      .select({ id: schema.interactionsTable.id })
+                      .from(schema.interactionsTable)
+                      .where(eq(schema.interactionsTable.id, interactionId));
+                    if (legacy)
+                      throw new Error(
+                        "Cannot settle an interaction already written without a billing receipt",
+                      );
+                  }
+                  if (routingUsage)
+                    await RoutingUsageModel.record(tx, routingUsage);
+                  const created = await write(tx);
+                  if (claimed && data.billingMode !== "subscription") {
+                    await LimitModel.settleBillableUsage({
+                      tx,
+                      usage: billingUsage,
+                      attribution: billingAttribution,
+                    });
+                  }
+                  return created;
+                }),
+              ),
+          })
+        : routingUsage
+          ? await withDbTransaction(async (tx) => {
+              await RoutingUsageModel.record(tx, routingUsage);
+              return write(tx);
+            })
+          : await write();
+    // The RETURNING row is create's public return value, so callers never
+    // see envelopes. Safe for encrypted-chat rows too: this caller supplied the
+    // very key that just encrypted them.
+    if (returnRow)
+      restoreWrittenInteractionContent(interaction, {
+        written: insertValues,
+        plaintext,
+        audit,
+      });
+
+    if (tip) {
+      InteractionDeltaManager.commitTip(interaction.id, tip);
+    }
+
+    if (
+      !withheld &&
+      !claudeDesktopTitleDescription &&
+      sanitized.sessionId &&
+      isClaudeSessionSource(sanitized.sessionSource) &&
+      sanitized.profileId &&
+      values.parentId == null &&
+      !hasAssistantTurn(sanitized.request)
+    ) {
+      await linkClaudeDesktopTitleInteractions({
+        profileId: sanitized.profileId,
+        userId: sanitized.userId ?? null,
+        sessionId: sanitized.sessionId,
+        sessionSource: sanitized.sessionSource ?? null,
+        request: sanitized.request,
+      });
+    }
+
+    // Update usage tracking after interaction is created
+    // Run in background to not block the response
+    if (!billingUsage)
+      trackBackgroundWork(
+        InteractionModel.updateUsageAfterInteraction(
+          returnRow
+            ? (interaction as InsertInteraction & { id: string })
+            : { ...plaintext, id: interaction.id },
+        ).catch((error) => {
+          logger.error(
+            { error },
+            `Failed to update usage tracking for interaction ${interaction.id}`,
+          );
+        }),
+      );
+
+    AgentUsageModel.recordUseInBackground({
+      agentId: interaction.profileId,
+      usedAt: interaction.createdAt,
+    });
+
+    return interaction;
+  }
 }
 
 export default InteractionModel;
 
+/** Usage an auto-routed interaction contributes to its decision; none without usage. */
+function routingUsageFor(params: {
+  interactionId: string;
+  decisionId: string | undefined;
+  columns: Pick<
+    InsertInteraction,
+    | "inputTokens"
+    | "inputTokensEstimated"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheWriteTokens"
+    | "cacheWrite1hTokens"
+  >;
+}): InsertRoutingUsage | null {
+  const { interactionId, decisionId, columns } = params;
+  if (!decisionId) return null;
+  if (columns.inputTokens == null && columns.outputTokens == null) return null;
+  return {
+    interactionId,
+    decisionId,
+    input: columns.inputTokens ?? 0,
+    cacheRead: columns.cacheReadTokens ?? 0,
+    cacheWrite: columns.cacheWriteTokens ?? 0,
+    cacheWrite1h: columns.cacheWrite1hTokens ?? 0,
+    output: columns.outputTokens ?? 0,
+    estimated: columns.inputTokensEstimated ?? false,
+  };
+}
+
 /** One interaction row sampled for a session's list entry. */
 type SessionWindowRow = {
   preview: InteractionSessionPreview | null;
+  attributionLabels: AttributionLabels | null;
   id: string;
   sessionId: string | null;
   sessionSource: string | null;
@@ -3477,30 +3901,100 @@ async function withReconstructedRequests<
  * Returns null when the request has no extractable user text or an
  * unsupported provider shape — the listing renders its fallback instead.
  */
+function isHarnessInjectedUserBlock(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return (
+    trimmed.startsWith("<system-reminder>") ||
+    trimmed.startsWith("<local-command-stdout>") ||
+    trimmed.startsWith("<local-command-stderr>") ||
+    trimmed.startsWith("<local-command-caveat>") ||
+    trimmed.startsWith("<command-name>") ||
+    trimmed.startsWith(
+      "Another Claude session sent a message:\n<agent-message",
+    ) ||
+    trimmed.startsWith("[handback-send-enforce]") ||
+    trimmed === "/branch"
+  );
+}
+
+function extractGenuineAnthropicUserMessage(request: unknown): string | null {
+  const messages = (
+    request as {
+      messages?: Array<{
+        role?: string;
+        content?: string | Array<{ type?: string; text?: string }>;
+      }>;
+    } | null
+  )?.messages;
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "user") continue;
+    if (typeof msg.content === "string") {
+      if (!isHarnessInjectedUserBlock(msg.content)) {
+        return msg.content.trim();
+      }
+      continue;
+    }
+    if (Array.isArray(msg.content)) {
+      for (let j = msg.content.length - 1; j >= 0; j--) {
+        const block = msg.content[j];
+        if (
+          block?.type === "text" &&
+          typeof block.text === "string" &&
+          !isHarnessInjectedUserBlock(block.text)
+        ) {
+          return block.text.trim();
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The session title's text: the last user message. A media row may keep
+ * what the user said on its response (the text a speech call spoke), so the
+ * response is read too when the caller has it.
+ */
 function buildLastUserMessagePreview(
   request: unknown,
   type: string,
+  response: unknown = {},
 ): string | null {
   try {
+    if (type === "anthropic:messages") {
+      const genuine = extractGenuineAnthropicUserMessage(request);
+      if (genuine) {
+        return truncatePreview(genuine);
+      }
+    }
     const interaction = new DynamicInteraction({
       request,
-      response: {},
+      response: response ?? {},
       type,
     } as never);
     const message = interaction.getLastUserMessage().trim();
     if (!message) {
       return null;
     }
-    let preview = message.slice(0, LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH);
-    // Don't leave half a surrogate pair at the truncation point.
-    const lastCode = preview.charCodeAt(preview.length - 1);
-    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
-      preview = preview.slice(0, -1);
-    }
-    return preview;
+    return truncatePreview(message);
   } catch {
     return null;
   }
+}
+
+function truncatePreview(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  let preview = trimmed.slice(0, LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH);
+  // Don't leave half a surrogate pair at the truncation point.
+  const lastCode = preview.charCodeAt(preview.length - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    preview = preview.slice(0, -1);
+  }
+  return preview;
 }
 
 /**
@@ -3550,6 +4044,40 @@ function parseInteractionAuthMethods(
     });
 }
 
+/**
+ * A thread's skeleton with every parent ahead of its children, keeping the
+ * listed (created_at, id) order otherwise. The fold needs parents first, and
+ * timestamps alone do not promise it: a clock stepping back between two
+ * inserts, or rows restored with their own timestamps, can put a child first.
+ */
+function parentsFirst(rows: ThreadSkeletonRow[]): ThreadSkeletonRow[] {
+  const members = new Map(rows.map((row) => [row.id, row]));
+  const children = new Map<string, ThreadSkeletonRow[]>();
+  const roots: ThreadSkeletonRow[] = [];
+  for (const row of rows) {
+    if (row.parent_id !== null && members.has(row.parent_id)) {
+      const siblings = children.get(row.parent_id) ?? [];
+      siblings.push(row);
+      children.set(row.parent_id, siblings);
+    } else {
+      roots.push(row);
+    }
+  }
+  // Depth first from each root, siblings in listed order. Iterative: a thread
+  // can be thousands of rows deep.
+  const ordered: ThreadSkeletonRow[] = [];
+  const stack = roots.reverse();
+  while (stack.length > 0) {
+    const row = stack.pop() as ThreadSkeletonRow;
+    ordered.push(row);
+    const next = children.get(row.id);
+    if (next) {
+      for (let i = next.length - 1; i >= 0; i--) stack.push(next[i]);
+    }
+  }
+  return ordered;
+}
+
 /** Derive text from the full request and classify the stored delta suffix. */
 function buildSessionPreview(
   data: InsertInteraction,
@@ -3560,33 +4088,398 @@ function buildSessionPreview(
     input?: unknown[];
     contents?: unknown[];
   };
-  const text = isGuardrailSource(data.source ?? null)
-    ? ""
-    : (JSON.stringify(request) ?? "");
-  const isTitleGeneration = text.includes("Please write a 5-10 word title");
-  const response = data.response as { content?: Array<{ text?: string }> };
+  const markers = isGuardrailSource(data.source ?? null)
+    ? new Set<string>()
+    : findMarkers(request, SESSION_PREVIEW_MARKERS);
+  const isTitleGeneration = hasTitleGenerationMarker(markers);
   const contentNotStored = isLogContentNotStored(request);
+  const lastUserMessagePreview = buildLastUserMessagePreview(
+    data.request,
+    data.type,
+    data.response,
+  );
   return {
     hasContent:
       [request?.messages, request?.input, request?.contents].some(
         (value) => Array.isArray(value) && value.length > 0,
-      ) || contentNotStored,
+      ) ||
+      contentNotStored ||
+      // Media, realtime and pass-through rows carry no message array; they
+      // are turns when their request summarises to text.
+      lastUserMessagePreview !== null,
     isTitleGeneration,
-    isPromptSuggestion: text.includes("prompt suggestion generator"),
+    isPromptSuggestion: markers.has(PROMPT_SUGGESTION_MARKER),
     isOpenCodeSideTurn:
-      isOpenCodeFamilySessionSource(data.sessionSource ?? null) &&
-      computeRequestType(
-        request,
-        data.sessionSource ?? null,
-        data.source ?? null,
-      ) === "subagent",
+      (isOpenCodeFamilySessionSource(data.sessionSource ?? null) &&
+        computeRequestType(
+          request,
+          data.sessionSource ?? null,
+          data.source ?? null,
+        ) === "subagent") ||
+      (isClaudeSessionSource(data.sessionSource ?? null) &&
+        hasClaudeSubagentMarker(data.request)),
     contentNotStored,
-    lastUserMessagePreview: buildLastUserMessagePreview(
-      data.request,
-      data.type,
-    ),
+    lastUserMessagePreview,
     claudeCodeTitle: isTitleGeneration
-      ? (response?.content?.[0]?.text ?? null)
+      ? extractClaudeCodeTitle(data.response)
       : null,
+    ...(contentNotStored
+      ? { responseToolNames: [], responseTextPreview: null }
+      : buildResponsePreview(data)),
   };
+}
+
+const TITLE_GENERATION_MARKER = "Please write a 5-10 word title";
+const CLAUDE_DESKTOP_TITLE_GENERATION_MARKER =
+  "You are coming up with a succinct title";
+const CLAUDE_DESKTOP_TITLE_SYSTEM_MARKER =
+  "You write short session titles. Reply with only the tagged fields the prompt asks for.";
+const PROMPT_SUGGESTION_MARKER = "prompt suggestion generator";
+const SESSION_PREVIEW_MARKERS = [
+  TITLE_GENERATION_MARKER,
+  CLAUDE_DESKTOP_TITLE_GENERATION_MARKER,
+  CLAUDE_DESKTOP_TITLE_SYSTEM_MARKER,
+  PROMPT_SUGGESTION_MARKER,
+];
+
+function hasTitleGenerationMarker(markers: Set<string>): boolean {
+  return (
+    markers.has(TITLE_GENERATION_MARKER) ||
+    markers.has(CLAUDE_DESKTOP_TITLE_GENERATION_MARKER) ||
+    markers.has(CLAUDE_DESKTOP_TITLE_SYSTEM_MARKER)
+  );
+}
+
+function hasTitleGenerationText(text: string): boolean {
+  return (
+    text.includes(TITLE_GENERATION_MARKER) ||
+    text.includes(CLAUDE_DESKTOP_TITLE_GENERATION_MARKER) ||
+    text.includes(CLAUDE_DESKTOP_TITLE_SYSTEM_MARKER)
+  );
+}
+
+function extractClaudeCodeTitle(response: unknown): string | null {
+  const content = (
+    response as { content?: Array<{ type?: string; text?: string }> } | null
+  )?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (typeof block?.text !== "string") continue;
+    const raw = block.text.trim();
+    if (!raw) continue;
+    const tagged = /<title>([\s\S]*?)<\/title>/i.exec(raw)?.[1]?.trim();
+    return tagged !== undefined ? tagged || null : raw;
+  }
+  return null;
+}
+
+function extractClaudeDesktopTitleDescription(request: unknown): string | null {
+  if (
+    !hasTitleGenerationMarker(findMarkers(request, SESSION_PREVIEW_MARKERS))
+  ) {
+    return null;
+  }
+  const messages = (
+    request as {
+      messages?: Array<{
+        role?: string;
+        content?: string | Array<{ text?: string; type?: string }>;
+      }>;
+    } | null
+  )?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const text = getMessageText(messages[0]?.content);
+  const match =
+    /<description>((?:(?!<description>)[\s\S])*?)<\/description>/i.exec(text);
+  const description = match?.[1]?.trim();
+  return description ? description : null;
+}
+
+function extractClaudeOpeningPrompts(request: unknown): string[] {
+  const messages = (
+    request as {
+      messages?: Array<{
+        role?: string;
+        content?: string | Array<{ text?: string; type?: string }>;
+      }>;
+    } | null
+  )?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const firstUser = messages.find((m) => m?.role === "user") ?? messages[0];
+  const content = firstUser?.content;
+  const candidates = new Set<string>();
+  const joined = getMessageText(content).trim();
+  if (joined) candidates.add(joined);
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (typeof block?.text === "string") {
+        const trimmed = block.text.trim();
+        if (trimmed && !trimmed.startsWith("<system-reminder>")) {
+          candidates.add(trimmed);
+        }
+      }
+    }
+  }
+  return [...candidates];
+}
+
+function claudePromptMatchesTitleDescription(
+  openingPrompts: string[],
+  description: string,
+): boolean {
+  return openingPrompts.some(
+    (prompt) => prompt === description || prompt.startsWith(description),
+  );
+}
+
+function hasAssistantTurn(request: unknown): boolean {
+  const messages = (request as { messages?: Array<{ role?: string }> } | null)
+    ?.messages;
+  return (
+    Array.isArray(messages) && messages.some((m) => m?.role === "assistant")
+  );
+}
+
+async function findMatchingClaudeDesktopMainSession(params: {
+  profileId: string;
+  userId: string | null;
+  currentSessionId: string | null;
+  description: string;
+}): Promise<{ sessionId: string; sessionSource: string | null } | null> {
+  try {
+    const t = schema.interactionsTable;
+    const rows = await db
+      .select({
+        id: t.id,
+        sessionId: t.sessionId,
+        sessionSource: t.sessionSource,
+        request: t.request,
+        encryptedChatConversationId: t.encryptedChatConversationId,
+      })
+      .from(t)
+      .where(
+        and(
+          eq(t.profileId, params.profileId),
+          params.userId ? eq(t.userId, params.userId) : isNull(t.userId),
+          sql`${t.createdAt} >= now() - interval '5 minutes'`,
+          isNotNull(t.sessionId),
+          isNull(t.parentId),
+          isNull(t.encryptedChatConversationId),
+        ),
+      )
+      .orderBy(desc(t.createdAt), desc(t.id))
+      .limit(10);
+    for (const row of rows) {
+      if (!row.sessionId || row.sessionId === params.currentSessionId) continue;
+      if (!isClaudeSessionSource(row.sessionSource)) continue;
+      readInteractionRow(row);
+      if (hasAssistantTurn(row.request)) continue;
+      if (extractClaudeDesktopTitleDescription(row.request)) continue;
+      const prompts = extractClaudeOpeningPrompts(row.request);
+      if (claudePromptMatchesTitleDescription(prompts, params.description)) {
+        return {
+          sessionId: row.sessionId,
+          sessionSource: row.sessionSource,
+        };
+      }
+    }
+  } catch (error) {
+    logger.warn(
+      { error, profileId: params.profileId },
+      "Failed to look up matching Claude Desktop main session for title request",
+    );
+  }
+  return null;
+}
+
+async function linkClaudeDesktopTitleInteractions(params: {
+  profileId: string;
+  userId: string | null;
+  sessionId: string;
+  sessionSource: string | null;
+  request: unknown;
+}): Promise<void> {
+  const openingPrompts = extractClaudeOpeningPrompts(params.request);
+  if (openingPrompts.length === 0) return;
+  try {
+    const t = schema.interactionsTable;
+    const rows = await db
+      .select({
+        id: t.id,
+        sessionId: t.sessionId,
+        request: t.request,
+        encryptedChatConversationId: t.encryptedChatConversationId,
+      })
+      .from(t)
+      .where(
+        and(
+          eq(t.profileId, params.profileId),
+          params.userId ? eq(t.userId, params.userId) : isNull(t.userId),
+          sql`${t.createdAt} >= now() - interval '5 minutes'`,
+          or(
+            isNull(t.sessionId),
+            and(
+              sql`${t.sessionId} <> ${params.sessionId}`,
+              sql`NOT EXISTS (SELECT 1 FROM ${t} i2 WHERE i2.session_id = ${t.sessionId} AND i2.id <> ${t.id})`,
+            ),
+          ),
+          isNull(t.parentId),
+          isNull(t.encryptedChatConversationId),
+        ),
+      )
+      .orderBy(desc(t.createdAt), desc(t.id))
+      .limit(15);
+    const matchedIds: string[] = [];
+    for (const row of rows) {
+      readInteractionRow(row);
+      const description = extractClaudeDesktopTitleDescription(row.request);
+      if (
+        description &&
+        claudePromptMatchesTitleDescription(openingPrompts, description)
+      ) {
+        matchedIds.push(row.id);
+      }
+    }
+    if (matchedIds.length === 0) return;
+    await db
+      .update(t)
+      .set({
+        sessionId: params.sessionId,
+        sessionSource: params.sessionSource,
+      })
+      .where(inArray(t.id, matchedIds));
+    await db.execute(sql`
+      DELETE FROM interaction_session_heads
+      WHERE last_interaction_id IN (${sql.join(
+        matchedIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )})
+        AND session_key <> ${params.sessionId}
+    `);
+    sessionTotalCache.clear();
+  } catch (error) {
+    logger.warn(
+      { error, profileId: params.profileId, sessionId: params.sessionId },
+      "Failed to link Claude Desktop title generation interaction to main session",
+    );
+  }
+}
+
+/**
+ * Markers found in any string of a stored request. Walking the strings finds
+ * the same markers as searching its JSON, since none contains a character JSON
+ * escapes, without serializing a large conversation on every write.
+ */
+function findMarkers(value: unknown, markers: string[]): Set<string> {
+  const found = new Set<string>();
+  const pending: unknown[] = [value];
+  while (pending.length && found.size < markers.length) {
+    const next = pending.pop();
+    if (typeof next === "string") {
+      for (const marker of markers)
+        if (next.includes(marker)) found.add(marker);
+    } else if (Array.isArray(next)) {
+      for (const item of next) pending.push(item);
+    } else if (next && typeof next === "object") {
+      for (const [key, item] of Object.entries(next)) pending.push(key, item);
+    }
+  }
+  return found;
+}
+
+/** The tools a response asked for, else the start of its reply. */
+function buildResponsePreview(
+  data: InsertInteraction,
+): Pick<
+  InteractionSessionPreview,
+  "responseToolNames" | "responseTextPreview"
+> {
+  try {
+    const interaction = new DynamicInteraction({
+      request: data.request,
+      response: data.response,
+      type: data.type,
+    } as never);
+    const responseToolNames = interaction.getToolNamesRequested();
+    return {
+      responseToolNames,
+      responseTextPreview:
+        responseToolNames.length > 0
+          ? null
+          : truncatePreview(interaction.getLastAssistantResponse()),
+    };
+  } catch {
+    return { responseToolNames: [], responseTextPreview: null };
+  }
+}
+
+/** Retry only failed log foreign keys; admission attribution stays in the receipt. */
+async function retainDeletedBillingAttribution<T>(params: {
+  values: typeof schema.interactionsTable.$inferInsert;
+  run: () => Promise<T>;
+}): Promise<T> {
+  const columns = getTableColumns(schema.interactionsTable);
+  const foreignKeys = getTableConfig(schema.interactionsTable).foreignKeys;
+  const clearedConstraints = new Set<string>();
+  // Each retry clears a nullable log reference. Unknown constraints fail
+  // immediately; each constraint can be cleared only once.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await params.run();
+    } catch (error) {
+      let detail: unknown = error;
+      for (
+        let depth = 0;
+        depth < 5 &&
+        detail &&
+        typeof detail === "object" &&
+        !("constraint" in detail);
+        depth++
+      )
+        detail = "cause" in detail ? detail.cause : null;
+      if (
+        !detail ||
+        typeof detail !== "object" ||
+        !("code" in detail) ||
+        detail.code !== "23503" ||
+        !("constraint" in detail) ||
+        typeof detail.constraint !== "string" ||
+        clearedConstraints.has(detail.constraint) ||
+        attempt >= foreignKeys.length
+      )
+        throw error;
+      const missing = foreignKeys
+        .find((key) => key.getName() === detail.constraint)
+        ?.reference().columns;
+      if (!missing?.length || missing.some((column) => column.notNull))
+        throw error;
+      clearedConstraints.add(detail.constraint);
+      for (const column of missing) {
+        const key = Object.entries(columns).find(
+          ([, value]) => value.name === column.name,
+        )?.[0];
+        if (!key) throw error;
+        Reflect.set(params.values, key, null);
+      }
+      logger.info(
+        { constraint: detail.constraint },
+        "Cleared deleted log reference; retained admitted billing attribution",
+      );
+    }
+  }
+}
+
+/** One entry per distinct credential source, organizations first. */
+function dedupeCopilotSources(
+  sources: CopilotCredentialSource[],
+): CopilotCredentialSource[] {
+  const seen = new Map<string, CopilotCredentialSource>();
+  for (const source of sources) {
+    const key =
+      source.kind === "organization"
+        ? `org:${source.organization ?? ""}`
+        : "personal";
+    seen.set(key, source);
+  }
+  return [...seen.values()].sort((a, b) => a.kind.localeCompare(b.kind));
 }

@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { HttpResponse, http } from "msw";
 import { assert, vi } from "vitest";
 import { A2AProtocolRole } from "@/agents/a2a/a2a-protocol";
+import { settleFailedA2ATask } from "@/agents/a2a/a2a-task-settlement";
 import { serviceAccountUserId } from "@/auth/service-account-user-id";
 import config from "@/config";
 import db, { schema } from "@/database";
@@ -24,6 +25,7 @@ import {
 } from "@/models";
 import MemberModel from "@/models/member";
 import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
+import ServiceAccountModel from "@/models/service-account";
 import { claudeCodeAccountManager } from "@/services/agent-runtime/claude-code-account";
 import { resolveAgentRuntimeCredentials } from "@/services/agent-runtime/credentials";
 import { resolveAgentRuntime } from "@/services/agent-runtime/pod-run";
@@ -36,6 +38,7 @@ import {
 import { projectService } from "@/services/project";
 import { ResourcePermissions } from "@/services/resource-permissions";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { setupTestCacheManager } from "@/test/cache-manager";
 import { useMswServer } from "@/test/msw";
 import { shareForTest } from "@/test/sharing";
 import { grantRoleEverywhere } from "@/test/wildcard-grants";
@@ -49,6 +52,8 @@ vi.mock("@/services/agent-runtime/start-task", () => ({
 
 // biome-ignore lint/correctness/useHookAtTopLevel: Vitest lifecycle helper.
 const oauthServer = useMswServer();
+// Transfer tickets live in the shared cache so any replica can redeem them.
+setupTestCacheManager();
 
 describe("Agent Runtime routes", () => {
   let app: FastifyInstanceWithZod;
@@ -96,7 +101,6 @@ describe("Agent Runtime routes", () => {
         backend: "kubernetes",
         steerMode: "pipe",
         privileged: false,
-        resources: null,
         environment: null,
         credentials: [
           {
@@ -605,6 +609,18 @@ describe("Agent Runtime routes", () => {
       description: null,
     });
     vi.mocked(startDetachedAgentTask).mockResolvedValue(task);
+    // A limit above the Agent's is refused with the maximum named, before
+    // any task exists.
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agent.id}/runs`,
+      payload: { message: "Start", limits: { tier: "L" } },
+    });
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(refused.json().error.message).toContain(
+      "Tier L is above this Agent's largest tier M",
+    );
+    expect(startDetachedAgentTask).not.toHaveBeenCalled();
 
     const response = await app.inject({
       method: "POST",
@@ -612,6 +628,7 @@ describe("Agent Runtime routes", () => {
       payload: {
         message: "Implement the requested change.",
         projectId: project.id,
+        limits: { tier: "S", maxDurationHours: 2 },
         systemParams: expect.objectContaining({
           source: "chat",
           runtimeMode: "interactive",
@@ -634,6 +651,12 @@ describe("Agent Runtime routes", () => {
       prompt: "Implement the requested change.",
       projectId: project.id,
       state: "TASK_STATE_SUBMITTED",
+      limits: {
+        tier: "S",
+        idleTimeoutMinutes: config.agentRuntime.defaultIdleTimeoutMinutes,
+        maxDurationHours: 2,
+        maxCostUsd: null,
+      },
     });
     expect(startDetachedAgentTask).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -644,7 +667,13 @@ describe("Agent Runtime routes", () => {
         },
         agentId: agent.id,
         message: "Implement the requested change.",
-        systemParams: expect.objectContaining({ projectId: project.id }),
+        systemParams: expect.objectContaining({
+          projectId: project.id,
+          runtimeLimits: expect.objectContaining({
+            tier: "S",
+            maxDurationHours: 2,
+          }),
+        }),
         attachments: [
           {
             name: "requirements.txt",
@@ -684,6 +713,72 @@ describe("Agent Runtime routes", () => {
       "Implement the requested change",
     );
     expect(JSON.stringify(audit)).not.toContain("requirements.txt");
+  });
+
+  test("exposes a classified failure on run reads and leaves other runs without one", async () => {
+    const failed = await createTask(agent.id);
+    await createRun({ taskId: failed.id, actorUserId: user.id });
+    await settleFailedA2ATask({
+      taskId: failed.id,
+      contextId: failed.contextId,
+      statusReason: "The Agent Runtime pod failed.\nReason: Evicted",
+      failure: { code: "pod.evicted", retriable: true },
+    });
+    // A failure settled before classification existed.
+    const legacy = await createTask(agent.id);
+    await createRun({ taskId: legacy.id, actorUserId: user.id });
+    await settleFailedA2ATask({
+      taskId: legacy.id,
+      contextId: legacy.contextId,
+      statusReason: "The Agent Runtime turn exited with status 1",
+    });
+    const running = await createTask(agent.id);
+    await createRun({ taskId: running.id, actorUserId: user.id });
+
+    const expected = {
+      code: "pod.evicted",
+      retriable: true,
+      message: "The Agent Runtime pod failed.\nReason: Evicted",
+    };
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/agent-runs/${failed.id}`,
+    });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      state: "TASK_STATE_FAILED",
+      statusReason: expected.message,
+      failure: expected,
+    });
+    // The LLM trace is keyed by the frozen run name the runtime sends.
+    expect(detail.json().llmSessionId).toBe(detail.json().workloadName);
+    for (const taskId of [legacy.id, running.id]) {
+      const other = await app.inject({
+        method: "GET",
+        url: `/api/agent-runs/${taskId}`,
+      });
+      expect(other.json().failure).toBeNull();
+    }
+
+    const mine = await app.inject({ method: "GET", url: "/api/agent-runs" });
+    expect(mine.statusCode, mine.body).toBe(200);
+    const agentRuns = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agent.id}/runs`,
+    });
+    expect(agentRuns.statusCode, agentRuns.body).toBe(200);
+    for (const rows of [
+      mine.json().data as Array<{ taskId: string; failure: unknown }>,
+      agentRuns.json() as Array<{ taskId: string; failure: unknown }>,
+    ]) {
+      expect(
+        Object.fromEntries(rows.map((row) => [row.taskId, row.failure])),
+      ).toEqual({
+        [failed.id]: expected,
+        [legacy.id]: null,
+        [running.id]: null,
+      });
+    }
   });
 
   test("does not start a run inside a project the caller cannot read", async ({
@@ -773,6 +868,9 @@ describe("Agent Runtime routes", () => {
     });
 
     expect(response.statusCode).toBe(200);
+    const [ownRun] = response.json().data;
+    // The LLM trace is keyed by the frozen run name the runtime sends.
+    expect(ownRun.llmSessionId).toBe(ownRun.workloadName);
     expect(response.json().data).toEqual([
       expect.objectContaining({
         taskId: ownTask.id,
@@ -2389,6 +2487,183 @@ describe("Agent Runtime routes", () => {
       "retained transcript",
     );
   });
+  test("names service-account runs and exposes terminal access only to their account managers", async ({
+    makeServiceAccount,
+    makeCustomRole,
+  }) => {
+    const account = await makeServiceAccount(organizationId, {
+      name: "Build automation",
+    });
+    const task = await A2ATaskModel.create({
+      contextId: (
+        await A2AContextModel.create({
+          actorKind: "serviceAccount",
+          actorId: account.id,
+        })
+      ).id,
+      agentId: agent.id,
+      state: "TASK_STATE_WORKING",
+    });
+    await AgentRunModel.create({
+      organizationId,
+      taskId: task.id,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      actorUserId: null,
+      workloadName: `agent-run-${task.id}`,
+      backend: "kubernetes",
+      runtimeScope: "archestra-dev",
+    });
+    const role = await makeCustomRole(organizationId, { permission: {} });
+    await MemberModel.updateRole(user.id, organizationId, role.role);
+    const agentKey = {
+      organizationId,
+      resource: "agent" as const,
+      scope: agent.id,
+    };
+    const policy = await ResourcePermissionPolicyModel.find(agentKey);
+    await ResourcePermissionPolicyModel.replace({
+      ...agentKey,
+      revision: policy?.revision ?? 0,
+      grants: [
+        { subject: { type: "user", id: user.id }, actions: ["read", "use"] },
+      ],
+    });
+    const list = () => app.inject({ url: `/api/agents/${agent.id}/runs` });
+    const before = await list();
+    expect(before.statusCode, before.body).toBe(200);
+    expect(before.json()[0]).toMatchObject({
+      initiatorName: "Build automation",
+      canAttach: false,
+    });
+    expect(
+      (await app.inject({ url: `/api/agent-runs/${task.id}` })).statusCode,
+    ).toBe(404);
+    await ResourcePermissionPolicyModel.replace({
+      organizationId,
+      resource: "serviceAccount",
+      scope: account.id,
+      revision: 0,
+      grants: [{ subject: { type: "user", id: user.id }, actions: ["update"] }],
+    });
+    expect((await list()).json()[0]).toMatchObject({ canAttach: true });
+    const detail = await app.inject({ url: `/api/agent-runs/${task.id}` });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      canAttach: true,
+      viewerRole: "shared",
+    });
+    const original = await AgentRunModel.findByTaskId(task.id);
+    assert(original);
+    for (let i = 0; i < 4; i++) {
+      const repeatedTask = await A2ATaskModel.create({
+        contextId: task.contextId,
+        agentId: agent.id,
+        state: "TASK_STATE_WORKING",
+      });
+      await AgentRunModel.create({
+        ...original,
+        id: undefined,
+        taskId: repeatedTask.id,
+        workloadName: `agent-run-${repeatedTask.id}`,
+      });
+    }
+    const endedTask = await A2ATaskModel.create({
+      contextId: task.contextId,
+      agentId: agent.id,
+      state: "TASK_STATE_COMPLETED",
+    });
+    const endedRun = await AgentRunModel.create({
+      ...original,
+      id: undefined,
+      taskId: endedTask.id,
+      workloadName: `agent-run-${endedTask.id}`,
+    });
+    await AgentRunModel.close({ id: endedRun.id, logs: "done" });
+    // Count calls without replacing their implementation: authorization and storage stay real.
+    const accounts = vi.spyOn(ServiceAccountModel, "findAccount");
+    const permissions = vi.spyOn(ResourcePermissions, "allows");
+    const repeated = await list();
+    expect(repeated.statusCode, repeated.body).toBe(200);
+    expect(
+      repeated.json().filter((row: { canAttach: boolean }) => row.canAttach),
+    ).toHaveLength(5);
+    expect(accounts).toHaveBeenCalledTimes(1);
+    expect(
+      permissions.mock.calls.filter(
+        ([request]) => request.resource === "agent" && request.action === "use",
+      ),
+    ).toHaveLength(1);
+    expect(
+      repeated
+        .json()
+        .find((row: { taskId: string }) => row.taskId === endedTask.id)
+        .canAttach,
+    ).toBe(false);
+    const currentTask = await A2ATaskModel.create({
+      contextId: task.contextId,
+      agentId: agent.id,
+      state: "TASK_STATE_WORKING",
+    });
+    await AgentRunModel.create({
+      ...original,
+      id: undefined,
+      taskId: currentTask.id,
+    });
+    await AgentWorkspaceModel.create({
+      organizationId,
+      agentId: agent.id,
+      actorKind: "serviceAccount",
+      actorId: account.id,
+      backend: "kubernetes",
+      runtimeScope: original.runtimeScope,
+      workloadName: original.workloadName,
+      state: "active",
+      activeTaskId: currentTask.id,
+      lastTaskId: currentTask.id,
+      expiresAt: new Date(Date.now() + 3600000),
+    });
+    const currentDetail = await app.inject({
+      url: `/api/agent-runs/${task.id}`,
+    });
+    expect(currentDetail.statusCode, currentDetail.body).toBe(200);
+    expect(currentDetail.json()).toMatchObject({
+      taskId: currentTask.id,
+      canAttach: true,
+      viewerRole: "shared",
+    });
+    // Terminal access does not confer ownership or workspace mutation.
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/agent-runs/${task.id}`,
+          payload: { title: "changed" },
+        })
+      ).statusCode,
+    ).toBe(404);
+    const accountKey = {
+      organizationId,
+      resource: "serviceAccount" as const,
+      scope: account.id,
+    };
+    const accountPolicy = await ResourcePermissionPolicyModel.find(accountKey);
+    await ResourcePermissionPolicyModel.replace({
+      ...accountKey,
+      revision: accountPolicy?.revision ?? 0,
+      grants: [],
+    });
+    expect(
+      (await list())
+        .json()
+        .some((row: { canAttach: boolean }) => row.canAttach),
+    ).toBe(false);
+    expect(
+      (await app.inject({ url: `/api/agent-runs/${task.id}` })).statusCode,
+    ).toBe(404);
+  });
+
   async function createTask(agentId: string, stateChangedAt?: Date) {
     const context = await A2AContextModel.create({
       actorKind: "user",

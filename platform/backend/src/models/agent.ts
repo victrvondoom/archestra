@@ -45,9 +45,17 @@ import {
 } from "drizzle-orm";
 import { type AnyPgColumn, alias, unionAll } from "drizzle-orm/pg-core";
 import { z } from "zod";
+import {
+  canUseAgent,
+  dropHiddenAgents,
+  dropHiddenTools,
+  gatedAgentsFence,
+  isPermissionGatedAgent,
+} from "@/auth/permission-gated";
 import { LRUCacheManager } from "@/cache-manager";
 import config from "@/config";
 import db, { schema, type Transaction, withDbTransaction } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
 import { notDeleted } from "@/database/schemas/soft-deletable-table";
 import { hardDelete, restore, softDelete } from "@/database/soft-delete";
 import {
@@ -60,6 +68,7 @@ import { qualified } from "@/database/utils/qualified-column";
 import { enterpriseTier } from "@/enterprise-tier";
 import logger from "@/logging";
 import { registerProcessLocalCache } from "@/process-local-cache-registry";
+import { readConfig } from "@/services/config-cache";
 import {
   type Agent,
   type AgentAccessContext,
@@ -102,6 +111,7 @@ import AgentToolModel from "./agent-tool";
 import AgentUserModel from "./agent-user";
 import AgentVersionModel from "./agent-version";
 import CreatedByModel from "./created-by";
+import { gatewayAgentSelection } from "./gateway-agent-selection";
 import { idArrayCondition } from "./id-array-condition";
 import InteractionUserActivityModel from "./interaction-user-activity";
 import OrganizationModel from "./organization";
@@ -534,6 +544,39 @@ class AgentModel {
   /**
    * Populate author identity on agents by looking up users in one batch.
    */
+  /**
+   * The fields tool resolution reads repeatedly during one call, read together
+   * once per request scope. Outside a memoizing request this is a fresh read,
+   * so a changed setting applies to the next call.
+   */
+  private static findToolAccessFields(id: string): Promise<{
+    environmentId: string | null;
+    accessAllTools: boolean;
+    keepMediaInLogs: boolean | null;
+  } | null> {
+    return readConfig(`agent-tool-access\0${id}`, async () => {
+      // The organization's media setting rides along so each log write learns
+      // it from the read it already makes; an organization change drops the
+      // cached entry like an agent change does.
+      const [result] = await db
+        .select({
+          environmentId: schema.agentsTable.environmentId,
+          accessAllTools: schema.agentsTable.accessAllTools,
+          keepMediaInLogs: schema.organizationsTable.keepMediaInLogs,
+        })
+        .from(schema.agentsTable)
+        .leftJoin(
+          schema.organizationsTable,
+          eq(schema.organizationsTable.id, schema.agentsTable.organizationId),
+        )
+        .where(
+          and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)),
+        )
+        .limit(1);
+      return result ?? null;
+    });
+  }
+
   private static async populateAuthorNames(
     agents: Pick<
       Agent,
@@ -725,6 +768,8 @@ class AgentModel {
       // but a real column create() honours for internal callers and fixtures.
       accessAllSkills?: boolean;
       slug?: string;
+      /** A fixed id for a system-seeded agent; random otherwise. */
+      id?: string;
     },
     authorId?: string,
     options?: {
@@ -1241,8 +1286,15 @@ class AgentModel {
   }
 
   /** The delegation canvas needs nodes, not editable agents or their assigned tools. */
-  static async findDelegationGraphNodes(organizationId: string) {
+  static async findDelegationGraphNodes(
+    organizationId: string,
+    userId: string,
+  ) {
     const table = schema.agentsTable;
+    const fence = await gatedAgentsFence({
+      userId,
+      organizationIds: [organizationId],
+    });
     return db
       .select({ id: table.id, name: table.name, agentType: table.agentType })
       .from(table)
@@ -1251,6 +1303,7 @@ class AgentModel {
           eq(table.organizationId, organizationId),
           eq(table.agentType, "agent"),
           notDeleted(table),
+          fence,
         ),
       )
       .orderBy(desc(table.createdAt), desc(table.id));
@@ -1363,6 +1416,7 @@ class AgentModel {
         defaultNamespace: schema.organizationsTable.defaultEnvironmentNamespace,
         environmentPolicy: schema.environmentsTable.networkPolicy,
         defaultPolicy: schema.organizationsTable.defaultNetworkPolicy,
+        agentRuntimeTiers: schema.organizationsTable.agentRuntimeTiers,
       })
       .from(schema.agentsTable)
       .innerJoin(recentRuns, eq(recentRuns.agentId, schema.agentsTable.id))
@@ -1413,6 +1467,27 @@ class AgentModel {
           notDeleted(schema.agentsTable),
         ),
       );
+  }
+
+  /** Agents auto routing applies to: no model, key, pool or runtime of their own. */
+  static async countFollowingOrganizationRouting(
+    organizationId: string,
+  ): Promise<number> {
+    const [row] = await db
+      .select({ total: count() })
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.organizationId, organizationId),
+          eq(schema.agentsTable.agentType, "agent"),
+          isNull(schema.agentsTable.llmApiKeyId),
+          isNull(schema.agentsTable.modelId),
+          isNull(schema.agentsTable.modelPoolId),
+          isNull(schema.agentsTable.runtime),
+          notDeleted(schema.agentsTable),
+        ),
+      );
+    return row?.total ?? 0;
   }
 
   static async findRuntimeTargets(organizationId: string) {
@@ -2246,6 +2321,10 @@ class AgentModel {
       getAgentStatusCondition(filters?.status ?? "active"),
       ...(userId && !readThroughGrant ? [agentListFence(principals)] : []),
     ];
+    if (userId) {
+      const fence = await callerAgentsFence(userId, principals);
+      if (fence) whereConditions.push(fence);
+    }
 
     if (filters?.organizationId) {
       whereConditions.push(
@@ -2920,13 +2999,22 @@ class AgentModel {
   }
 
   static async findEnvironmentId(id: string): Promise<string | null> {
-    const [result] = await db
-      .select({ environmentId: schema.agentsTable.environmentId })
-      .from(schema.agentsTable)
-      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
-      .limit(1);
+    return (await AgentModel.findToolAccessFields(id))?.environmentId ?? null;
+  }
 
-    return result?.environmentId ?? null;
+  /**
+   * What a log row written for this agent needs: its environment, and whether
+   * its organization keeps media in logs (null when the agent is not found).
+   */
+  static async findLogSettings(id: string): Promise<{
+    environmentId: string | null;
+    keepMediaInLogs: boolean | null;
+  }> {
+    const fields = await AgentModel.findToolAccessFields(id);
+    return {
+      environmentId: fields?.environmentId ?? null,
+      keepMediaInLogs: fields?.keepMediaInLogs ?? null,
+    };
   }
 
   /**
@@ -2963,18 +3051,12 @@ class AgentModel {
   /**
    * Whether the agent's "access all tools" toggle is on — the per-agent opt-in
    * for dynamic tool access via search_tools/run_tool. Lean read on the tool
-   * dispatch path; intentionally not cached so toggling the setting affects
-   * the next discovery/dispatch call. Defaults to false when the agent is
-   * missing or deleted.
+   * dispatch path; never cached across requests, so toggling the setting
+   * affects the next discovery/dispatch call. Defaults to false when the agent
+   * is missing or deleted.
    */
   static async getAccessAllTools(id: string): Promise<boolean> {
-    const [result] = await db
-      .select({ accessAllTools: schema.agentsTable.accessAllTools })
-      .from(schema.agentsTable)
-      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
-      .limit(1);
-
-    return result?.accessAllTools ?? false;
+    return (await AgentModel.findToolAccessFields(id))?.accessAllTools ?? false;
   }
 
   /**
@@ -3199,14 +3281,22 @@ class AgentModel {
     const readers =
       principals ??
       (await ResourcePermissionSubjectModel.resolvePrincipals({ userId }));
-    const rows = await accessibleAgentIdsQuery({
-      userId,
-      isAgentAdmin,
-      principals: readers,
-      among: options?.among,
-    });
+    const rows = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+      })
+      .from(schema.agentsTable)
+      .where(
+        accessibleAgentsCondition({
+          userId,
+          isAgentAdmin,
+          principals: readers,
+          among: options?.among,
+        }),
+      );
 
-    return rows.map((row) => row.id);
+    return (await dropHiddenAgents(rows, userId)).map((row) => row.id);
   }
 
   /**
@@ -3231,7 +3321,9 @@ class AgentModel {
     lookups?: PrincipalSource;
     includeDetails?: boolean;
   }): Promise<
-    Pick<Agent, "id" | "name" | "description" | "builtInAgentConfig">[]
+    (Pick<Agent, "id" | "name" | "description" | "builtInAgentConfig"> & {
+      hasRuntime: boolean;
+    })[]
   > {
     const { userId, isAdmin, organizationId, excludeAgentId, environmentId } =
       params;
@@ -3248,9 +3340,10 @@ class AgentModel {
     ];
 
     if (isAdmin) {
-      return db
+      const rows = await db
         .select({
           id: schema.agentsTable.id,
+          organizationId: schema.agentsTable.organizationId,
           name: schema.agentsTable.name,
           description:
             params.includeDetails === false
@@ -3260,19 +3353,22 @@ class AgentModel {
             params.includeDetails === false
               ? sql<Agent["builtInAgentConfig"]>`NULL`
               : schema.agentsTable.builtInAgentConfig,
+          hasRuntime: sql<boolean>`${schema.agentsTable.runtime} IS NOT NULL`,
         })
         .from(schema.agentsTable)
         .where(and(...baseConditions))
         .orderBy(asc(schema.agentsTable.name));
+      return withoutOrganization(await dropHiddenAgents(rows, userId));
     }
 
     const principal = await ResourcePermissionSubjectModel.resolvePrincipalFrom(
       params.lookups,
       { organizationId, userId },
     );
-    return db
+    const rows = await db
       .select({
         id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
         name: schema.agentsTable.name,
         description:
           params.includeDetails === false
@@ -3282,6 +3378,7 @@ class AgentModel {
           params.includeDetails === false
             ? sql<Agent["builtInAgentConfig"]>`NULL`
             : schema.agentsTable.builtInAgentConfig,
+        hasRuntime: sql<boolean>`${schema.agentsTable.runtime} IS NOT NULL`,
       })
       .from(schema.agentsTable)
       .where(
@@ -3300,17 +3397,23 @@ class AgentModel {
         ),
       )
       .orderBy(asc(schema.agentsTable.name));
+    return withoutOrganization(await dropHiddenAgents(rows, userId));
   }
 
   static async findDelegationTarget(
     id: string,
     tx?: Transaction,
-  ): Promise<Pick<Agent, "id" | "name" | "agentType"> | null> {
+  ): Promise<Pick<
+    Agent,
+    "id" | "name" | "agentType" | "llmApiKeyId" | "modelId"
+  > | null> {
     const [targetAgent] = await (tx ?? db)
       .select({
         id: schema.agentsTable.id,
         name: schema.agentsTable.name,
         agentType: schema.agentsTable.agentType,
+        llmApiKeyId: schema.agentsTable.llmApiKeyId,
+        modelId: schema.agentsTable.modelId,
       })
       .from(schema.agentsTable)
       .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
@@ -3321,34 +3424,22 @@ class AgentModel {
 
   static async findAccessContextById(
     id: string,
-  ): Promise<Pick<
-    Agent,
-    "id" | "organizationId" | "scope" | "authorId"
-  > | null> {
-    const [agent] = await db
-      .select({
-        id: schema.agentsTable.id,
-        organizationId: schema.agentsTable.organizationId,
-        scope: schema.agentsTable.scope,
-        authorId: schema.agentsTable.authorId,
-        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
-      })
-      .from(schema.agentsTable)
-      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
-      .limit(1);
-
-    return agent ?? null;
+  ): Promise<AgentAccessContext | null> {
+    return readConfig(`agent-access-context\0${id}`, () =>
+      AgentModel.loadAccessContext(id),
+    );
   }
 
   /**
    * The one row a read authorization needs — type (for the type-specific RBAC
    * check), name, and the access-context columns
-   * {@link AgentTeamModel.userHasAgentAccess} takes — without the tool join and
-   * hydration {@link findById} does. For routes that only authorize the agent
-   * before reading something else about it.
+   * {@link AgentTeamModel.userHasAgentAccess} takes — of an agent the viewer may
+   * see, without the tool join and hydration {@link findById} does. For routes
+   * that only authorize the agent before reading something else about it.
    */
   static async findByIdForAccess(
     id: string,
+    viewerId: string,
   ): Promise<
     | (AgentAccessContext &
         Pick<Agent, "agentType" | "name" | "createdByServiceAccountId">)
@@ -3363,6 +3454,39 @@ class AgentModel {
         createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
         agentType: schema.agentsTable.agentType,
         name: schema.agentsTable.name,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return agent &&
+      (await canUseAgent(agent.id, {
+        userId: viewerId,
+        organizationId: agent.organizationId,
+      }))
+      ? agent
+      : null;
+  }
+
+  /**
+   * A live gateway's access context and its GitHub Actions setting, for the
+   * GitHub Actions token exchange.
+   */
+  static async findGitHubActionsGateway(
+    id: string,
+  ): Promise<
+    (AgentAccessContext & Pick<Agent, "name" | "githubActionsAccess">) | null
+  > {
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+        agentType: schema.agentsTable.agentType,
+        name: schema.agentsTable.name,
+        githubActionsAccess: schema.agentsTable.githubActionsAccess,
       })
       .from(schema.agentsTable)
       .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
@@ -3492,21 +3616,34 @@ class AgentModel {
     return agent?.runtime?.ports ?? [];
   }
 
+  /** A caller-scoped read's access check; no caller is an internal lookup. */
+  private static async callerCanAccess(
+    id: string,
+    userId?: string,
+    isAgentAdmin?: boolean,
+  ): Promise<boolean> {
+    if (!userId) return true;
+    if (!isAgentAdmin)
+      return AgentTeamModel.userHasAgentAccess({
+        userId,
+        agentId: id,
+        isAgentAdmin: false,
+      });
+    if (!isPermissionGatedAgent(id)) return true;
+    const agent = await AgentModel.findAccessContextById(id);
+    return (
+      !!agent &&
+      canUseAgent(id, { userId, organizationId: agent.organizationId })
+    );
+  }
+
   static async findById(
     id: string,
     userId?: string,
     isAgentAdmin?: boolean,
   ): Promise<Agent | null> {
-    // Check access control for non-agent admins
-    if (userId && !isAgentAdmin) {
-      const hasAccess = await AgentTeamModel.userHasAgentAccess({
-        userId: userId,
-        agentId: id,
-        isAgentAdmin: false,
-      });
-      if (!hasAccess) {
-        return null;
-      }
+    if (!(await AgentModel.callerCanAccess(id, userId, isAgentAdmin))) {
+      return null;
     }
 
     const rows = await db
@@ -3529,9 +3666,15 @@ class AgentModel {
     }
 
     const agent = rows[0].agents;
-    const tools = rows
+    const assignedTools = rows
       .map((row) => row.tools)
       .filter((tool): tool is NonNullable<typeof tool> => tool !== null);
+    const tools = userId
+      ? await dropHiddenTools(assignedTools, {
+          userId,
+          organizationId: agent.organizationId,
+        })
+      : assignedTools;
 
     const [teams, labels, knowledgeBaseIds, connectorIds] = await Promise.all([
       AgentTeamModel.getTeamDetailsForAgent(id),
@@ -3571,21 +3714,13 @@ class AgentModel {
    * resolved-LLM hydration {@link findById} performs. The gateway loads the
    * agent on every JSON-RPC request only for scalar config (agent type, tool
    * exposure, passthrough headers, identity provider) and trace-span labels,
-   * so this must stay at two index lookups.
+   * so configuration and labels are loaded together in one statement.
    */
   static async findGatewayAgentById(id: string): Promise<GatewayAgent | null> {
-    const [agent] = await db
-      .select()
-      .from(schema.agentsTable)
-      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
-      .limit(1);
-
-    if (!agent) {
-      return null;
-    }
-
-    const labels = await AgentLabelModel.getLabelsForAgent(id);
-    return { ...agent, labels };
+    return readConfig(`gateway-agent\0${id}`, async () => {
+      const [agent] = await AgentModel.gatewayById.get().execute({ id });
+      return agent ?? null;
+    });
   }
 
   /**
@@ -3598,8 +3733,7 @@ class AgentModel {
   static async getOrgLlmProxy(organizationId: string): Promise<GatewayAgent> {
     const existing = await AgentModel.findOrgLlmProxyRow(organizationId);
     if (existing) {
-      const labels = await AgentLabelModel.getLabelsForAgent(existing.id);
-      return { ...existing, labels };
+      return existing;
     }
 
     await db
@@ -3627,8 +3761,7 @@ class AgentModel {
         `Failed to ensure the LLM Proxy for organization ${organizationId}`,
       );
     }
-    const labels = await AgentLabelModel.getLabelsForAgent(row.id);
-    return { ...row, labels };
+    return row;
   }
 
   /**
@@ -3668,18 +3801,9 @@ class AgentModel {
   }
 
   private static async findOrgLlmProxyRow(organizationId: string) {
-    const [row] = await db
-      .select()
-      .from(schema.agentsTable)
-      .where(
-        and(
-          eq(schema.agentsTable.organizationId, organizationId),
-          eq(schema.agentsTable.agentType, "llm_proxy"),
-          eq(schema.agentsTable.isDefault, true),
-          notDeleted(schema.agentsTable),
-        ),
-      )
-      .limit(1);
+    const [row] = await AgentModel.organizationProxy
+      .get()
+      .execute({ organizationId });
     return row ?? null;
   }
 
@@ -3689,13 +3813,10 @@ class AgentModel {
    * when no organization exists yet.
    */
   static async getDeploymentLlmProxy(): Promise<GatewayAgent | null> {
-    const [firstOrg] = await db
-      .select({ id: schema.organizationsTable.id })
-      .from(schema.organizationsTable)
-      // Deterministic "first organization": the oldest one. Without an order
-      // the planner may return different rows across calls.
-      .orderBy(asc(schema.organizationsTable.createdAt))
-      .limit(1);
+    const [existing] = await AgentModel.deploymentProxy.get().execute();
+    if (existing) return existing;
+
+    const [firstOrg] = await AgentModel.firstOrganization.get().execute();
     if (!firstOrg) {
       return null;
     }
@@ -3753,15 +3874,8 @@ class AgentModel {
     userId?: string,
     isAgentAdmin?: boolean,
   ): Promise<{ llmApiKeyId: string | null; modelId: string | null } | null> {
-    if (userId && !isAgentAdmin) {
-      const hasAccess = await AgentTeamModel.userHasAgentAccess({
-        userId: userId,
-        agentId: id,
-        isAgentAdmin: false,
-      });
-      if (!hasAccess) {
-        return null;
-      }
+    if (!(await AgentModel.callerCanAccess(id, userId, isAgentAdmin))) {
+      return null;
     }
 
     const rows = await db
@@ -4507,6 +4621,10 @@ class AgentModel {
     // are the durable marker that they did and chose to delete it.
     if (await AgentModel.hasEverAuthoredPersonalChatAgent(params)) return null;
 
+    const accessAllTools =
+      await OrganizationModel.getDefaultPersonalAgentAccessAllTools(
+        organizationId,
+      );
     const agent = await AgentModel.create(
       {
         organizationId,
@@ -4514,13 +4632,9 @@ class AgentModel {
         agentType: "agent",
         scope: "personal",
         description: "Your personal chat assistant",
-        // The personal assistant should be able to reach every tool the user
-        // can access (e.g. MCP servers they install) without per-tool
-        // assignment. `accessAllTools` grants that dynamic access and, via the
-        // invariant in AgentModel.create, coerces toolExposureMode to
-        // "search_and_run_only" so the search_tools/run_tool dispatch surface
-        // is exposed.
-        accessAllTools: true,
+        // Apply the organization default only on creation. Existing assistants
+        // returned above keep their saved mode and assignments.
+        accessAllTools,
       },
       userId,
     );
@@ -4667,6 +4781,10 @@ class AgentModel {
     );
     if (existing) return existing;
 
+    const accessAllTools =
+      await OrganizationModel.getDefaultPersonalAgentAccessAllTools(
+        organizationId,
+      );
     const [userRow] = await db
       .select({ name: schema.usersTable.name })
       .from(schema.usersTable)
@@ -4686,12 +4804,7 @@ class AgentModel {
           scope: "personal",
           description: PERSONAL_MCP_GATEWAY_DESCRIPTION,
           isPersonalGateway: true,
-          // The personal gateway defaults to "All" mode so it can reach every
-          // tool the user can access without per-tool assignment. Via the
-          // invariant in AgentModel.create, accessAllTools coerces
-          // toolExposureMode to "search_and_run_only" (the search_tools/run_tool
-          // dispatch surface).
-          accessAllTools: true,
+          accessAllTools,
         },
         userId,
       );
@@ -4742,11 +4855,17 @@ class AgentModel {
         userId: schema.membersTable.userId,
         organizationId: schema.membersTable.organizationId,
         userName: schema.usersTable.name,
+        accessAllTools:
+          schema.organizationsTable.defaultPersonalAgentAccessAllTools,
       })
       .from(schema.membersTable)
       .innerJoin(
         schema.usersTable,
         eq(schema.usersTable.id, schema.membersTable.userId),
+      )
+      .innerJoin(
+        schema.organizationsTable,
+        eq(schema.organizationsTable.id, schema.membersTable.organizationId),
       )
       .leftJoin(
         schema.agentsTable,
@@ -4774,10 +4893,8 @@ class AgentModel {
         agentType: "mcp_gateway" as const,
         scope: "personal" as const,
         isPersonalGateway: true,
-        // Personal gateways default to "All" mode (see ensurePersonalMcpGateway).
-        // This raw INSERT bypasses AgentModel.create, so set both fields here to
-        // preserve the accessAllTools => search_and_run_only invariant.
-        accessAllTools: true,
+        // This path also creates new objects; never rewrite an existing gateway.
+        accessAllTools: m.accessAllTools,
         toolExposureMode: "search_and_run_only" as const,
         slug: `my-gateway-${userPart}-${crypto.randomUUID().slice(0, 6)}`,
       };
@@ -4794,13 +4911,15 @@ class AgentModel {
           ],
           where: sql`${schema.agentsTable.agentType} = 'mcp_gateway' AND ${schema.agentsTable.isPersonalGateway} = true AND ${schema.agentsTable.deletedAt} IS NULL`,
         })
-        .returning({ id: schema.agentsTable.id });
+        .returning({
+          id: schema.agentsTable.id,
+          accessAllTools: schema.agentsTable.accessAllTools,
+        });
 
-      // This raw INSERT creates the gateways directly in All-tools mode, so
-      // pre-fill their exclusion lists in the same transaction — none of them
-      // may commit in Auto mode without the pre-fill.
+      // Only All-mode gateways need the exclusion pre-fill. Keep it atomic
+      // with their insert, as in the ordinary create path.
       await AgentExcludedToolModel.prefillManyForAllToolsMode(
-        insertedRows.map((row) => row.id),
+        insertedRows.filter((row) => row.accessAllTools).map((row) => row.id),
         tx,
       );
 
@@ -5015,6 +5134,8 @@ class AgentModel {
           // exclusions are copied can only leave a fail-closed (assigned-tools-
           // only) clone, never one wide open in Auto mode with no exclusions.
           accessAllTools: false,
+          // Keep subagents closed until their exclusions have been copied.
+          accessAllSubagents: false,
           // Skill policy rules are copied below. Start closed so a partial
           // clone can never transiently widen a Manual source to All.
           activationSkillMode: "manual",
@@ -5083,19 +5204,18 @@ class AgentModel {
         revision: activationSkillRules.length > 0 ? 1 : 0,
       });
 
-      // Now that the verbatim exclusions exist, flip an All-tools source's
-      // clone on. Skip the pre-fill: the copy above is the authoritative set,
-      // and an additive pre-fill would re-add built-ins the source had
-      // un-excluded.
-      if (sourceAgent.accessAllTools) {
+      // Restore both Auto modes together after copying exclusions, so version
+      // history never records an intermediate tools-only Auto policy.
+      // The copied tool exclusions are authoritative; skip additive pre-fill.
+      if (sourceAgent.accessAllTools || sourceAgent.accessAllSubagents) {
         await AgentModel.update(
           created.id,
-          { accessAllTools: true },
+          {
+            accessAllTools: sourceAgent.accessAllTools,
+            accessAllSubagents: sourceAgent.accessAllSubagents,
+          },
           { skipExclusionPrefill: true },
         );
-      }
-      if (sourceAgent.accessAllSubagents) {
-        await AgentModel.update(created.id, { accessAllSubagents: true });
       }
 
       // Fork last, once the copied assignments and exclusions are in place.
@@ -5392,6 +5512,8 @@ class AgentModel {
       // safe to capture verbatim.
       passthroughHeaders: [...(row.passthroughHeaders ?? [])].sort(),
       identityProviderId: row.identityProviderId ?? null,
+      // Names only: the App's key, repositories and workflow refs.
+      githubActionsAccess: row.githubActionsAccess ?? null,
       environmentId: row.environmentId ?? null,
       incomingEmailEnabled: row.incomingEmailEnabled,
       incomingEmailSecurityMode: row.incomingEmailSecurityMode,
@@ -5404,7 +5526,8 @@ class AgentModel {
             backend: row.runtime.backend,
             steerMode: row.runtime.steerMode,
             privileged: row.runtime.privileged,
-            resources: row.runtime.resources,
+            tier: row.runtime.tier ?? null,
+            maxTier: row.runtime.maxTier ?? null,
             environmentKeys: (row.runtime.environment ?? [])
               .map((entry) => entry.key)
               .sort(),
@@ -5454,13 +5577,26 @@ class AgentModel {
     isAgentAdmin?: boolean;
     options?: AgentRosterOptions;
   }) {
-    const { userId, isAgentAdmin, options } = params;
+    const { userId, options } = params;
     const principals = userId
       ? await ResourcePermissionSubjectModel.resolvePrincipals({
           userId,
           organizationId: options?.authorization?.organizationId,
         })
       : [];
+    return and(
+      await AgentModel.buildUnfencedRosterWhere({ ...params, principals }),
+      userId ? await callerAgentsFence(userId, principals) : undefined,
+    );
+  }
+
+  private static async buildUnfencedRosterWhere(params: {
+    userId?: string;
+    isAgentAdmin?: boolean;
+    options?: AgentRosterOptions;
+    principals: GrantPrincipal[];
+  }) {
+    const { userId, isAgentAdmin, options, principals } = params;
     // An authorized read of live rows needs its read grant once. The fence,
     // the base-type read, the oversight filter and the non-admin semi-join
     // each restate that grant (base read types never include LLM proxies),
@@ -6109,6 +6245,90 @@ class AgentModel {
     // SPDX-SnippetEnd
     return agents;
   }
+
+  private static readonly gatewayById = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(schema.agentsTable.id, sql.placeholder("id")),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_gateway_agent_by_id"),
+  );
+
+  private static readonly organizationProxy = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(
+            schema.agentsTable.organizationId,
+            sql.placeholder("organizationId"),
+          ),
+          eq(schema.agentsTable.agentType, "llm_proxy"),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_organization_llm_proxy"),
+  );
+
+  private static readonly deploymentProxy = new PreparedQuery((database) =>
+    database
+      .select(gatewayAgentSelection())
+      .from(schema.agentsTable)
+      .where(
+        and(
+          eq(
+            schema.agentsTable.organizationId,
+            database
+              .select({ id: schema.organizationsTable.id })
+              .from(schema.organizationsTable)
+              .orderBy(asc(schema.organizationsTable.createdAt))
+              .limit(1),
+          ),
+          eq(schema.agentsTable.agentType, "llm_proxy"),
+          eq(schema.agentsTable.isDefault, true),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_deployment_llm_proxy"),
+  );
+
+  private static readonly firstOrganization = new PreparedQuery((database) =>
+    database
+      .select({ id: schema.organizationsTable.id })
+      .from(schema.organizationsTable)
+      .orderBy(asc(schema.organizationsTable.createdAt))
+      .limit(1)
+      .prepare("archestra_first_organization"),
+  );
+
+  private static async loadAccessContext(
+    id: string,
+  ): Promise<AgentAccessContext | null> {
+    const [agent] = await db
+      .select({
+        id: schema.agentsTable.id,
+        organizationId: schema.agentsTable.organizationId,
+        scope: schema.agentsTable.scope,
+        authorId: schema.agentsTable.authorId,
+        agentType: schema.agentsTable.agentType,
+        createdByServiceAccountId: schema.agentsTable.createdByServiceAccountId,
+      })
+      .from(schema.agentsTable)
+      .where(and(eq(schema.agentsTable.id, id), notDeleted(schema.agentsTable)))
+      .limit(1);
+
+    return agent ?? null;
+  }
 }
 
 const PERSONAL_MCP_GATEWAY_DESCRIPTION =
@@ -6273,6 +6493,7 @@ const CHAT_ROSTER_COLUMNS = {
   runtime: schema.agentsTable.runtime,
   modelId: schema.agentsTable.modelId,
   llmApiKeyId: schema.agentsTable.llmApiKeyId,
+  modelPoolId: schema.agentsTable.modelPoolId,
 };
 
 type RosterCursorFields = { cursorValue?: string; chatRank?: number };
@@ -6419,6 +6640,23 @@ function grantedAgentIdsCondition(params: {
   // SPDX-SnippetEnd
 }
 
+function withoutOrganization<T extends { organizationId: string }>(
+  rows: T[],
+): Omit<T, "organizationId">[] {
+  return rows.map(({ organizationId: _, ...row }) => row);
+}
+
+/** {@link gatedAgentsFence} over the organizations the caller's principals span. */
+function callerAgentsFence(
+  userId: string,
+  principals: GrantPrincipal[],
+): Promise<SQL | undefined> {
+  return gatedAgentsFence({
+    userId,
+    organizationIds: principals.map(({ organizationId }) => organizationId),
+  });
+}
+
 /**
  * The list fence for every agent kind: agents and MCP gateways by their read
  * grants, and LLM proxies unfenced here because they have no grant namespace
@@ -6443,26 +6681,30 @@ function agentListFence(principals: GrantPrincipal[]): SQL {
 // SPDX-SnippetBegin
 // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
 // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
-function accessibleAgentIdsQuery(params: {
+function accessibleAgentIdsQuery(params: AccessibleAgentsParams) {
+  return db
+    .select({ id: schema.agentsTable.id })
+    .from(schema.agentsTable)
+    .where(accessibleAgentsCondition(params));
+}
+
+function accessibleAgentsCondition(params: AccessibleAgentsParams) {
+  return and(
+    notDeleted(schema.agentsTable),
+    params.among ? inArray(schema.agentsTable.id, params.among) : undefined,
+    or(
+      explicitAgentReadCondition(params.principals),
+      params.isAgentAdmin ? sql`true` : undefined,
+      organizationLlmProxyCondition(params.userId),
+    ),
+  );
+}
+
+interface AccessibleAgentsParams {
   userId: string;
   isAgentAdmin: boolean;
   principals: GrantPrincipal[];
   among?: string[];
-}) {
-  return db
-    .select({ id: schema.agentsTable.id })
-    .from(schema.agentsTable)
-    .where(
-      and(
-        notDeleted(schema.agentsTable),
-        params.among ? inArray(schema.agentsTable.id, params.among) : undefined,
-        or(
-          explicitAgentReadCondition(params.principals),
-          params.isAgentAdmin ? sql`true` : undefined,
-          organizationLlmProxyCondition(params.userId),
-        ),
-      ),
-    );
 }
 // SPDX-SnippetEnd
 

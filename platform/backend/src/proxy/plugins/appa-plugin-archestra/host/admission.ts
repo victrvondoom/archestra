@@ -3,6 +3,7 @@ import type { FastifyRequest } from "fastify";
 import config from "@/config";
 import logger from "@/logging";
 import { ConversationModel } from "@/models";
+import type { RuntimeIdentitySnapshot } from "@/models/proxy-request-context";
 import { scopedSessionId } from "@/openappa/actor";
 import { forkedSession } from "@/openappa/lineage";
 import {
@@ -106,12 +107,12 @@ export async function resolveInstallerSetupBypass(params: {
   if (installerSetupBypass) {
     logger.info(
       { profileId: agent.id, proof: "approved-installer" },
-      "Connection setup APPA bypass active",
+      "OpenAPPA bypass active for connection setup",
     );
   } else if (appaActive && approvedProxySetup) {
     logger.info(
       { profileId: agent.id },
-      "Connection setup URL outside the installer's conversation; Guardrails apply",
+      "OpenAPPA connection setup URL outside the installer's conversation; Guardrails apply",
     );
   }
   return installerSetupBypass;
@@ -142,6 +143,7 @@ export async function admitOpenappaRequest(params: {
   installerSetupBypass: boolean;
   ingress: OpenappaIngress;
   toolIdentity: GatewayToolIdentity;
+  runtimeSnapshot?: RuntimeIdentitySnapshot;
 }): Promise<OpenappaAdmission> {
   const { request, body, agent, principal, chatSource, ingress } = params;
   const headers = request.headers as Record<
@@ -204,7 +206,7 @@ export async function admitOpenappaRequest(params: {
     : null;
   // A child that claims a trajectory it cannot prove must not run unbound.
   if (appaActive && subagentToken && !subagentBinding) {
-    throw new ApiError(403, "The subagent binding is invalid or expired");
+    throw new ApiError(403, "OpenAPPA subagent binding is invalid or expired");
   }
   // Other delegated A2A runs share the parent's logging session, but have
   // no APPA child-return lifecycle. Keep their events out of that
@@ -220,6 +222,7 @@ export async function admitOpenappaRequest(params: {
       ? await resolveRuntimeIdentityByVirtualKeys({
           virtualKeyIds: [virtualKeyId, passthroughVirtualKeyId],
           organizationId: agent.organizationId,
+          snapshot: params.runtimeSnapshot,
         })
       : { status: "unbound" as const };
   if (
@@ -370,7 +373,7 @@ export async function admitOpenappaRequest(params: {
   ) {
     throw new ApiError(
       400,
-      "Guardrails do not recognize this client, so the proxy blocked the request. Add an X-Appa-Session-ID header to each request, or ask an administrator to allow unrecognized clients.",
+      "OpenAPPA does not recognize this client, so Guardrails blocked the request. Add an X-Appa-Session-ID header to each request, or ask an administrator to allow unrecognized clients.",
     );
   }
   // The facts that bind a child trajectory. Read without preparing the
@@ -387,6 +390,9 @@ export async function admitOpenappaRequest(params: {
       ? { delegation: { markers: ingress.delegationMarkers } }
       : {}),
     ...(ingress.childReturns ? { childReturns: ingress.childReturns } : {}),
+    ...(ingress.releasedSpawnCalls
+      ? { releasedSpawnCalls: ingress.releasedSpawnCalls }
+      : {}),
     ...(ingress.childTrajectoryReceipts
       ? { childTrajectoryReceipts: ingress.childTrajectoryReceipts }
       : {}),
@@ -491,7 +497,7 @@ export async function admitOpenappaRequest(params: {
       if (session?.session_id !== runtimeSession.session_id) {
         throw new ApiError(
           400,
-          "The runtime request does not match its bound workspace",
+          "OpenAPPA runtime request does not match its bound workspace",
         );
       }
       // The launcher stored the authenticated parent before giving the pod data.

@@ -41,8 +41,9 @@ import {
   useAllCatalogTools,
   useInternalMcpCatalog,
 } from "@/lib/mcp/internal-mcp-catalog.query";
-import { useOrganization } from "@/lib/organization.query";
+import { organizationKeys, useOrganization } from "@/lib/organization.query";
 import { usePlugins } from "@/lib/plugins/plugin.query";
+import { markShellSeeded } from "@/lib/shell-deferral";
 import { saveConnectChoices } from "./connect-choices";
 import ConnectionPage from "./page";
 
@@ -59,6 +60,24 @@ const { catalogHookMock, rowsByIdsCache } = vi.hoisted(() => ({
 }));
 
 vi.mock("next/navigation");
+// The page loads each view as its own chunk. Resolve both before the tests
+// render, so a test sees the view on its first render, as a server-rendered
+// document does.
+const dynamicViews = vi.hoisted(() => [] as Promise<unknown>[]);
+vi.mock("next/dynamic", () => ({
+  default: (load: () => Promise<React.ComponentType<object>>) => {
+    let View: React.ComponentType<object> | null = null;
+    dynamicViews.push(
+      load().then((loaded) => {
+        View = loaded;
+      }),
+    );
+    return (props: object) => (View ? <View {...props} /> : null);
+  },
+}));
+beforeAll(async () => {
+  await Promise.all(dynamicViews);
+});
 vi.mock("@/lib/clipboard");
 vi.mock("@/lib/agent.query");
 vi.mock("@/lib/agent-options.query", async (importOriginal) => ({
@@ -316,7 +335,7 @@ describe("ConnectPage gateway footprint", () => {
     expect(await within(summary).findByText("2 tools")).toBeVisible();
     expect(within(summary).getByText("~2.4K tokens")).toBeVisible();
     expect(within(summary).queryByText("3 tools")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: /Codex$/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Codex CLI$/ }));
     await requestToolCounts();
     expect(await screen.findByText("~1.1K tokens")).toBeVisible();
   });
@@ -446,10 +465,10 @@ describe("ConnectPage saved agent order", () => {
       .getAllByRole("button")
       .map((button) => button.textContent?.trim());
     const tileNames = names.filter((name) =>
-      ["n8n", "Codex", "Claude Code"].includes(name ?? ""),
+      ["n8n", "Codex CLI", "Claude Code"].includes(name ?? ""),
     );
-    expect(tileNames).toEqual(["n8n", "Codex", "Claude Code"]);
-    expect(screen.getByRole("button", { name: /Codex$/ })).toHaveAttribute(
+    expect(tileNames).toEqual(["n8n", "Codex CLI", "Claude Code"]);
+    expect(screen.getByRole("button", { name: /Codex CLI$/ })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
@@ -513,6 +532,11 @@ describe("ConnectPage saved agent order", () => {
 });
 
 describe("ConnectPage guardrails chip", () => {
+  const api = setupServer();
+  beforeAll(() => api.listen({ onUnhandledRequest: "bypass" }));
+  afterEach(() => api.resetHandlers());
+  afterAll(() => api.close());
+
   function renderPage(
     clientId: string,
     deployment: {
@@ -580,14 +604,56 @@ describe("ConnectPage guardrails chip", () => {
     Object.entries(NATIVE_SESSION_CLIENT_LABELS),
   )("marks %s as supporting guardrails even before enforcement is enabled", async (clientId, label) => {
     setup(clientId, { active: false, unsupportedClientAction: "block" });
-    const badge = within(
-      screen.getByRole("button", { name: new RegExp(`${label}$`) }),
-    ).getByRole("img", { name: "Supports LLM proxy guardrails" });
+    const clientLabel = clientId === "codex" ? "Codex CLI" : label;
+    const tile = screen.getByRole("button", {
+      name: new RegExp(`${clientLabel}$`),
+    });
+    const badge = within(tile).getByRole("img", {
+      name: "Supports LLM proxy guardrails",
+    });
     expect(badge).toBeVisible();
+    // Separate from the label text so the shield does not shift the agent name.
+    expect(within(tile).getByText(clientLabel)).not.toContainElement(badge);
     await userEvent.hover(badge);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Enforcement depends on your organization's settings.",
     );
+  });
+
+  it("stacks the last connected mark below the guardrails mark in the same corner", async () => {
+    archestraApiClient.setConfig({ baseUrl: "http://localhost:9000" });
+    const now = new Date().toISOString();
+    api.use(
+      http.get("http://localhost:9000/api/connected-clients", () =>
+        HttpResponse.json([
+          {
+            clientId: "codex",
+            name: "Codex",
+            lastConnectedAt: now,
+            deviceNames: [],
+            lastSeenAt: now,
+          },
+        ]),
+      ),
+    );
+    setup("codex", { active: true, unsupportedClientAction: "block" });
+    const tile = screen.getByRole("button", { name: "Codex CLI" });
+    const lastConnected = await within(tile).findByRole("img", {
+      name: "Last connected",
+    });
+    const guardrails = within(tile).getByRole("img", {
+      name: "Supports LLM proxy guardrails",
+    });
+    const corner = guardrails.parentElement;
+    expect(lastConnected.parentElement).toBe(corner);
+    expect(within(tile).getByText("Codex CLI")).not.toContainElement(
+      guardrails,
+    );
+    expect(
+      within(corner as HTMLElement)
+        .getAllByRole("img")
+        .map((mark) => mark.getAttribute("aria-label")),
+    ).toEqual(["Supports LLM proxy guardrails", "Last connected"]);
   });
 
   it("does not mark an unsupported client as supporting guardrails", () => {
@@ -599,7 +665,7 @@ describe("ConnectPage guardrails chip", () => {
 
   it("keeps the selected client button name concise when it has a support hint", () => {
     setup("codex", { active: true, unsupportedClientAction: "block" });
-    const tile = screen.getByRole("button", { name: "Codex" });
+    const tile = screen.getByRole("button", { name: "Codex CLI" });
     expect(tile).toHaveAttribute("aria-pressed", "true");
     expect(tile).toHaveAccessibleDescription("Supports LLM proxy guardrails");
   });
@@ -786,6 +852,55 @@ describe("ConnectPage (no connect request)", () => {
     });
     render(<ConnectionPage />);
     expect(screen.getByText("Not active")).toBeVisible();
+  });
+
+  it("Pi keeps model routing required and includes shared skills while excluding plugins", async () => {
+    window.localStorage.clear();
+    saveConnectChoices("pi", {
+      tools: true,
+      proxy: false,
+      skills: true,
+      plugins: true,
+    });
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("clientId=pi") as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(useHasPermissions).mockReturnValue({ data: true } as ReturnType<
+      typeof useHasPermissions
+    >);
+    vi.mocked(useLlmProxy).mockReturnValue({
+      data: { id: "proxy-1" },
+    } as unknown as ReturnType<typeof useLlmProxy>);
+    mockOrganization({
+      data: {
+        connectionShownClientIds: ["pi"],
+        connectionLlmProxyEnabled: true,
+        connectionSkillsEnabled: true,
+        connectionPluginsEnabled: true,
+      },
+    });
+    vi.mocked(archestraApiSdk.getSkills).mockResolvedValue({
+      data: {
+        data: [
+          {
+            id: "native-checks",
+            name: "native-checks",
+            description: "Check arithmetic",
+            usageCount: 0,
+          },
+        ],
+        pagination: { total: 1, limit: 10, offset: 0 },
+      },
+    } as unknown as Awaited<ReturnType<typeof archestraApiSdk.getSkills>>);
+    render(<ConnectionPage />);
+    expect(screen.getByText(/--client pi --exclude plugins$/)).toBeVisible();
+    expect(screen.getByText(/Open a new terminal and run arcpi/)).toBeVisible();
+    await userEvent.click(
+      screen.getByRole("button", { name: /Choose what to include/ }),
+    );
+    expect(screen.getByRole("switch", { name: /LLM proxy/ })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: /LLM proxy/ })).toBeChecked();
+    expect(await screen.findByRole("switch", { name: /Skills/ })).toBeChecked();
   });
 
   it("lets any agent leave the LLM proxy out", async () => {
@@ -1018,6 +1133,43 @@ describe("ConnectionPage (connect request approval)", () => {
     expect(
       screen.getByRole("status", { name: "Checking connection settings" }),
     ).toBeInTheDocument();
+  });
+
+  it("renders the flow at once from the settings the server read for this document", () => {
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams(
+        "connectRequest=request&clientId=opencode",
+      ) as ReturnType<typeof useSearchParams>,
+    );
+    const settings = {
+      connectionSkillsEnabled: true,
+      connectionLlmProxyEnabled: true,
+      connectionPluginsEnabled: true,
+    };
+    // No read has happened since mount: only the server seed holds the data.
+    vi.mocked(useOrganization).mockReturnValue({
+      data: settings,
+      isFetchedAfterMount: false,
+      isFetching: false,
+      isError: false,
+      refetch: refetchOrganizationMock,
+    } as unknown as ReturnType<typeof useOrganization>);
+    const seeded = new QueryClient();
+    markShellSeeded(seeded);
+    seeded.setQueryData(organizationKeys.details(), settings);
+
+    rtlRender(<ConnectionPage />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={seeded}>{children}</QueryClientProvider>
+      ),
+    });
+
+    expect(
+      screen.queryByRole("status", { name: "Checking connection settings" }),
+    ).toBeNull();
+    expect(connectionFlowMock).toHaveBeenCalledWith(
+      expect.objectContaining({ skillsEnabled: true, llmProxyEnabled: true }),
+    );
   });
 
   it("keeps the flow visible during revalidation without dropping selections", () => {
@@ -1487,7 +1639,7 @@ describe("ConnectPage after copying the command", () => {
     expect(status()).toHaveTextContent("Connected.");
   });
 
-  it("stops waiting when the agent changes, but keeps a connection it saw", async () => {
+  it("stops waiting when the agent changes, and the connected card follows the selected agent", async () => {
     show(["cursor", "codex"]);
     await copyCommand();
     await userEvent.click(screen.getByRole("button", { name: /Codex/ }));
@@ -1497,6 +1649,15 @@ describe("ConnectPage after copying the command", () => {
     await copyCommand();
     await approveElsewhere();
     await userEvent.click(screen.getByRole("button", { name: /Codex/ }));
+    expect(status()).toBeNull();
+    expect(screen.getByRole("region", { name: "Connect" })).not.toHaveClass(
+      "opacity-50",
+    );
+    expect(
+      screen.getByRole("button", { name: "Show the starter prompt" }),
+    ).toBeVisible();
+
+    await userEvent.click(screen.getByRole("button", { name: /Cursor/ }));
     expect(status()).toHaveTextContent(
       "Connected. Next, ask Cursor what it can do now",
     );

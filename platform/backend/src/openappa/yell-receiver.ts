@@ -41,7 +41,7 @@ export async function captureYellReport<T>(params: {
             })
           : archive,
       });
-      if (params.encryptedChat || !config.analytics.enabled) {
+      if (params.encryptedChat || !config.openappa.yellForwardingEnabled) {
         response
           .writeHead(200, { "content-type": "application/json" })
           .end(JSON.stringify({ receipt_id: params.id, duplicate: false }));
@@ -67,7 +67,7 @@ export async function captureYellReport<T>(params: {
     })().catch((err: unknown) => {
       logger.warn(
         { err, yellId: params.id },
-        "Could not deliver OpenAPPA report",
+        "OpenAPPA could not deliver the report",
       );
       if (!response.headersSent) response.writeHead(500);
       response.end();

@@ -5,19 +5,29 @@ import {
   type MessagingChannelId,
   providerDisplayNames,
   type ResourceVisibilityScope,
+  subscriptionKindForProvider,
+  TOOL_POST_AGENT_RUN_MESSAGE_SHORT_NAME,
+  toPlaceholderTitle,
 } from "@archestra/shared";
 import type { UIMessageChunk } from "ai";
+import type { A2AActor } from "@/agents/a2a/a2a-base";
 import { A2AManager, type A2ASystemParams } from "@/agents/a2a/a2a-manager";
 import type { A2AAttachment } from "@/agents/a2a-executor";
 import { watchTaskCompletion } from "@/agents/task-completion-watcher";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import { agentCredentialSetupUrl } from "@/archestra-mcp-server/helpers";
 import { resolveRunToolTarget } from "@/archestra-mcp-server/run-tool-target";
+import {
+  actorFromUserId,
+  isServiceAccountUserId,
+  serviceAccountUserId,
+} from "@/auth/service-account-user-id";
 import { type AllowedCacheKey, CacheKey, cacheManager } from "@/cache-manager";
 import config from "@/config";
 import logger from "@/logging";
 import {
   A2AContextModel,
+  A2ATaskModel,
   AgentModel,
   AgentRunModel,
   AgentWorkspaceModel,
@@ -26,12 +36,16 @@ import {
   ChatOpsProcessedMessageModel,
   ChatOpsThreadContextModel,
   LlmProviderApiKeyModel,
+  MemberModel,
   OrganizationModel,
+  ServiceAccountModel,
   TeamModel,
   UserModel,
 } from "@/models";
 import A2ATaskApprovalRequestModel from "@/models/a2a/task-approval-request";
 import ChatOpsUserAdmissionModel from "@/models/chatops-user-admission";
+import JiraChatOpsEventModel from "@/models/jira-chatops-event";
+import JiraChatOpsIdentityModel from "@/models/jira-chatops-identity";
 import ResourcePermissionPolicyModel from "@/models/resource-permission-policy";
 import { RouteCategory } from "@/observability/tracing";
 import {
@@ -101,11 +115,19 @@ import {
   CHATOPS_NO_REPLY_SENTINEL,
   CHATOPS_SESSION_RESET_REPLY,
   CHATOPS_SESSION_ROLLOVER_HINT,
+  JIRA_THREAD_MUTE_HINT,
   SLACK_DEFAULT_CONNECTION_MODE,
+  SLACK_THREAD_MUTE_HINT,
   THREAD_MUTE_HINT,
 } from "./constants";
+import { parseJiraApprovalCommand } from "./jira-message";
+import JiraProvider from "./jira-provider";
 import MSTeamsProvider from "./ms-teams-provider";
-import { sendRuntimeReplyWithAnchor } from "./runtime-reply-anchor";
+import {
+  assertRuntimeAcknowledgementSettled,
+  sendRuntimeReplyWithAnchor,
+  startRuntimeAcknowledgement,
+} from "./runtime-reply-anchor";
 import SlackProvider from "./slack-provider";
 import TelegramProvider from "./telegram-provider";
 import {
@@ -132,6 +154,7 @@ export class ChatOpsManager {
   /** Additional Slack apps, each pinned to one agent, keyed by agent id. */
   private slackAgentBots = new Map<string, SlackProvider>();
   private telegramProvider: TelegramProvider | null = null;
+  private jiraAgentBots = new Map<string, JiraProvider>();
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
   private readonly a2aManager: A2AManager;
   private readonly statefulA2aManager: A2AManager;
@@ -163,8 +186,46 @@ export class ChatOpsManager {
     return this.slackProvider;
   }
 
+  /** Workers send notices without starting inbound Slack listeners or sockets. */
+  async getSlackRuntimeNoticeProvider(
+    pinnedAgentId?: string,
+  ): Promise<SlackProvider | null> {
+    if ((await getHiddenMessagingChannels()).has("slack")) return null;
+    const slackConfig = pinnedAgentId
+      ? (await ChatOpsConfigModel.getSlackAgentBots()).find(
+          (bot) => bot.agentId === pinnedAgentId,
+        )
+      : await ChatOpsConfigModel.getSlackConfig();
+    if (!slackConfig) return null;
+    const provider = new SlackProvider(slackConfig, { pinnedAgentId });
+    return provider.isConfigured() ? provider : null;
+  }
+
   getTelegramProvider(): TelegramProvider | null {
     return this.telegramProvider;
+  }
+
+  getJiraProvider(agentId?: string): JiraProvider | null {
+    return agentId
+      ? (this.jiraAgentBots.get(agentId) ?? null)
+      : (this.jiraAgentBots.values().next().value ?? null);
+  }
+
+  async reloadJiraProviders(): Promise<void> {
+    const next = new Map<string, JiraProvider>();
+    const jiraConfig = await ChatOpsConfigModel.getJiraConfig();
+    if (
+      jiraConfig &&
+      !(await getHiddenMessagingChannels(jiraConfig.organizationId)).has("jira")
+    ) {
+      if (jiraConfig.enabled) {
+        for (const bot of jiraConfig.bots) {
+          if (bot.enabled)
+            next.set(bot.agentId, new JiraProvider(jiraConfig, bot));
+        }
+      }
+    }
+    this.jiraAgentBots = next;
   }
 
   getChatOpsProvider(
@@ -177,6 +238,8 @@ export class ChatOpsManager {
         return this.getSlackProvider();
       case "telegram":
         return this.getTelegramProvider();
+      case "jira":
+        return this.getJiraProvider();
     }
   }
 
@@ -215,7 +278,8 @@ export class ChatOpsManager {
       (this.msTeamsProvider?.isConfigured() ?? false) ||
       (this.slackProvider?.isConfigured() ?? false) ||
       [...this.slackAgentBots.values()].some((bot) => bot.isConfigured()) ||
-      (this.telegramProvider?.isConfigured() ?? false)
+      (this.telegramProvider?.isConfigured() ?? false) ||
+      [...this.jiraAgentBots.values()].some((bot) => bot.isConfigured())
     );
   }
 
@@ -250,6 +314,7 @@ export class ChatOpsManager {
     if (!binding) {
       throw new Error("The task's messaging-channel binding no longer exists");
     }
+    if (binding.provider === "jira") await this.reloadJiraProviders();
     const provider = this.providerForBinding(
       binding.provider,
       params.pinnedAgentId,
@@ -282,25 +347,36 @@ export class ChatOpsManager {
     conversationReference?: Record<string, unknown>;
     placeholderActivityId?: string;
     muteMarkerAtStart?: string | null;
-  }): Promise<void> {
+    progress?: boolean;
+  }): Promise<boolean> {
     const binding = await ChatOpsChannelBindingModel.findById(params.bindingId);
     if (!binding) {
+      if (params.progress)
+        throw new Error("The run's Slack binding no longer exists.");
       logger.warn(
         { bindingId: params.bindingId },
         "[ChatOps] notifyBindingThread: binding no longer exists",
       );
-      return;
+      return false;
     }
+    if (params.progress && binding.provider !== "slack") {
+      throw new Error(
+        "Progress updates are only supported for Slack runtime runs.",
+      );
+    }
+    if (binding.provider === "jira") await this.reloadJiraProviders();
     const provider = this.providerForBinding(
       binding.provider,
       params.pinnedAgentId,
     );
     if (!provider?.isConfigured()) {
+      if (params.progress)
+        throw new Error("The run's Slack provider is not configured.");
       logger.warn(
         { bindingId: params.bindingId, provider: binding.provider },
         "[ChatOps] notifyBindingThread: provider not configured",
       );
-      return;
+      return false;
     }
     const run = params.taskId
       ? await AgentRunModel.findByTaskId(params.taskId)
@@ -308,16 +384,26 @@ export class ChatOpsManager {
     const workspace = run
       ? await AgentWorkspaceModel.findByWorkloadName(run.workloadName)
       : null;
+    if (params.taskId && !params.progress)
+      await assertRuntimeAcknowledgementSettled(params.taskId);
     const metadata = {
       conversationReference: params.conversationReference,
       placeholderActivityId: params.placeholderActivityId,
+      ...(binding.provider === "jira" && {
+        jiraCommentId: params.conversationReference?.jiraCommentId,
+        jiraCommentUpdated: params.conversationReference?.jiraCommentUpdated,
+        jiraPlaceholderCommentId: params.placeholderActivityId,
+        jiraOperationKey: params.taskId
+          ? `task:${params.taskId}:completion`
+          : undefined,
+      }),
     };
     try {
       if (
         !params.text.trim() ||
         params.text.includes(CHATOPS_NO_REPLY_SENTINEL)
       )
-        return;
+        return false;
       if (
         params.muteMarkerAtStart !== undefined &&
         (await this.threadMutedSinceStart(
@@ -330,15 +416,15 @@ export class ChatOpsManager {
           params.muteMarkerAtStart,
         ))
       )
-        return;
+        return false;
       const nativeRuntimeReply =
         !!run &&
         (binding.provider === "slack" || binding.provider === "ms-teams");
       const conversationUrl = params.taskId
         ? agentRunUrl(workspace?.id ?? params.taskId)
         : undefined;
-      const send = (includeAnchor: boolean) =>
-        provider.sendReply({
+      const send = async (includeAnchor: boolean) => {
+        const messageId = await provider.sendReply({
           // Saved metadata preserves detached Teams routing and placeholder replacement.
           originalMessage: {
             messageId: `notify-${params.bindingId}-${Date.now()}`,
@@ -362,25 +448,33 @@ export class ChatOpsManager {
           conversationUrl: includeAnchor ? conversationUrl : undefined,
           hint:
             nativeRuntimeReply && includeAnchor && !binding.isDm
-              ? THREAD_MUTE_HINT
+              ? this.threadMuteHint(provider)
               : undefined,
           conversationReference: params.conversationReference,
         });
+        if (params.progress && !messageId) {
+          throw new Error("Slack did not confirm the progress update.");
+        }
+        return messageId;
+      };
       if (nativeRuntimeReply && conversationUrl) {
         await sendRuntimeReplyWithAnchor({
           organizationId: binding.organizationId,
           bindingId: binding.id,
           threadId: params.threadId,
           providerScope: provider.stateScope,
+          ...(params.progress && { anchorOptional: true }),
           send,
         });
       } else {
         await send(true);
       }
+      return true;
     } finally {
       try {
         if (
           params.taskId &&
+          !params.progress &&
           (binding.provider !== "slack" ||
             (
               await AgentRunModel.listCancelableInChatOpsThread({
@@ -572,6 +666,8 @@ export class ChatOpsManager {
       this.telegramProvider.setEventHandler(this);
     }
 
+    await this.reloadJiraProviders();
+
     if (!this.isAnyProviderConfigured()) {
       return;
     }
@@ -649,6 +745,7 @@ export class ChatOpsManager {
       await bot.cleanup();
     }
     this.slackAgentBots.clear();
+    this.jiraAgentBots.clear();
     if (this.telegramProvider) {
       await this.telegramProvider.cleanup();
       this.telegramProvider = null;
@@ -972,6 +1069,98 @@ export class ChatOpsManager {
    * 4. Fetch thread history for context
    * 5. Execute agent and send reply
    */
+  async processJiraMessage(
+    provider: JiraProvider,
+    message: IncomingChatMessage,
+  ): Promise<ChatOpsProcessingResult> {
+    const command = parseJiraApprovalCommand(message);
+    if (!command) return this.processMessage({ provider, message });
+    const binding = await ChatOpsChannelBindingModel.findByChannel({
+      provider: "jira",
+      channelId: message.channelId,
+      workspaceId: message.workspaceId,
+    });
+    if (
+      !binding ||
+      binding.organizationId !== provider.getOrganizationId() ||
+      binding.agentId !== provider.pinnedAgentId ||
+      !message.threadId
+    ) {
+      return { success: false, error: "NO_BINDING" };
+    }
+    const identityKey = {
+      integrationId: provider.jiraConfig.id,
+      organizationId: provider.getOrganizationId(),
+      accountId: message.senderId,
+    };
+    const identity = await JiraChatOpsIdentityModel.find(identityKey);
+    const email =
+      message.senderEmail ??
+      (identity ? null : await provider.getUserEmail(message.senderId));
+    const user = identity
+      ? identity.userId
+        ? await UserModel.getById(identity.userId)
+        : null
+      : email
+        ? await UserModel.findByEmail(email.toLowerCase())
+        : null;
+    if (user && !identity)
+      await JiraChatOpsIdentityModel.remember({
+        ...identityKey,
+        userId: user.id,
+      });
+    if (
+      !user?.emailVerified ||
+      user.banned ||
+      !(await ResourcePermissions.allows({
+        organizationId: binding.organizationId,
+        userId: user.id,
+        resource: "agent",
+        scope: provider.pinnedAgentId,
+        action: "use",
+      }))
+    )
+      return {
+        success: false,
+        error: "A verified authorized human must approve this request",
+      };
+    const pending = await A2ATaskApprovalRequestModel.findPendingInChatThread({
+      organizationId: binding.organizationId,
+      channelId: message.channelId,
+      threadId: message.threadId,
+      approvalId: command.approvalId,
+    });
+    if (pending.length !== 1 || pending[0].reviewerUserId !== user.id) {
+      return {
+        success: false,
+        error: "No single pending approval assigned to this reviewer",
+      };
+    }
+    const approval = pending[0];
+    if (typeof message.metadata?.jiraReceiptId === "string") {
+      await JiraChatOpsEventModel.attachTask({
+        receiptId: message.metadata.jiraReceiptId,
+        taskId: approval.taskId,
+      });
+    }
+    await this.handleInteractiveApprovalDecision(provider, {
+      taskId: approval.taskId,
+      approvalId: approval.approvalId,
+      approved: command.approved,
+      channelId: message.channelId,
+      workspaceId: message.workspaceId,
+      threadTs: message.threadId,
+      messageTs: approval.approvalId,
+      userId: message.senderId,
+      userName: message.senderName,
+      responseUrl: "",
+      approverEmail: user.email,
+      toolName: approval.toolName,
+      originalMessage: message,
+    });
+    return { success: true };
+  }
+
   async processMessage(params: {
     message: IncomingChatMessage;
     provider: ChatOpsProvider;
@@ -1043,6 +1232,30 @@ export class ChatOpsManager {
     });
   }
 
+  private async addPlatformMessageFiles(params: {
+    provider: ChatOpsProvider;
+    message: IncomingChatMessage;
+  }): Promise<void> {
+    const { provider, message } = params;
+    if (!provider.downloadMessageFiles) return;
+    const outcomes = await provider.downloadMessageFiles(message);
+    const delivered = outcomes.flatMap((o) =>
+      o.status === "delivered" ? [o.attachment] : [],
+    );
+    const skipped = outcomes.flatMap((o) =>
+      o.status === "skipped" ? [o.skipped] : [],
+    );
+    if (delivered.length > 0) {
+      message.attachments = [...(message.attachments ?? []), ...delivered];
+    }
+    if (skipped.length > 0) {
+      message.skippedAttachments = [
+        ...(message.skippedAttachments ?? []),
+        ...skipped,
+      ];
+    }
+  }
+
   private async processMessageWithAdmission(
     params: Parameters<ChatOpsManager["processMessage"]>[0],
     onPendingUserAdmission: (id: string) => void,
@@ -1056,9 +1269,11 @@ export class ChatOpsManager {
 
     // Deduplication check. Two bots in one channel both receive a message and
     // each decides on its own, so the claim is per bot.
-    const isNew = await ChatOpsProcessedMessageModel.tryMarkAsProcessed(
-      processedMessageKey(provider, message),
-    );
+    const isNew =
+      provider.providerId === "jira" ||
+      (await ChatOpsProcessedMessageModel.tryMarkAsProcessed(
+        processedMessageKey(provider, message),
+      ));
     if (!isNew) {
       return { success: true };
     }
@@ -1072,6 +1287,40 @@ export class ChatOpsManager {
 
     if (!binding) {
       return { success: true, error: "NO_BINDING" };
+    }
+
+    // Files the platform keeps off the message (Teams channel and group-chat
+    // files live in SharePoint) are read only now, once per answered message.
+    // As it arrived: a held message reads its platform files again on replay.
+    const arrivedMessage: IncomingChatMessage = { ...message };
+    await this.addPlatformMessageFiles({ provider, message });
+    // A file only its sender can open (a Teams group-chat file in their
+    // OneDrive): hold the message and ask them to sign in; it is answered
+    // again, with the file, once they have.
+    const signInFiles =
+      message.skippedAttachments?.filter(
+        (skipped) => skipped.reason === "sign_in_required",
+      ) ?? [];
+    if (
+      signInFiles.length > 0 &&
+      provider.requestFileSignIn &&
+      (await provider.requestFileSignIn({
+        message: arrivedMessage,
+        fileNames: signInFiles.flatMap((file) =>
+          file.name ? [file.name] : [],
+        ),
+      }))
+    ) {
+      return { success: true };
+    }
+    // A Teams channel message can look empty until its files are read; one
+    // that is still empty has nothing to answer.
+    if (
+      !message.text.trim() &&
+      !message.attachments?.length &&
+      !message.skippedAttachments?.length
+    ) {
+      return { success: true };
     }
 
     // "@router list": the agents this person can reach with "Agent > message".
@@ -1196,7 +1445,11 @@ export class ChatOpsManager {
       });
     }
 
-    if (provider.providerId === "slack" || provider.providerId === "ms-teams") {
+    if (
+      provider.providerId === "slack" ||
+      provider.providerId === "ms-teams" ||
+      provider.providerId === "jira"
+    ) {
       const runtimeAgent =
         agentToUse.id === agent.id
           ? agent
@@ -1207,7 +1460,9 @@ export class ChatOpsManager {
           binding,
           message,
           provider,
-          cleanedMessageText,
+          cleanedMessageText: isServiceAccountUserId(authResult.userId)
+            ? message.text
+            : cleanedMessageText,
           serverSideSessions,
           sendReply,
           userId: authResult.userId,
@@ -1225,6 +1480,9 @@ export class ChatOpsManager {
 
     // Build the full message with context — use cleanedMessageText so
     // the "AgentName >" prefix is stripped from what the LLM sees
+    const effectiveMessageText = isServiceAccountUserId(authResult.userId)
+      ? message.text
+      : cleanedMessageText;
     const providerLabel = CHATOPS_PROVIDER_LABELS[provider.providerId];
     const threadRootTs = message.threadId ?? message.messageId;
     // The channel's NAME, not just its id. Agent instructions are routinely
@@ -1357,15 +1615,15 @@ export class ChatOpsManager {
       const isGroup =
         conversationType === "groupChat" || conversationType === "channel";
       fullMessage = isGroup
-        ? `${message.senderName}: ${cleanedMessageText}`
+        ? `${message.senderName}: ${effectiveMessageText}`
         : cleanedMessageText;
       // The A2A manager prepends this straight onto the executed turn's text,
       // so the instructions are already adjacent to the message here.
       ephemeralExecutionPrefix = `${systemPrefix}${channelInstructions}`;
     } else {
-      fullMessage = `${systemPrefix}${channelInstructions}\n\n${cleanedMessageText}`;
+      fullMessage = `${systemPrefix}${channelInstructions}\n\n${effectiveMessageText}`;
       if (contextMessages.length > 0) {
-        fullMessage = `${systemPrefix}\n\nThe earlier messages in this thread are below — this is your shared history in this conversation, so you DO have access to it and remember it. Use it to answer follow-up questions and references to "earlier", "before", or "what I just asked".\n\nConversation so far:\n${contextMessages.join("\n")}${channelInstructions}\n\nUser: ${cleanedMessageText}`;
+        fullMessage = `${systemPrefix}\n\nThe earlier messages in this thread are below — this is your shared history in this conversation, so you DO have access to it and remember it. Use it to answer follow-up questions and references to "earlier", "before", or "what I just asked".\n\nConversation so far:\n${contextMessages.join("\n")}${channelInstructions}\n\nUser: ${effectiveMessageText}`;
       }
     }
 
@@ -1752,6 +2010,11 @@ export class ChatOpsManager {
     ].join("\n\n");
     const fullMessage = [
       `Current message: ${message.messageId}; sender: ${message.senderId}.`,
+      ...(provider.providerId === "slack"
+        ? [
+            `As the primary agent responding directly to this Slack thread, proactively send brief updates after meaningful milestones, when the plan materially changes, or when blocked or awaiting a user decision. During long-running work, occasionally explain what is still running or being waited on. Use ${archestraMcpBranding.getToolName(TOOL_POST_AGENT_RUN_MESSAGE_SHORT_NAME)} with message and the current task_id from the ARCHESTRA_AGENT_RUNTIME_TASK_ID environment variable, only while that task is active. If needed, discover it through the gateway's tool search. Keep updates to one or two sentences covering the result and next step; avoid narrating individual commands, repeating unchanged status, or duplicating acknowledgments or input notices already sent by the platform. Continue working after posting; sending a message does not end the turn or wait for a reply. Collect input and approvals through the available question or approval interface. Your final answer is posted automatically; do not send it with this tool. Delegated subagents must report internally to their parent and never post externally.`,
+          ]
+        : []),
       ...(isGroup
         ? [
             `Directly @mentioned: ${message.metadata?.botMentioned === true ? "yes" : "no"}.`,
@@ -1785,6 +2048,7 @@ export class ChatOpsManager {
       },
       provider,
       fullMessage,
+      cleanedMessageText: params.cleanedMessageText,
       sessionSetup,
       sendReply: params.sendReply,
       userId: params.userId,
@@ -1990,6 +2254,24 @@ export class ChatOpsManager {
 
     // Try pre-resolved email first (from Bot Framework TeamsInfo, no Graph API needed)
     let userEmail = message.senderEmail || null;
+    if (provider instanceof JiraProvider) {
+      const identity = await JiraChatOpsIdentityModel.find({
+        integrationId: provider.jiraConfig.id,
+        organizationId,
+        accountId: message.senderId,
+      });
+      if (identity) {
+        const linkedUser = identity.userId
+          ? await UserModel.getById(identity.userId)
+          : null;
+        if (!linkedUser || linkedUser.banned)
+          return {
+            success: false,
+            error: `The linked ${archestraMcpBranding.appName} account is unavailable`,
+          };
+        userEmail = linkedUser.email;
+      }
+    }
     if (!userEmail) {
       // Fall back to Graph API (requires User.Read.All permission)
       logger.debug(
@@ -2002,6 +2284,53 @@ export class ChatOpsManager {
       { senderId: message.senderId, userEmail },
       "[ChatOps] User email resolved",
     );
+
+    if (!userEmail && provider instanceof JiraProvider) {
+      const fallback = provider.getFallbackIdentity();
+      if (fallback && fallback.organizationId === organizationId) {
+        const fallbackAgent = await AgentModel.findById(agentId);
+        if (fallbackAgent && resolveAgentRuntime(fallbackAgent)) {
+          return {
+            success: false,
+            error:
+              "Hidden-email service fallback is unavailable for runtime agents. Use a linked human Jira identity.",
+          };
+        }
+        const [service, reviewer, member] = await Promise.all([
+          ServiceAccountModel.findAuthContext(
+            fallback.serviceAccountId,
+            organizationId,
+          ),
+          UserModel.getById(fallback.reviewerUserId),
+          MemberModel.getByUserId(fallback.reviewerUserId, organizationId),
+        ]);
+        const fallbackUserId = serviceAccountUserId(fallback.serviceAccountId);
+        if (
+          service &&
+          !service.disabled &&
+          reviewer?.emailVerified &&
+          !reviewer.banned &&
+          member &&
+          (await ResourcePermissions.allows({
+            userId: fallbackUserId,
+            organizationId,
+            resource: "agent",
+            scope: agentId,
+            action: "use",
+          })) &&
+          (await ResourcePermissions.allows({
+            userId: reviewer.id,
+            organizationId,
+            resource: "agent",
+            scope: agentId,
+            action: "use",
+          }))
+        ) {
+          message.text = `[Jira requester accountId ${message.senderId}; email unavailable. Running under the configured restricted service identity; this is not a verified human ${archestraMcpBranding.appName} identity.]\n${message.text}`;
+          return { success: true, userId: fallbackUserId };
+        }
+      }
+    }
 
     if (!userEmail) {
       logger.warn(
@@ -2044,6 +2373,20 @@ export class ChatOpsManager {
       };
     }
     let user = provisioned.user;
+    if (provider instanceof JiraProvider) {
+      await JiraChatOpsIdentityModel.remember({
+        integrationId: provider.jiraConfig.id,
+        organizationId,
+        accountId: message.senderId,
+        userId: user.id,
+      });
+    }
+    if (provider.providerId === "jira" && user.banned) {
+      return {
+        success: false,
+        error: `This ${archestraMcpBranding.appName} account is disabled`,
+      };
+    }
     if (provider.providerId === "ms-teams") {
       const admission = await ChatOpsUserAdmissionModel.acquire(userEmail);
       if (!admission)
@@ -2402,7 +2745,10 @@ export class ChatOpsManager {
         // chatops has no interactive affordance, so one automatic retry
         // stands in for it. The retry re-runs the whole agent turn, exactly
         // like a user-clicked retry would.
-        if (!isTransientProviderError(error)) {
+        if (
+          provider.providerId === "jira" ||
+          !isTransientProviderError(error)
+        ) {
           throw error;
         }
         logger.info(
@@ -2450,7 +2796,13 @@ export class ChatOpsManager {
         result,
         session,
         replyStream: replyStream.current,
-        reviewer: { userId, organizationId: binding.organizationId },
+        reviewer: {
+          userId:
+            provider instanceof JiraProvider && isServiceAccountUserId(userId)
+              ? (provider.getFallbackIdentity()?.reviewerUserId ?? userId)
+              : userId,
+          organizationId: binding.organizationId,
+        },
       });
     } catch (error) {
       // A mute that aborted the run mid-flight (e.g. during the retry leg above)
@@ -2537,6 +2889,7 @@ export class ChatOpsManager {
     providerType: ChatOpsProviderType,
     pinnedAgentId: string | undefined,
   ): ChatOpsProvider | null {
+    if (providerType === "jira") return this.getJiraProvider(pinnedAgentId);
     if (providerType === "slack" && pinnedAgentId) {
       return this.slackAgentBots.get(pinnedAgentId) ?? null;
     }
@@ -2581,8 +2934,8 @@ export class ChatOpsManager {
 
   /**
    * Start a durable run in the Agent's runtime. The run posts its result to
-   * this thread when it settles. Slack and Teams use provider status while
-   * other providers acknowledge startup. A
+   * this thread when it settles. Addressed Slack requests receive the session
+   * link as soon as it is accessible; provider status tracks execution. A
    * follow-up from the same person continues their latest workspace for the
    * thread, so the work carries over between messages.
    */
@@ -2592,6 +2945,7 @@ export class ChatOpsManager {
     message: IncomingChatMessage;
     provider: ChatOpsProvider;
     fullMessage: string;
+    cleanedMessageText?: string;
     sessionSetup?: string;
     ephemeralExecutionPrefix?: string;
     sendReply: boolean;
@@ -2609,12 +2963,13 @@ export class ChatOpsManager {
     } = params;
     const threadId = message.threadId ?? message.channelId ?? message.messageId;
     const actor = {
-      kind: "user" as const,
-      id: userId,
+      ...actorFromUserId(userId),
       organizationId: binding.organizationId,
     };
     const nativeConversation =
-      provider.providerId === "slack" || provider.providerId === "ms-teams";
+      provider.providerId === "slack" ||
+      provider.providerId === "ms-teams" ||
+      provider.providerId === "jira";
     // The Teams replay path (sendReply: false) posts `agentResponse` itself.
     const acknowledge = async (
       text: string,
@@ -2638,6 +2993,9 @@ export class ChatOpsManager {
         organizationId: binding.organizationId,
         actorKind: actor.kind,
         actorId: actor.id,
+        ...(provider.providerId === "jira" && {
+          jiraRequesterAccountId: message.senderId,
+        }),
       });
       const workspace = previous?.workspace;
       const workspaceRetained =
@@ -2681,21 +3039,40 @@ export class ChatOpsManager {
         { type: "chatops" }
       > = {
         type: "chatops",
+        ...(provider.providerId === "jira" && {
+          jiraRequesterAccountId: message.senderId,
+        }),
         bindingId: binding.id,
         threadId,
         muteMarkerAtStart,
         ...(provider.pinnedAgentId && {
           pinnedAgentId: provider.pinnedAgentId,
         }),
-        ...(provider.providerId === "ms-teams" && {
-          conversationReference: message.metadata?.conversationReference as
-            | Record<string, unknown>
-            | undefined,
-          placeholderActivityId: message.metadata?.placeholderActivityId as
-            | string
-            | undefined,
+        ...((provider.providerId === "ms-teams" ||
+          provider.providerId === "jira") && {
+          conversationReference:
+            provider.providerId === "jira"
+              ? {
+                  jiraCommentId: message.metadata?.jiraCommentId,
+                  jiraCommentUpdated: message.metadata?.jiraCommentUpdated,
+                }
+              : (message.metadata?.conversationReference as
+                  | Record<string, unknown>
+                  | undefined),
+          placeholderActivityId: (provider.providerId === "jira"
+            ? message.metadata?.jiraPlaceholderCommentId
+            : message.metadata?.placeholderActivityId) as string | undefined,
         }),
       };
+      let acknowledgementDelivery = Promise.resolve();
+      // Only a new workspace is acknowledged: the thread already holds the
+      // link to a continued one, and its follow-ups go straight to work.
+      const acknowledgeSession =
+        sendReply &&
+        !resumeFromTaskId &&
+        provider.providerId === "slack" &&
+        (message.metadata?.conversationType === "personal" ||
+          message.metadata?.botMentioned === true);
       const task = await startDetachedAgentTask({
         actor,
         agentId: agent.id,
@@ -2706,9 +3083,24 @@ export class ChatOpsManager {
         attachments: message.attachments,
         onTaskCreated: async (taskId) => {
           completionTarget.originatingTaskId = taskId;
+          if (
+            provider.providerId === "jira" &&
+            typeof message.metadata?.jiraReceiptId === "string"
+          ) {
+            await JiraChatOpsEventModel.attachTask({
+              receiptId: message.metadata.jiraReceiptId,
+              taskId,
+            });
+          }
         },
         systemParams: {
           resumeFromTaskId,
+          runtimeTitle:
+            resumeFromTaskId && previous
+              ? previous.run.title
+              : toPlaceholderTitle(
+                  `${CHATOPS_PROVIDER_LABELS[provider.providerId]}: ${params.cleanedMessageText || message.text || "New chat"}`,
+                ),
           sessionId: buildChatOpsSessionId(
             provider.providerId,
             message.channelId,
@@ -2718,12 +3110,54 @@ export class ChatOpsManager {
           routeCategory: RouteCategory.CHATOPS,
           completionTarget,
           ephemeralExecutionPrefix,
+          ...(acknowledgeSession && {
+            onRuntimeSessionCreated: async ({ taskId, workspaceId }) => {
+              const acknowledgement = await startRuntimeAcknowledgement({
+                taskId,
+                send: async () => {
+                  if (
+                    (await this.threadMutedSinceStart(
+                      threadKey,
+                      muteMarkerAtStart,
+                    )) ||
+                    (await A2ATaskModel.findById(taskId))?.state ===
+                      "TASK_STATE_CANCELED"
+                  )
+                    return;
+                  await sendRuntimeReplyWithAnchor({
+                    organizationId: binding.organizationId,
+                    bindingId: binding.id,
+                    threadId,
+                    providerScope: provider.stateScope,
+                    anchorOptional: true,
+                    send: (includeAnchor) =>
+                      provider.sendReply({
+                        originalMessage: message,
+                        text: "I'm on it.",
+                        conversationUrl: agentRunUrl(workspaceId),
+                        footer: includeAnchor
+                          ? buildAgentFooter(agent.name)
+                          : undefined,
+                        hint:
+                          includeAnchor &&
+                          message.metadata?.conversationType !== "personal"
+                            ? this.threadMuteHint(provider)
+                            : undefined,
+                        bestEffort: true,
+                      }),
+                  });
+                },
+              });
+              acknowledgementDelivery = acknowledgement.delivery;
+            },
+          }),
         },
       });
       void watchTaskCompletion({
         taskId: task.id,
         agentName: agent.name,
         target: completionTarget,
+        beforeDelivery: () => acknowledgementDelivery,
       }).catch((error) => {
         logger.warn(
           { error: errorMessage(error), taskId: task.id },
@@ -2862,10 +3296,26 @@ export class ChatOpsManager {
 
     // A per-user provider the user hasn't linked yet → a friendly prompt
     // with a link to connect (chatops can't render the interactive flow).
-    if (error instanceof LlmProviderAuthRequiredError) {
+    const providerAuth =
+      error instanceof LlmProviderAuthRequiredError
+        ? error
+        : error instanceof ProviderError
+          ? error.chatErrorResponse.authAction
+          : undefined;
+    if (providerAuth) {
+      const { provider: authProvider, providerLabel } = providerAuth;
+      const subscriptionKind = subscriptionKindForProvider(authProvider);
+      const setupPath = subscriptionKind
+        ? `/llm/model-providers?reconnect=${encodeURIComponent(subscriptionKind)}`
+        : `/llm/model-providers?create=${encodeURIComponent(authProvider)}`;
       await provider.sendReply({
         originalMessage: message,
-        text: `This agent uses ${error.providerLabel}, which is per-user. Connect your own ${error.providerLabel} account, then try again: ${config.frontendBaseUrl}/settings`,
+        text: [
+          error instanceof ProviderError
+            ? error.chatErrorResponse.message
+            : `This agent uses ${providerLabel}, which is per-user. Connect your own ${providerLabel} account, then try again.`,
+          `[${error instanceof ProviderError ? "Reconnect account" : "Connect account"}](${config.frontendBaseUrl}${setupPath})`,
+        ].join("\n\n"),
         footer: footer(),
         conversationReference: message.metadata?.conversationReference,
       });
@@ -2900,13 +3350,24 @@ export class ChatOpsManager {
     // x-api-key"). Users rarely realize the bot resolves its model/key the
     // same way in-app chat does, so name the key that was used and where to
     // fix it instead of leaving only the provider's cryptic one-liner.
-    if (isLlmProviderAuthError(errMsg)) {
+    if (
+      isLlmProviderAuthError(errMsg) ||
+      (error instanceof ProviderError &&
+        error.chatErrorResponse.code === ChatErrorCode.Authentication)
+    ) {
       const usedLlm = llmContext
         ? await this.describeLlmUsedForRun({
             ...llmContext,
             agentId: isSubagentError ? error.subagentId : llmContext.agentId,
           })
         : null;
+      const rejectedProvider =
+        error instanceof ProviderError
+          ? error.chatErrorResponse.originalError?.provider
+          : undefined;
+      const setupPath = rejectedProvider
+        ? `/llm/model-providers?create=${encodeURIComponent(rejectedProvider)}`
+        : "/llm/model-providers";
       await provider.sendReply({
         originalMessage: message,
         text: [
@@ -2915,7 +3376,7 @@ export class ChatOpsManager {
           usedLlm ??
             "Check the API key configured for this agent (or your organization's LLM settings).",
           "",
-          `Update the key or configure a different one, then try again: ${config.frontendBaseUrl}/llm/model-providers`,
+          `Update the key or configure a different one, then try again. [Configure provider](${config.frontendBaseUrl}${setupPath})`,
         ].join("\n"),
         footer: footer(sourcedErrorDetail),
         conversationReference: message.metadata?.conversationReference,
@@ -2954,7 +3415,6 @@ export class ChatOpsManager {
           agent: { llmApiKeyId: agent.llmApiKeyId, modelId: agent.modelId },
           organizationId: params.organizationId,
           userId: params.userId,
-          includeMemberChatDefault: false,
         });
 
       const userTeamIds = await TeamModel.getUserTeamIds(params.userId);
@@ -3078,7 +3538,7 @@ export class ChatOpsManager {
           ...(session?.rolledOver
             ? { hint: CHATOPS_SESSION_ROLLOVER_HINT }
             : (await this.shouldHintThreadMute(provider, message)) && {
-                hint: THREAD_MUTE_HINT,
+                hint: this.threadMuteHint(provider),
               }),
           conversationReference: message.metadata?.conversationReference,
         },
@@ -3118,6 +3578,13 @@ export class ChatOpsManager {
       agentResponse,
       interactionId: resultMessage.messageId,
     };
+  }
+
+  private threadMuteHint(provider: ChatOpsProvider): string {
+    if (provider.providerId === "jira") return JIRA_THREAD_MUTE_HINT;
+    return provider.providerId === "slack"
+      ? SLACK_THREAD_MUTE_HINT
+      : THREAD_MUTE_HINT;
   }
 
   /**
@@ -3232,6 +3699,7 @@ export class ChatOpsManager {
           approvalId: approvalRequest.approvalId,
           userId: reviewer.userId,
           channelId: message.channelId,
+          threadId: message.threadId,
         });
         // `run_tool` is a meta wrapper; show the user the underlying tool and
         // its arguments rather than the opaque wrapper name.
@@ -3306,8 +3774,7 @@ export class ChatOpsManager {
       message.threadId ?? message.channelId ?? message.messageId;
 
     const actor = {
-      kind: "user" as const,
-      id: userId,
+      ...actorFromUserId(userId),
       organizationId: binding.organizationId,
     };
 
@@ -3378,6 +3845,17 @@ export class ChatOpsManager {
         : undefined,
     });
 
+    if (
+      provider.providerId === "jira" &&
+      initialResult.task &&
+      typeof message.metadata?.jiraReceiptId === "string"
+    ) {
+      await JiraChatOpsEventModel.attachTask({
+        receiptId: message.metadata.jiraReceiptId,
+        taskId: initialResult.task.id,
+      });
+    }
+
     return {
       result: initialResult,
       responseAgent: agent,
@@ -3406,7 +3884,7 @@ export class ChatOpsManager {
     provider: ChatOpsProvider;
     message: IncomingChatMessage;
     threadId: string;
-    actor: { kind: "user"; id: string; organizationId: string };
+    actor: A2AActor;
     rollOverWhenIdle: boolean;
   }): Promise<{ contextId: string; rolledOver: boolean }> {
     const threadKey = {
@@ -3631,6 +4109,82 @@ export class ChatOpsManager {
         return;
       }
 
+      let approvalActor: A2AActor = {
+        kind: "user",
+        id: user.id,
+        organizationId: binding.organizationId,
+      };
+      if (provider instanceof JiraProvider) {
+        if (
+          !user.emailVerified ||
+          user.banned ||
+          binding.organizationId !== provider.getOrganizationId() ||
+          binding.agentId !== provider.pinnedAgentId ||
+          !(await ResourcePermissions.allows({
+            organizationId: binding.organizationId,
+            userId: user.id,
+            resource: "agent",
+            scope: provider.pinnedAgentId,
+            action: "use",
+          }))
+        )
+          return;
+        const pending =
+          await A2ATaskApprovalRequestModel.findPendingInChatThread({
+            organizationId: binding.organizationId,
+            channelId: decision.channelId,
+            threadId:
+              decision.threadTs ?? decision.originalMessage.threadId ?? "",
+            approvalId: decision.approvalId,
+          });
+        if (
+          pending.length !== 1 ||
+          pending[0].taskId !== decision.taskId ||
+          pending[0].reviewerUserId !== user.id
+        )
+          return;
+        const pausedTask = await A2ATaskModel.findById(decision.taskId);
+        if (!pausedTask || pausedTask.agentId !== provider.pinnedAgentId)
+          return;
+        const pausedContext = await A2AContextModel.findById(
+          pausedTask.contextId,
+        );
+        if (pausedContext?.actorKind === "serviceAccount") {
+          const fallback = provider.getFallbackIdentity();
+          if (
+            !fallback ||
+            fallback.serviceAccountId !== pausedContext.actorId ||
+            fallback.reviewerUserId !== user.id
+          )
+            return;
+          const service = await ServiceAccountModel.findAuthContext(
+            fallback.serviceAccountId,
+            binding.organizationId,
+          );
+          if (
+            !service ||
+            service.disabled ||
+            !(await ResourcePermissions.allows({
+              organizationId: binding.organizationId,
+              userId: serviceAccountUserId(fallback.serviceAccountId),
+              resource: "agent",
+              scope: provider.pinnedAgentId,
+              action: "use",
+            }))
+          )
+            return;
+          approvalActor = {
+            kind: "serviceAccount",
+            id: fallback.serviceAccountId,
+            organizationId: binding.organizationId,
+          };
+        } else if (
+          pausedContext?.actorKind !== "user" ||
+          pausedContext.actorId !== user.id
+        )
+          return;
+      }
+
       // An OpenAPPA review is decided by its stored reviewer, in its thread,
       // before it expires, once. The button payload only names the review.
       const openappaReview = await decideChatHitlReview({
@@ -3734,11 +4288,7 @@ export class ChatOpsManager {
         ? this.statefulA2aManager
         : this.a2aManager;
       const result = await approvalA2aManager.sendMessage({
-        actor: {
-          kind: "user" as const,
-          id: user.id,
-          organizationId: binding.organizationId,
-        },
+        actor: approvalActor,
         agentId,
         request: buildApprovalDecisionSendMessageRequest({
           taskId: decision.taskId,
@@ -3828,6 +4378,7 @@ const CHATOPS_PROVIDER_LABELS: Record<ChatOpsProviderType, string> = {
   slack: "Slack",
   "ms-teams": "MS Teams",
   telegram: "Telegram",
+  jira: "Jira",
 };
 
 /** Interaction-log `source` value per provider. */
@@ -3836,6 +4387,7 @@ const CHATOPS_PROVIDER_SOURCES: Record<ChatOpsProviderType, InteractionSource> =
     slack: "chatops:slack",
     "ms-teams": "chatops:ms-teams",
     telegram: "chatops:telegram",
+    jira: "chatops:jira",
   };
 
 /**

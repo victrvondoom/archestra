@@ -1,11 +1,16 @@
-import type { IncomingEmailSecurityMode } from "@archestra/shared";
+import type {
+  GitHubActionsAccess,
+  IncomingEmailSecurityMode,
+} from "@archestra/shared";
 import { type SQL, sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
   index,
   integer,
   jsonb,
+  numeric,
   text,
   timestamp,
   uniqueIndex,
@@ -24,6 +29,8 @@ import environmentsTable from "./environment";
 import identityProvidersTable from "./identity-provider";
 import llmProviderApiKeysTable from "./llm-provider-api-key";
 import modelsTable from "./model";
+import modelPoolsTable from "./model-pool";
+import routingScorerVersionsTable from "./routing-scorer-version";
 import secretsTable from "./secret";
 import serviceAccountsTable from "./service-account";
 import { softDeletablePgTable } from "./soft-deletable-table";
@@ -102,6 +109,36 @@ const agentsTable = softDeletablePgTable(
     modelId: uuid("model_id").references(() => modelsTable.id, {
       onDelete: "set null",
     }),
+    /**
+     * A model pool as the agent's default model. `llmApiKeyId` and `modelId`
+     * then hold one member, for everything that needs a single model; its
+     * runs and new chats go to the pool. ON DELETE SET NULL.
+     */
+    modelPoolId: uuid("model_pool_id").references(() => modelPoolsTable.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * Auto routing (the org's `llm_proxy` row only). Server-managed: written
+     * under the routing-plan lock, which also bumps `autoRoutingGeneration`.
+     */
+    autoRoutingEnabled: boolean("auto_routing_enabled")
+      .notNull()
+      .default(false),
+    autoRoutingBudgetUsdPerDay: numeric("auto_routing_budget_usd_per_day", {
+      precision: 12,
+      scale: 2,
+    }),
+    autoRoutingScorerVersionId: uuid(
+      "auto_routing_scorer_version_id",
+    ).references(() => routingScorerVersionsTable.id),
+    autoRoutingGeneration: bigint("auto_routing_generation", { mode: "number" })
+      .notNull()
+      .default(0),
+    autoRoutingPlannedGeneration: bigint("auto_routing_planned_generation", {
+      mode: "number",
+    })
+      .notNull()
+      .default(0),
 
     /** Optional Identity Provider for JWKS-based JWT validation on MCP Gateway requests */
     identityProviderId: text("identity_provider_id").references(
@@ -140,6 +177,15 @@ const agentsTable = softDeletablePgTable(
 
     /** Allowlist of HTTP header names to forward from gateway requests to downstream MCP servers */
     passthroughHeaders: text("passthrough_headers").array(),
+
+    /**
+     * MCP gateways only: which GitHub Actions pull-request jobs may trade
+     * their OIDC token for a token on this gateway that acts as the pull
+     * request's author. Null turns the exchange off.
+     */
+    githubActionsAccess: jsonb(
+      "github_actions_access",
+    ).$type<GitHubActionsAccess>(),
 
     /** Whether tools/list exposes the full tool menu or only meta-discovery tools */
     toolExposureMode: text("tool_exposure_mode")
@@ -264,6 +310,12 @@ const agentsTable = softDeletablePgTable(
     index("agents_environment_id_idx").on(table.environmentId),
     index("agents_author_id_idx").on(table.authorId),
     index("agents_scope_idx").on(table.scope),
+    // Deleting a model clears this column through its foreign key, one
+    // lookup per deleted model. Without an index every lookup read the whole
+    // table, so removing a provider key's models outran the statement timeout.
+    index("agents_model_id_idx")
+      .on(table.modelId)
+      .where(sql`${table.modelId} IS NOT NULL`),
     // Agent lists: walk visible agents in name or creation order and stop at
     // the page. The name indexes also carry the columns the list's
     // visibility filter reads, so the list's count is an index-only scan.

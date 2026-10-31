@@ -9,10 +9,7 @@ import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model
 import UserModel from "@/models/user";
 import { guardrailsPolicyService } from "@/services/guardrails-policy";
 import { ApiError } from "@/types";
-import type {
-  NewSessionPolicy,
-  UnsupportedAppaClientAction,
-} from "@/types/guardrails-policy";
+import type { UnsupportedAppaClientAction } from "@/types/guardrails-policy";
 
 export type GuardrailsV2Activation = "active" | "inactive";
 
@@ -33,19 +30,23 @@ export async function isGuardrailsV2Active(): Promise<boolean> {
   return (await readGuardrailsV2Activation()) === "active";
 }
 export async function getGuardrailsDeployment() {
+  return getGuardrailsDeploymentFromSnapshot();
+}
+
+export async function getGuardrailsDeploymentFromSnapshot(
+  snapshot?: Parameters<typeof GuardrailsDeploymentModel.get>[0],
+) {
   const {
     enabled,
     unsupportedClientAction,
     breakTheGlassEnabled,
-    newSessionPolicy,
     annotatorModelId,
     annotatorLlmApiKeyId,
-  } = await GuardrailsDeploymentModel.get();
+  } = await GuardrailsDeploymentModel.get(snapshot);
   return {
     enabled,
     unsupportedClientAction,
     breakTheGlassEnabled,
-    newSessionPolicy,
     annotatorModelId,
     annotatorLlmApiKeyId,
     featureEnabled: enterpriseTier.isOpenappaActive(),
@@ -78,7 +79,6 @@ export async function setGuardrailsDeployment(
     enabled?: boolean;
     unsupportedClientAction?: UnsupportedAppaClientAction;
     breakTheGlassEnabled?: boolean;
-    newSessionPolicy?: NewSessionPolicy;
     annotatorModelId?: string | null;
     annotatorLlmApiKeyId?: string | null;
   },
@@ -115,9 +115,7 @@ export async function setGuardrailsDeployment(
     },
     after.enabled !== before.enabled
       ? `Guardrails enforcement switched ${after.enabled ? "on" : "off"}`
-      : after.newSessionPolicy !== before.newSessionPolicy
-        ? `Guardrails policy for new sessions set to ${after.newSessionPolicy}`
-        : "Guardrails deployment settings changed",
+      : "Guardrails deployment settings changed",
   );
   return after;
 }
@@ -130,7 +128,6 @@ function deploymentSettings(
     active: deployment.active,
     unsupportedClientAction: deployment.unsupportedClientAction,
     breakTheGlassEnabled: deployment.breakTheGlassEnabled,
-    newSessionPolicy: deployment.newSessionPolicy,
     annotatorModelId: deployment.annotatorModelId,
     annotatorLlmApiKeyId: deployment.annotatorLlmApiKeyId,
   };

@@ -3,7 +3,7 @@
 # the Alpine packages/binaries have historically lagged on Go patch releases, so
 # we compile these tools ourselves to pick up upstream fixes without local vendoring hacks.
 ARG GOLANG_IMAGE=golang:1.26.9-alpine@sha256:cdfd4fe2da6b225d8b40c6b7a105736e548e83ff56d5d8f9394446eeb5eb84e0
-ARG NODE_IMAGE=node:24-alpine3.23@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14
+ARG NODE_IMAGE=node:24-alpine3.23@sha256:0468540aa58203ff9e40c2aab3907c52644ab818af6176b1c70a026137dc92a2
 ARG KIND_VERSION=v0.31.0
 ARG KIND_COMMIT=a323333ff9efd8099f95a8a6b5c86c75a210d00f
 ARG DOCKER_CLI_VERSION=v29.3.0
@@ -54,8 +54,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod edit -go=1.25.11 && \
     # CVE-2026-39883: OTel SDK untrusted search path fixed in >= 1.43.0
     go get go.opentelemetry.io/otel/sdk@v1.43.0 && \
-    # CVE-2026-34986: go-jose uncaught exception fixed in >= 4.1.4
-    go get github.com/go-jose/go-jose/v4@v4.1.4 && \
+    # CVE-2026-34986 and CVE-2026-116587: patched go-jose JWE/JWK parsing.
+    go get github.com/go-jose/go-jose/v4@v4.1.6 && \
     # CVE-2026-17106: go-archive path traversal fixed in >= 0.3.0 (vendor.mod floors it at 0.2.0)
     go get github.com/moby/go-archive@v0.3.0 && \
     # x/sys/x/term must be pinned for `go mod vendor` to find windows/registry and plan9 sub-pkgs.
@@ -94,8 +94,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     # cve-2026-34040: replace Dagger's BuildKit Docker monolith imports with split Moby modules.
     go mod edit -require=github.com/docker/docker@v29.3.1+incompatible && \
     go mod edit -replace=github.com/docker/docker=./dockercompat && \
-    # cve-2026-34986: go-jose uncaught exception fixed in >= 4.1.4
-    go get github.com/go-jose/go-jose/v4@v4.1.4 && \
+    # CVE-2026-34986 and CVE-2026-116587: patched go-jose JWE/JWK parsing.
+    go get github.com/go-jose/go-jose/v4@v4.1.6 && \
     # cve-2026-45022: go-git validation issue fixed in >= 5.19.0
     # cve-2026-71556: go-git link following fixed in >= 5.19.2
     go get github.com/go-git/go-git/v5@v5.19.2 && \
@@ -226,6 +226,7 @@ COPY archestra-rs/sandbox-rs/package.json archestra-rs/sandbox-rs/
 COPY archestra-rs/app-runtime-rs/package.json archestra-rs/app-runtime-rs/
 COPY archestra-rs/image-rs/package.json archestra-rs/image-rs/
 COPY archestra-rs/openappa-rs/package.json archestra-rs/openappa-rs/
+COPY archestra-rs/router-rs/package.json archestra-rs/router-rs/
 
 # Install all dependencies
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
@@ -267,9 +268,11 @@ COPY archestra-rs/app-runtime-rs/Cargo.toml archestra-rs/app-runtime-rs/build.rs
 COPY archestra-rs/image-core/Cargo.toml ./archestra-rs/image-core/
 COPY archestra-rs/image-rs/Cargo.toml archestra-rs/image-rs/build.rs ./archestra-rs/image-rs/
 COPY archestra-rs/openappa-rs/Cargo.toml archestra-rs/openappa-rs/build.rs ./archestra-rs/openappa-rs/
+COPY archestra-rs/router-core/Cargo.toml ./archestra-rs/router-core/
+COPY archestra-rs/router-rs/Cargo.toml archestra-rs/router-rs/build.rs ./archestra-rs/router-rs/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    for crate in sandbox-core sandbox-rs app-runtime-core app-runtime-rs image-core image-rs openappa-rs; do \
+    for crate in sandbox-core sandbox-rs app-runtime-core app-runtime-rs image-core image-rs openappa-rs router-core router-rs; do \
       mkdir -p "archestra-rs/${crate}/src"; \
       printf 'pub fn dependency_cache_placeholder() {}\n' > "archestra-rs/${crate}/src/lib.rs"; \
     done && \
@@ -279,7 +282,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
       arm64) RUST_TARGET=aarch64-alpine-linux-musl ;; \
       *) echo "Unsupported Rust architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    for package in app_runtime_rs image_rs sandbox_rs openappa_rs; do \
+    for package in app_runtime_rs image_rs sandbox_rs openappa_rs router_rs; do \
       RUSTFLAGS='-C target-feature=-crt-static' cargo build --release --locked \
         --target "${RUST_TARGET}" -p "${package}"; \
     done
@@ -294,6 +297,7 @@ COPY --from=deps /app/archestra-rs/sandbox-rs/node_modules ./archestra-rs/sandbo
 COPY --from=deps /app/archestra-rs/app-runtime-rs/node_modules ./archestra-rs/app-runtime-rs/node_modules
 COPY --from=deps /app/archestra-rs/image-rs/node_modules ./archestra-rs/image-rs/node_modules
 COPY --from=deps /app/archestra-rs/openappa-rs/node_modules ./archestra-rs/openappa-rs/node_modules
+COPY --from=deps /app/archestra-rs/router-rs/node_modules ./archestra-rs/router-rs/node_modules
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY archestra-rs/Cargo.toml archestra-rs/Cargo.lock ./archestra-rs/
 COPY archestra-rs/vendor/dagger-sdk-0.21.9 ./archestra-rs/vendor/dagger-sdk-0.21.9
@@ -305,6 +309,8 @@ COPY archestra-rs/app-runtime-rs ./archestra-rs/app-runtime-rs
 COPY archestra-rs/image-core ./archestra-rs/image-core
 COPY archestra-rs/image-rs ./archestra-rs/image-rs
 COPY archestra-rs/openappa-rs ./archestra-rs/openappa-rs
+COPY archestra-rs/router-core ./archestra-rs/router-core
+COPY archestra-rs/router-rs ./archestra-rs/router-rs
 
 # These tasks stay outside Turbo's shared cache because their artifacts are
 # platform-specific. This Docker layer is architecture-scoped and exportable,
@@ -318,7 +324,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     pnpm --filter @archestra/sandbox-rs \
          --filter @archestra/app-runtime-rs \
          --filter @archestra/image-rs \
-         --filter @archestra/openappa-rs build
+         --filter @archestra/openappa-rs \
+         --filter @archestra/router-rs build
 
 # VERSION is intentionally declared after the native RUN. Build args implicitly
 # participate in following RUN cache keys, and every staging commit has a new
@@ -348,7 +355,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=bind,from=rust-deps,source=/app/archestra-rs/target,target=/app/archestra-rs/target,rw \
     --mount=type=cache,id=rust-napi-debug,target=/app/archestra-rs/target/debug \
-    pnpm --filter @archestra/sandbox-rs --filter @archestra/app-runtime-rs --filter @archestra/image-rs --filter @archestra/openappa-rs check:musl
+    pnpm --filter @archestra/sandbox-rs --filter @archestra/app-runtime-rs --filter @archestra/image-rs --filter @archestra/openappa-rs --filter @archestra/router-rs check:musl
 
 # <----- Builder stage ----->
 FROM builder-base AS builder
@@ -451,7 +458,10 @@ ENV ARCHESTRA_SENTRY_ENVIRONMENT=""
 ENV ARCHESTRA_HTTP_KEEP_ALIVE_TIMEOUT_MS="620000"
 
 # Cloud database CA bundle for SSL certificate validation
-# This allows sslmode=require to work with AWS RDS and Google Cloud SQL
+# This allows sslmode=require to work with AWS RDS and Google Cloud SQL.
+# Node reads it through NODE_EXTRA_CA_CERTS. The OpenAPPA runtime connects
+# through OpenSSL, which reads only the system store, so the RUN below also
+# appends the bundle to /etc/ssl/certs/ca-certificates.crt.
 ENV NODE_EXTRA_CA_CERTS="/etc/ssl/certs/cloud-database-ca-bundle.pem"
 
 # Vendor cloud database CA bundles into the repository so image builds do not
@@ -489,6 +499,7 @@ RUN apk --no-cache upgrade && \
         "postgresql18>=18.5-r0" postgresql-pgvector su-exec git git-daemon && \
     # Combine all CA bundles
     cat /tmp/aws-rds-ca.pem /tmp/gcloud-sql-ca.pem > /etc/ssl/certs/cloud-database-ca-bundle.pem && \
+    cat /etc/ssl/certs/cloud-database-ca-bundle.pem >> /etc/ssl/certs/ca-certificates.crt && \
     rm -f /tmp/aws-rds-ca.pem /tmp/gcloud-sql-ca.pem && \
     # Remove NPM-related files and directories (as we do not use npm and it just brings extra dependencies/vulnerabilities)
     # See https://github.com/grafana/grafana-image-renderer/pull/625
@@ -585,6 +596,7 @@ VOLUME /var/lib/postgresql/data /app/data
 # or `pnpm install` are needed in this stage.
 COPY docker/scripts/docker-banner.sh /app/docker-banner.sh
 COPY docker/scripts/docker-entrypoint.sh /docker-entrypoint.sh
+COPY docker/scripts/shutdown-budget.mjs /app/shutdown-budget.mjs
 # slim Dagger Engine manifest applied into the embedded KinD cluster in quickstart
 # mode; backs the skill sandbox / code runtime (archestra__run_command and friends).
 # Real deployments provision engines in code instead — the quickstart runs this one

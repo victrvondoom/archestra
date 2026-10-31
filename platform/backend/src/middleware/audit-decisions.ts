@@ -24,6 +24,7 @@ import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
 import McpServerModel from "@/models/mcp-server";
 import MemberModel from "@/models/member";
 import ModelModel from "@/models/model";
+import ModelPoolModel from "@/models/model-pool";
 import OpenAppaBatteryInstallModel from "@/models/openappa-battery-install";
 import OpenAppaBatteryPackageModel from "@/models/openappa-battery-package";
 import OpenAppaCredentialBindingModel from "@/models/openappa-credential-binding";
@@ -40,6 +41,7 @@ import ServiceAccountModel from "@/models/service-account";
 import SkillModel from "@/models/skill";
 import SkillShareLinkModel from "@/models/skill-share-link";
 import TeamModel from "@/models/team";
+import UserLimitUsageResetModel from "@/models/user-limit-usage-reset";
 import UserTokenModel from "@/models/user-token";
 import VirtualApiKeyModel from "@/models/virtual-api-key";
 
@@ -87,6 +89,21 @@ type AuditDecision =
  * @public — consumed by audit-log-snapshot.test.ts invariant tests
  */
 export const AUDIT_DECISIONS = {
+  jiraChatOpsIdentitiesTable: {
+    audited: false,
+    reason:
+      "Observed external human identity pinning; internal ChatOps authorization state without admin mutation routes",
+  },
+  jiraChatOpsEventsTable: {
+    audited: false,
+    reason:
+      "Jira webhook receipt and dispatch state; internal high-volume runtime ledger",
+  },
+  jiraChatOpsDeliveriesTable: {
+    audited: false,
+    reason:
+      "Jira comment delivery and reconciliation state; internal runtime ledger",
+  },
   guardrailsPolicyRevisionsTable: {
     audited: true,
     model: GuardrailsPolicyModel,
@@ -157,10 +174,15 @@ export const AUDIT_DECISIONS = {
     model: KnowledgeBaseConnectorModel,
   },
   limitsTable: { audited: true, model: LimitModel },
+  userLimitUsageResetsTable: {
+    audited: true,
+    model: UserLimitUsageResetModel,
+  },
   llmProviderApiKeysTable: { audited: true, model: LlmProviderApiKeyModel },
   mcpServersTable: { audited: true, model: McpServerModel },
   membersTable: { audited: true, model: MemberModel },
   modelsTable: { audited: true, model: ModelModel },
+  modelPoolsTable: { audited: true, model: ModelPoolModel },
   // oauthClientsTable stores LLM OAuth clients (/api/llm-oauth-clients) and MCP
   // OAuth clients (/api/mcp-oauth-clients). Admin CRUD for both is audited at the
   // route level via AUDITABLE_ROUTES; this table-level model is the LLM snapshot.
@@ -578,6 +600,11 @@ export const AUDIT_DECISIONS = {
     audited: false,
     reason: "per-viewer UI state; intentionally excluded from audit logs",
   },
+  mcpServerToolDescriptionsTable: {
+    audited: false,
+    reason:
+      "derived from each installation's MCP tool discovery, like tools; no route mutates it directly",
+  },
   teamMembersTable: {
     audited: false,
     reason: "join: team × member; member changes audited via member",
@@ -586,12 +613,7 @@ export const AUDIT_DECISIONS = {
     audited: false,
     reason: "join: team × external group; parent (team) audited",
   },
-  // Vault folder mutations are captured under the parent team resource via
-  // /api/teams/:teamId/vault-folder → resourceType: "team".
-  teamVaultFoldersTable: {
-    audited: false,
-    reason: "team vault folder; mutations captured under parent team resource",
-  },
+
   virtualApiKeyProviderApiKeysTable: {
     audited: false,
     reason: "join: virtual key × provider key; parent audited",
@@ -695,6 +717,11 @@ export const AUDIT_DECISIONS = {
     reason:
       "derived per-viewer marketplace repo; created implicitly on clone, carries no user-authored state",
   },
+  agentRunAttentionNoticesTable: {
+    audited: false,
+    reason:
+      "internal Slack delivery state; contains only routing, message identity, and attention resolution",
+  },
   agentRunsTable: {
     audited: false,
     reason:
@@ -772,6 +799,10 @@ export const AUDIT_DECISIONS = {
     audited: false,
     reason:
       "user's own PFS files; download_file/save_file outputs, no admin signal",
+  },
+  proxyProviderFilesTable: {
+    audited: false,
+    reason: "principal-owned SDK provider file metadata ledger; no admin CRUD",
   },
   skillSandboxReplayEventsTable: {
     audited: false,
@@ -853,6 +884,14 @@ export const AUDIT_DECISIONS = {
     reason:
       "admin member mapping mutated only via /api/connectors/:id/member-overrides, audited at the route level as connector.updated; the connector audit snapshot carries the mapping list so upsert/delete diffs",
   },
+  modelPoolMembersTable: {
+    audited: false,
+    reason: "child: pool × provider key; parent (model pool) audited",
+  },
+  modelPoolVirtualApiKeysTable: {
+    audited: false,
+    reason: "join: pool × virtual key; parent (model pool) audited",
+  },
   llmProviderApiKeyModelsTable: {
     audited: false,
     reason: "join: provider key × model; parent audited",
@@ -869,6 +908,11 @@ export const AUDIT_DECISIONS = {
     audited: false,
     reason: "connector run execution log",
   },
+  modelCostBackfillsTable: {
+    audited: false,
+    reason:
+      "background job state; starting a backfill is audited at its route, and the worker's progress writes are not admin actions",
+  },
   scheduleTriggerRunsTable: {
     audited: false,
     reason: "schedule trigger run execution log",
@@ -878,6 +922,11 @@ export const AUDIT_DECISIONS = {
   // =========================================================================
   // ChatOps runtime
   // =========================================================================
+  chatopsMsTeamsUserConnectionsTable: {
+    audited: false,
+    reason:
+      "a Teams user's own sign-in for reading their group-chat files, created and removed only by that user from Teams; tokens live in the secrets manager",
+  },
   chatopsUserAdmissionsTable: {
     audited: false,
     reason: "pending ChatOps execution admission; runtime state",
@@ -1076,15 +1125,14 @@ export const AUDIT_DECISIONS = {
     audited: false,
     reason: "label history dataset the native runtime appends",
   },
-  openappaRootOpeningsTable: {
-    audited: false,
-    reason:
-      "derived from the runtime's event log once per root; read to keep or retire annotators, never edited",
-  },
   startupMigrationsTable: {
     audited: false,
     reason:
       "internal completion ledger committed with application data upgrades",
+  },
+  orgTrioPendingNormalTierTable: {
+    audited: false,
+    reason: "migration-written normal tiers the startup check consumes once",
   },
   interactionUserActivityTable: {
     audited: false,
@@ -1113,6 +1161,47 @@ export const AUDIT_DECISIONS = {
   interactionSessionHeadsBackfillTable: {
     audited: false,
     reason: "internal backfill progress marker",
+  },
+  interactionBillingTable: {
+    audited: false,
+    reason: "content-free idempotent billing receipts",
+  },
+  limitBillingUsageTable: {
+    audited: false,
+    reason: "transactional settled usage projection",
+  },
+  routingDecisionsTable: {
+    audited: false,
+    reason: "auto-routing execution state written per proxied session",
+  },
+  routingUsageTable: {
+    audited: false,
+    reason: "auto-routing usage written with each interaction",
+  },
+  routingPlansTable: {
+    audited: false,
+    reason: "system-written auto-routing fit outcomes",
+  },
+  routingScorerVersionsTable: {
+    audited: false,
+    reason: "system-written immutable scorer specs",
+  },
+  routingBackfillsTable: {
+    audited: false,
+    reason:
+      "background job state; the row records who started it, and the worker's progress writes are not admin actions",
+  },
+  routingHistorySessionsTable: {
+    audited: false,
+    reason: "worker-written scalars of past sessions found by a backfill scan",
+  },
+  routingHistoryUsageTable: {
+    audited: false,
+    reason: "worker-written usage copied from past interactions",
+  },
+  routingHistoryScoresTable: {
+    audited: false,
+    reason: "worker-written scorer readings of past sessions",
   },
 } satisfies Record<keyof typeof schema, AuditDecision>;
 

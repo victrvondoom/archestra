@@ -1,4 +1,5 @@
 import type * as k8s from "@kubernetes/client-node";
+import type { ClusterIpFamily } from "@/k8s/cluster-ip-families";
 import { sanitizeMetadataLabels } from "@/k8s/shared";
 import { networkPolicyDomains } from "@/services/environments/network-policy-domains";
 import type {
@@ -188,7 +189,7 @@ export function buildManagedAwsApplicationNetworkPolicy(params: {
       annotations: {
         ...buildPolicyAnnotations(params.effectivePolicy, "active"),
         "archestra.io/network-policy-cluster-dns":
-          params.clusterDnsIps.join(",") || "any",
+          params.clusterDnsIps.join(",") || "unresolved",
       },
     },
     spec: {
@@ -255,6 +256,8 @@ export function buildUnrestrictedFloorPolicy(params: {
   additionalDeniedCidrs?: string[];
   /** CIDRs explicitly allowed in addition to the public-egress floor. */
   allowedCidrs?: string[];
+  /** See `floorPublicEgressRules`. Omitted or empty means unknown. */
+  clusterIpFamilies?: ClusterIpFamily[];
 }): k8s.V1NetworkPolicy {
   return {
     apiVersion: "networking.k8s.io/v1",
@@ -283,6 +286,7 @@ export function buildUnrestrictedFloorPolicy(params: {
         ...floorPublicEgressRules({
           additionalDeniedCidrs: params.additionalDeniedCidrs ?? [],
           allowedCidrs: params.allowedCidrs ?? [],
+          clusterIpFamilies: params.clusterIpFamilies ?? [],
         }),
       ],
     },
@@ -295,6 +299,8 @@ export function buildUnrestrictedFloorAwsApplicationNetworkPolicy(params: {
   labels: Record<string, string>;
   clusterDnsIps?: string[];
   allowedCidrs?: string[];
+  /** See `floorPublicEgressRules`. Omitted or empty means unknown. */
+  clusterIpFamilies?: ClusterIpFamily[];
 }): Record<string, unknown> {
   return {
     apiVersion: "networking.k8s.aws/v1alpha1",
@@ -307,8 +313,11 @@ export function buildUnrestrictedFloorAwsApplicationNetworkPolicy(params: {
       podSelector: { matchLabels: params.podSelectorLabels },
       policyTypes: ["Egress"],
       egress: [
-        buildAwsDnsBootstrapEgressRule(params.clusterDnsIps ?? []),
-        ...floorPublicEgressRules({ allowedCidrs: params.allowedCidrs ?? [] }),
+        ...buildAwsDnsBootstrapEgressRules(params.clusterDnsIps ?? []),
+        ...floorPublicEgressRules({
+          allowedCidrs: params.allowedCidrs ?? [],
+          clusterIpFamilies: params.clusterIpFamilies ?? [],
+        }),
       ],
     },
   };
@@ -405,12 +414,22 @@ const FLOOR_DENIED_IPV6_CIDRS = [
 // private, and cloud-metadata ranges above. Each floor variant prepends its own
 // provider-appropriate DNS rule (selector-based for the plain NetworkPolicy, the
 // cluster resolver ipBlock for the AWS ApplicationNetworkPolicy).
+//
+// The `::/0` rule is emitted only when the cluster serves IPv6 (or its families
+// are unknown): the AWS network policy agent on an IPv4-only cluster drops the
+// IPv6 parent but keeps its `except` entries, fails the eBPF map update, and the
+// pods lose all public egress. The IPv4 rule stays unconditional because pods
+// on IPv6 clusters (e.g. EKS IPv6) still reach IPv4 hosts through the node.
 function floorPublicEgressRules(params: {
   additionalDeniedCidrs?: string[];
   allowedCidrs?: string[];
+  clusterIpFamilies?: ClusterIpFamily[];
 }): k8s.V1NetworkPolicyEgressRule[] {
   const additionalDeniedCidrs = params.additionalDeniedCidrs ?? [];
   const allowedCidrs = params.allowedCidrs ?? [];
+  const clusterIpFamilies = params.clusterIpFamilies ?? [];
+  const servesIpv6 =
+    clusterIpFamilies.length === 0 || clusterIpFamilies.includes("IPv6");
   return [
     {
       to: [
@@ -422,9 +441,15 @@ function floorPublicEgressRules(params: {
         },
       ],
     },
-    {
-      to: [{ ipBlock: { cidr: "::/0", except: FLOOR_DENIED_IPV6_CIDRS } }],
-    },
+    ...(servesIpv6
+      ? [
+          {
+            to: [
+              { ipBlock: { cidr: "::/0", except: FLOOR_DENIED_IPV6_CIDRS } },
+            ],
+          },
+        ]
+      : []),
     ...allowedCidrs.map((cidr) => ({ to: [{ ipBlock: { cidr } }] })),
   ];
 }
@@ -493,7 +518,7 @@ function buildAwsApplicationEgressRules(
   const domains = networkPolicyDomains(policy);
 
   return [
-    buildAwsDnsBootstrapEgressRule(clusterDnsIps),
+    ...buildAwsDnsBootstrapEgressRules(clusterDnsIps),
     ...policy.allowedCidrs.map((cidr) => ({
       to: [{ ipBlock: { cidr } }],
     })),
@@ -504,27 +529,25 @@ function buildAwsApplicationEgressRules(
 }
 
 /**
- * DNS bootstrap rule for EKS Auto Mode. When the cluster DNS ClusterIP could
- * not be resolved, fall back to allowing port 53 anywhere — restricting DNS
- * to an unknown IP would break every domainNames rule in the policy.
+ * Only known resolvers receive the DNS bootstrap exception. Omitting the rule
+ * when discovery fails keeps private DNS endpoints outside the allowlist.
  */
-function buildAwsDnsBootstrapEgressRule(
+function buildAwsDnsBootstrapEgressRules(
   clusterDnsIps: string[],
-): Record<string, unknown> {
-  const to =
-    clusterDnsIps.length > 0
-      ? clusterDnsIps.map((ip) => ({
-          ipBlock: { cidr: ip.includes(":") ? `${ip}/128` : `${ip}/32` },
-        }))
-      : [{ ipBlock: { cidr: "0.0.0.0/0" } }];
+): Array<Record<string, unknown>> {
+  if (clusterDnsIps.length === 0) return [];
 
-  return {
-    to,
-    ports: [
-      { protocol: "UDP", port: 53 },
-      { protocol: "TCP", port: 53 },
-    ],
-  };
+  return [
+    {
+      to: clusterDnsIps.map((ip) => ({
+        ipBlock: { cidr: ip.includes(":") ? `${ip}/128` : `${ip}/32` },
+      })),
+      ports: [
+        { protocol: "UDP", port: 53 },
+        { protocol: "TCP", port: 53 },
+      ],
+    },
+  ];
 }
 
 function buildCiliumDnsEgressRule(): Record<string, unknown> {

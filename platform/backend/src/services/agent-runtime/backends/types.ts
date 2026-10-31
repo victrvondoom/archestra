@@ -8,8 +8,10 @@ import type {
   AgentRuntimeBackend,
   AgentRuntimeResources,
   AgentRuntimeSteerMode,
+  AgentRuntimeTier,
   EffectiveNetworkPolicy,
 } from "@/types";
+import type { A2ATaskFailure } from "@/types/a2a-task";
 import type {
   AgentWorkspaceFileRequest,
   AgentWorkspaceFileResult,
@@ -36,6 +38,16 @@ export type AgentRunLaunchSpec = {
   command: string[] | null;
   privileged: boolean;
   resources: AgentRuntimeResources | null;
+  /** Tier the run asked for; null only for a run recorded before every run had one. */
+  tier: AgentRuntimeTier | null;
+  /**
+   * Tiers whose warm pool may serve the run, the requested one first, each
+   * with its size in the run's organization.
+   */
+  warmTiers: Array<{
+    tier: AgentRuntimeTier;
+    resources: AgentRuntimeResources;
+  }>;
   env: Record<string, string>;
   secretEnv: Record<string, string>;
   renewableCredentials?: Record<string, RenewableCredential>;
@@ -244,6 +256,8 @@ export type AgentRuntimeBackendName = AgentRuntimeBackend;
 export interface AgentRunCompletion {
   outcome: "succeeded" | "failed" | "aborted";
   reason?: string;
+  /** Classification of a failed outcome; see `run-failure.ts`. */
+  failure?: A2ATaskFailure;
 }
 
 export interface AgentRunAttachStatus {

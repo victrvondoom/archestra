@@ -20,6 +20,7 @@ import {
 } from "@archestra/shared/access-control";
 import { apiKey } from "@better-auth/api-key";
 import type { HookEndpointContext } from "@better-auth/core";
+import { getCurrentAdapter } from "@better-auth/core/context";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { sso } from "@better-auth/sso";
 import { APIError, betterAuth } from "better-auth";
@@ -27,6 +28,7 @@ import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { createAuthMiddleware } from "better-auth/api";
 import { admin, jwt, organization, twoFactor } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
+import type { Jwk } from "better-auth/plugins/jwt";
 import { and, eq, ne } from "drizzle-orm";
 import { z } from "zod";
 import { withInheritedRoleAuthorization } from "@/auth/role-composition";
@@ -39,6 +41,7 @@ import { LOG_LEVEL } from "@/logging/log-level";
 // Import directly from files to avoid circular dependency through barrel export
 import AccountModel from "@/models/account";
 import AgentModel from "@/models/agent";
+import AgentRuntimeTemplateModel from "@/models/agent-runtime-template";
 import AuditLogModel from "@/models/audit-log";
 import InvitationModel from "@/models/invitation";
 import McpServerModel from "@/models/mcp-server";
@@ -107,6 +110,21 @@ export const JWT_PLUGIN_OPTIONS = {
   },
   jwks: {
     keyPairConfig: { alg: "RS256", modulusLength: 2048 },
+  },
+  adapter: {
+    createJwk: async ({ alg, crv, ...key }, ctx) => {
+      // This deployment signs only RS256. Keep the existing key schema: the
+      // JWT plugin treats rows without algorithm metadata as the configured
+      // default. Other algorithms require persisted metadata before use.
+      if (alg !== "RS256" || crv != null) {
+        throw new Error("Only RS256 signing keys are supported");
+      }
+      const adapter = await getCurrentAdapter(ctx.context.adapter);
+      return adapter.create<Jwk>({
+        model: "jwks",
+        data: { ...key, createdAt: new Date() },
+      });
+    },
   },
   // Without this, the plugin's /get-session after-hook mints a JWT — a
   // jwks table read plus an RS256 signature — on EVERY authenticated
@@ -177,6 +195,12 @@ export const auth = betterAuth({
       organizationHooks: {
         afterAddMember: recomposeOrganizationOf,
         afterAcceptInvitation: recomposeOrganizationOf,
+        // Once the row is gone, concurrent template saves cannot recreate its settings.
+        afterDeleteOrganization: async ({ organization }) => {
+          await AgentRuntimeTemplateModel.deleteForOrganization(
+            organization.id,
+          );
+        },
       },
       ac,
       dynamicAccessControl: {
@@ -274,7 +298,7 @@ export const auth = betterAuth({
       issuer: APP_NAME,
     }),
     ...(ssoConfig ? [sso(ssoConfig)] : []),
-    jwt(JWT_PLUGIN_OPTIONS),
+    jwtWithExistingSchema(),
     oauthProvider({
       loginPage: OAUTH_PAGES.login,
       consentPage: OAUTH_PAGES.consent,
@@ -1186,8 +1210,34 @@ export async function handleBeforeHook(ctx: HookEndpointContext) {
   }
 
   logger.trace({ path, method }, "[auth:beforeHook] Processing auth request");
-  if (beforeRequest && isSsoCallbackPath(path))
-    ssoCallbackStartedAt.set(beforeRequest, new Date());
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  if (path === "/sso/register" && method === "POST" && !body.organizationId) {
+    throw new APIError("FORBIDDEN", {
+      message: "An organization is required for identity provider registration",
+    });
+  }
+  if (isSsoCallbackPath(path)) {
+    if (beforeRequest) ssoCallbackStartedAt.set(beforeRequest, new Date());
+    const providerId = getSsoCallbackProviderId({
+      path,
+      requestUrl: beforeRequest?.url,
+    });
+    if (providerId) {
+      const { default: IdentityProviderModel } = await import(
+        // biome-ignore lint/style/noRestrictedImports: runtime-gated EE model import
+        "@/models/identity-provider.ee"
+      );
+      const provider = await IdentityProviderModel.findByProviderId(providerId);
+      if (provider && !provider.organizationId) {
+        throw new APIError("FORBIDDEN", {
+          message: "Identity provider is not associated with an organization",
+        });
+      }
+    }
+  }
+  // SPDX-SnippetEnd
   if (
     (path === "/organization/update-member-role" ||
       path === "/organization/invite-member") &&
@@ -2460,35 +2510,34 @@ function getSsoCallbackProviderId(params: {
   path: string;
   requestUrl?: string;
 }): string | undefined {
-  const callbackPrefix = "/sso/callback/";
+  const callbackPrefixes = [
+    "/sso/callback/",
+    "/sso/saml2/callback/",
+    "/sso/saml2/sp/acs/",
+  ];
+
+  const providerFromPath = (pathname: string) => {
+    for (const prefix of callbackPrefixes) {
+      const callbackIndex = pathname.indexOf(prefix);
+      if (callbackIndex < 0) continue;
+      const providerId = pathname
+        .slice(callbackIndex + prefix.length)
+        .split("/")[0];
+      if (providerId && !providerId.startsWith(":")) return providerId;
+    }
+    return undefined;
+  };
 
   if (params.requestUrl) {
     try {
-      const callbackPath = new URL(params.requestUrl).pathname;
-      const callbackIndex = callbackPath.indexOf(callbackPrefix);
-      if (callbackIndex >= 0) {
-        const providerId = callbackPath
-          .slice(callbackIndex + callbackPrefix.length)
-          .split("/")[0];
-        if (providerId) {
-          return providerId;
-        }
-      }
+      const providerId = providerFromPath(new URL(params.requestUrl).pathname);
+      if (providerId) return providerId;
     } catch {
       // Fall back to the normalized route path below.
     }
   }
 
-  if (!params.path.startsWith(callbackPrefix)) {
-    return undefined;
-  }
-
-  const providerId = params.path.slice(callbackPrefix.length).split("/")[0];
-  if (providerId.startsWith(":")) {
-    return undefined;
-  }
-
-  return providerId || undefined;
+  return providerFromPath(params.path);
 }
 
 async function assertSsoEmailDomainAllowed(params: {
@@ -2497,10 +2546,6 @@ async function assertSsoEmailDomainAllowed(params: {
   userId: string;
   sessionId: string;
 }) {
-  if (!enterpriseTier.isCoreActive()) {
-    return;
-  }
-
   const { default: IdentityProviderModel } = await import(
     // biome-ignore lint/style/noRestrictedImports: runtime-gated EE model import
     "@/models/identity-provider.ee"
@@ -2509,15 +2554,15 @@ async function assertSsoEmailDomainAllowed(params: {
     params.providerId,
   );
 
-  if (!provider?.domain) {
-    return;
-  }
-
+  if (!provider) return;
   if (
-    emailMatchesAllowedIdentityProviderDomains(
-      params.userEmail,
-      provider.domain,
-    )
+    provider.organizationId &&
+    (!enterpriseTier.isCoreActive() ||
+      !provider.domain ||
+      emailMatchesAllowedIdentityProviderDomains(
+        params.userEmail,
+        provider.domain,
+      ))
   ) {
     return;
   }
@@ -2710,4 +2755,22 @@ function getInvitationIdFromSignUpBody(
   } catch {
     return undefined;
   }
+}
+
+function jwtWithExistingSchema() {
+  const plugin = jwt(JWT_PLUGIN_OPTIONS);
+  // Declare the four fields the RS256 adapter persists. Other algorithms need
+  // stored algorithm metadata before they can be enabled.
+  const { publicKey, privateKey, createdAt, expiresAt } =
+    plugin.schema.jwks.fields;
+  return {
+    ...plugin,
+    schema: {
+      ...plugin.schema,
+      jwks: {
+        ...plugin.schema.jwks,
+        fields: { publicKey, privateKey, createdAt, expiresAt },
+      },
+    },
+  };
 }

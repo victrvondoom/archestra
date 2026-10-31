@@ -9,7 +9,7 @@ import {
   type SupportedProvider,
   TimeInMs,
 } from "@archestra/shared";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { CacheKey, cacheManager, LRUCacheManager } from "@/cache-manager";
 import db, { schema, type Transaction, withDbTransaction } from "@/database";
 import logger from "@/logging";
@@ -30,6 +30,21 @@ export type IntegrationOverrideColumns = {
 };
 
 class OrganizationModel {
+  /** Read only when provisioning a new personal assistant or gateway. */
+  static async getDefaultPersonalAgentAccessAllTools(
+    organizationId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({
+        accessAllTools:
+          schema.organizationsTable.defaultPersonalAgentAccessAllTools,
+      })
+      .from(schema.organizationsTable)
+      .where(eq(schema.organizationsTable.id, organizationId))
+      .limit(1);
+    return row?.accessAllTools ?? true;
+  }
+
   /**
    * Process-local cache for {@link getAppearanceSettings}. The appearance
    * settings back white-labeling on the unauthenticated login page (and every
@@ -284,16 +299,34 @@ class OrganizationModel {
       return OrganizationModel.getById(id);
     }
 
-    const [updatedOrganization] = await db
-      .update(schema.organizationsTable)
-      .set(data)
-      .where(eq(schema.organizationsTable.id, id))
-      .returning();
+    const updatedOrganization = await OrganizationModel.patchInTransaction({
+      id,
+      data,
+    });
 
     logger.debug(
       { id, updated: !!updatedOrganization },
       "OrganizationModel.patch: completed",
     );
+    await OrganizationModel.invalidateSettingsCaches(id);
+    return updatedOrganization || null;
+  }
+
+  /** Used by the browser policy's cluster fence; cache invalidation follows commit. */
+  static async patchInTransaction(params: {
+    id: string;
+    data: Partial<Organization>;
+    tx?: Transaction;
+  }): Promise<Organization | null> {
+    const [row] = await (params.tx ?? db)
+      .update(schema.organizationsTable)
+      .set(params.data)
+      .where(eq(schema.organizationsTable.id, params.id))
+      .returning();
+    return row ?? null;
+  }
+
+  static async invalidateSettingsCaches(id: string): Promise<void> {
     await cacheManager.delete(getOrganizationSettingsCacheKey(id));
     await cacheManager.delete(getOrganizationAuthEnforcementCacheKey(id));
     await cacheManager.delete(getOrganizationOnlineSkillCatalogCacheKey(id));
@@ -311,7 +344,6 @@ class OrganizationModel {
     // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
     OrganizationModel.mcpIdleHibernationCache.clear();
     // SPDX-SnippetEnd
-    return updatedOrganization || null;
   }
 
   /**
@@ -502,9 +534,12 @@ class OrganizationModel {
   /**
    * Get an organization by ID
    */
-  static async getById(id: string): Promise<Organization | null> {
+  static async getById(
+    id: string,
+    tx?: Transaction,
+  ): Promise<Organization | null> {
     logger.debug({ id }, "OrganizationModel.getById: fetching organization");
-    const [organization] = await db
+    const [organization] = await (tx ?? db)
       .select()
       .from(schema.organizationsTable)
       .where(eq(schema.organizationsTable.id, id))
@@ -610,6 +645,42 @@ class OrganizationModel {
       .where(eq(schema.organizationsTable.id, id))
       .limit(1);
     return organization?.allowed ?? false;
+  }
+
+  /**
+   * Whether the organization's logs keep the media their rows carry. Read
+   * straight from the row on each log write, like the proxy's credential
+   * setting, so a change applies to the very next row on every replica. The
+   * organization is found from whichever owner the row names (agent, app,
+   * knowledge connector or environment), in one query. Media is kept only
+   * when that organization turned it on; a row that names none keeps none.
+   */
+  static async keepsMediaInLogs(owner: {
+    organizationId?: string | null;
+    agentId?: string | null;
+    appId?: string | null;
+    connectorId?: string | null;
+    environmentId?: string | null;
+  }): Promise<boolean> {
+    const { agentsTable, appsTable, environmentsTable } = schema;
+    const connectors = schema.knowledgeBaseConnectorsTable;
+    const organizationId = sql`coalesce(
+      ${owner.organizationId ?? null}::text,
+      (select ${agentsTable.organizationId} from ${agentsTable}
+        where ${agentsTable.id} = ${owner.agentId ?? null}::uuid),
+      (select ${appsTable.organizationId} from ${appsTable}
+        where ${appsTable.id} = ${owner.appId ?? null}::uuid),
+      (select ${connectors.organizationId} from ${connectors}
+        where ${connectors.id} = ${owner.connectorId ?? null}::uuid),
+      (select ${environmentsTable.organizationId} from ${environmentsTable}
+        where ${environmentsTable.id} = ${owner.environmentId ?? null}::uuid)
+    )`;
+    const [row] = await db
+      .select({ keep: schema.organizationsTable.keepMediaInLogs })
+      .from(schema.organizationsTable)
+      .where(sql`${schema.organizationsTable.id} = ${organizationId}`)
+      .limit(1);
+    return row?.keep ?? false;
   }
 
   /**
@@ -863,15 +934,19 @@ class OrganizationModel {
       defaultMemberRole: org.defaultMemberRole ?? null,
       onboardingComplete: org.onboardingComplete,
       onlineMcpCatalogEnabled: org.onlineMcpCatalogEnabled,
+      defaultPersonalAgentAccessAllTools:
+        org.defaultPersonalAgentAccessAllTools,
       // SPDX-SnippetBegin
       // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
       // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
       mcpIdleHibernationEnabled: org.mcpIdleHibernationEnabled,
       // SPDX-SnippetEnd
       onlineSkillCatalogEnabled: org.onlineSkillCatalogEnabled,
+      playwrightMcpEnabled: org.playwrightMcpEnabled,
       allowChatFileUploads: org.allowChatFileUploads,
       allowUnauthenticatedLlmProxyRequests:
         org.allowUnauthenticatedLlmProxyRequests,
+      keepMediaInLogs: org.keepMediaInLogs,
       allowToolAutoAssignment: org.allowToolAutoAssignment,
       embeddingModel: org.embeddingModel ?? null,
       kbContextualRetrievalMode: org.kbContextualRetrievalMode ?? null,
@@ -885,6 +960,8 @@ class OrganizationModel {
         : null,
       defaultLlmProvider: defaultKeyRows[0]?.provider ?? null,
       defaultAgentId: org.defaultAgentId ?? null,
+      defaultFastModelId: org.defaultFastModelId ?? null,
+      defaultSmartModelId: org.defaultSmartModelId ?? null,
       rerankerModel: org.rerankerModel ?? null,
       ocrModel: org.ocrModel ?? null,
       requireTwoFactor: org.requireTwoFactor,

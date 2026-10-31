@@ -2,6 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LlmProviderApiKey } from "@/lib/llm-provider-api-keys.query";
+import { useOrganizationDefaultModelSummary } from "@/lib/organization.query";
 import { ChatSetupMenu, type ChatSetupMenuProps } from "./chat-setup-menu";
 
 const {
@@ -9,6 +10,7 @@ const {
   models,
   keys,
   readiness,
+  pools,
   mutateConversation,
   hiddenProviders,
   navigate,
@@ -23,6 +25,7 @@ const {
       authorId: "user-1",
       builtIn: false,
       runtime: null,
+      modelId: undefined as string | undefined,
     },
     {
       id: "agent-research",
@@ -86,6 +89,7 @@ const {
     },
   ] as unknown as LlmProviderApiKey[],
   readiness: [] as unknown[],
+  pools: [] as { id: string; name: string; providers: string[] }[],
   mutateConversation: vi.fn(),
   navigate: vi.fn(),
 }));
@@ -125,9 +129,15 @@ vi.mock("@/lib/llm-provider-api-keys.query", () => ({
   useAvailableLlmProviderApiKeys: () => ({ data: keys }),
 }));
 
+vi.mock("@/lib/model-pools.query", () => ({
+  useAvailableModelPools: () => ({ data: pools }),
+}));
+
 vi.mock("@/lib/chat/chat.query", () => ({
   useUpdateConversation: () => ({ mutate: mutateConversation }),
 }));
+
+vi.mock("@/lib/organization.query");
 
 vi.mock("@/lib/integration-overrides", () => ({
   useModelProviderCatalog: () => ({
@@ -152,7 +162,11 @@ beforeEach(() => {
   hiddenProviders.clear();
   navigate.mockClear();
   readiness.splice(0);
+  pools.splice(0);
   mutateConversation.mockReset();
+  vi.mocked(useOrganizationDefaultModelSummary).mockReturnValue({
+    data: undefined,
+  } as never);
 });
 
 describe("ChatSetupMenu", () => {
@@ -206,6 +220,31 @@ describe("ChatSetupMenu", () => {
     expect(
       screen.getByRole("tab", { name: "Model: Qwen3 32B" }),
     ).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("picks a model pool at once and hides the model choice while in it", async () => {
+    pools.push({ id: "pool-1", name: "qwen3-32b", providers: ["vllm"] });
+    const user = userEvent.setup();
+    const props = renderMenu({ onModelPoolChange: vi.fn() });
+
+    await user.click(screen.getByRole("tab", { name: /^Key:/ }));
+    const group = screen.getByRole("group", { name: "Model pools" });
+    await user.click(within(group).getByRole("option", { name: /qwen3-32b/ }));
+
+    expect(props.onModelPoolChange).toHaveBeenCalledWith("pool-1");
+    expect(props.close).toHaveBeenCalledOnce();
+  });
+
+  it("shows a picked pool in place of the key, with no model tab", () => {
+    pools.push({ id: "pool-1", name: "qwen3-32b", providers: ["vllm"] });
+    renderMenu({ modelPoolId: "pool-1", onModelPoolChange: vi.fn() });
+
+    expect(
+      screen.getByRole("tab", { name: "Model pool: qwen3-32b" }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.queryByRole("tab", { name: /^Model:/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("offers subscription connections even without an API key and supports keyboard selection", async () => {
@@ -374,10 +413,48 @@ describe("ChatSetupMenu", () => {
       screen.getAllByRole("radiogroup", { name: "Reasoning effort" }),
     ).toHaveLength(1);
   });
+
+  it("names the trio auto routing runs the organization default on, for an agent on the default", () => {
+    const tier = (id: string, displayName: string) => ({
+      id,
+      provider: "vllm" as const,
+      displayName,
+    });
+    const tiers = {
+      fast: tier("model-fast", "Fast tier"),
+      normal: tier("model-plain", "Llama 3 8B"),
+      smart: tier("model-smart", "Smart tier"),
+    };
+    vi.mocked(useOrganizationDefaultModelSummary).mockReturnValue({
+      data: { model: tiers.normal, autoRouting: { active: true, tiers } },
+    } as never);
+    const defaultRow = () =>
+      screen.getByRole("option", { name: /Llama 3 8B/ }).nextElementSibling;
+
+    const { unmount } = render(<ChatSetupMenu {...menuProps()} />);
+    expect(defaultRow()).toHaveTextContent(/Fast tier.*Llama 3 8B.*Smart tier/);
+    unmount();
+
+    agents[0].modelId = "model-thinker";
+    try {
+      render(<ChatSetupMenu {...menuProps()} />);
+      expect(defaultRow()).not.toHaveTextContent(/Fast tier/);
+    } finally {
+      agents[0].modelId = undefined;
+    }
+  });
 });
 
 function renderMenu(overrides: Partial<ChatSetupMenuProps> = {}) {
-  const props: ChatSetupMenuProps = {
+  const props = menuProps(overrides);
+  render(<ChatSetupMenu {...props} />);
+  return props;
+}
+
+function menuProps(
+  overrides: Partial<ChatSetupMenuProps> = {},
+): ChatSetupMenuProps {
+  return {
     conversationId: "conversation-1",
     close: vi.fn(),
     agentId: "agent-mine",
@@ -399,6 +476,4 @@ function renderMenu(overrides: Partial<ChatSetupMenuProps> = {}) {
     notRecommendedForAgents: false,
     ...overrides,
   };
-  render(<ChatSetupMenu {...props} />);
-  return props;
 }

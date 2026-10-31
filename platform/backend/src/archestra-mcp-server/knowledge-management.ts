@@ -34,7 +34,12 @@ import {
 } from "@/knowledge-base";
 import { supersedePermissionSyncAfterSettingsChange } from "@/knowledge-base/connector-settings-change";
 import { reconcileP4ShimForConnector } from "@/knowledge-base/connectors/perforce/p4-shim-service";
+import { getConnector } from "@/knowledge-base/connectors/registry";
 import { toKnowledgeBaseUserMessage } from "@/knowledge-base/errors";
+import {
+  githubRepositorySettingsWriteError,
+  githubSyncConfigurationChanged,
+} from "@/knowledge-base/github-settings-compatibility";
 import {
   deleteConnector,
   deleteKnowledgeBase,
@@ -43,6 +48,7 @@ import {
   mfilesAuthMethodGateViolation,
   mfilesConnectorGateViolation,
 } from "@/knowledge-base/mfiles-gates";
+import { salesforceAuthPolicyViolation } from "@/knowledge-base/salesforce-auth-policy";
 import logger from "@/logging";
 import {
   AgentConnectorAssignmentModel,
@@ -662,7 +668,7 @@ async function handleQueryKnowledgeSources(params: {
         // Environment isolation: drop directly-assigned connectors from other envs.
         .filter((connector) => connector.environmentId === agentEnvironmentId);
 
-      const connectorIdsFromVisibleKbs = visibleKbs.length
+      const connectorsFromVisibleKbs = visibleKbs.length
         ? (
             await Promise.all(
               visibleKbs.map((kb) =>
@@ -676,15 +682,29 @@ async function handleQueryKnowledgeSources(params: {
                 }),
               ),
             )
-          )
-            .flat()
-            .map((connector) => connector.id)
+          ).flat()
         : [];
+      const connectors = [
+        ...connectorsFromVisibleKbs,
+        ...visibleDirectConnectors,
+      ];
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Uploaded files use their own grants through an assigned, published KB.
+      // Other connectors must themselves be published to the organization.
+      const visibleConnectors = access
+        ? connectors
+        : await knowledgeSourceAccessControlService.filterQueryableConnectorsForOrganization(
+            {
+              organizationId,
+              connectors,
+              knowledgeBaseIds: visibleKbs.map((kb) => kb.id),
+            },
+          );
+      // SPDX-SnippetEnd
       connectorIds = [
-        ...new Set([
-          ...connectorIdsFromVisibleKbs,
-          ...visibleDirectConnectors.map((connector) => connector.id),
-        ]),
+        ...new Set(visibleConnectors.map((connector) => connector.id)),
       ];
 
       if (visibleKbs.length === 0 && visibleDirectConnectors.length === 0) {
@@ -1087,6 +1107,22 @@ async function handleCreateKnowledgeConnector(params: {
       return errorResult(hiddenTypeViolation);
     }
 
+    const salesforceViolation = salesforceAuthPolicyViolation({
+      connectorType: args.connector_type,
+      nextConfig: { type: args.connector_type, ...args.config },
+    });
+    if (salesforceViolation) return errorResult(salesforceViolation);
+    if (args.connector_type === "salesforce") {
+      const validation = await getConnector("salesforce").validateConfig({
+        type: args.connector_type,
+        ...args.config,
+      });
+      if (!validation.valid)
+        return errorResult(
+          `Invalid connector configuration: ${validation.error}`,
+        );
+    }
+
     // Environment isolation: a connector created through a gateway belongs to the
     // gateway's environment, so the creator can actually use it afterwards.
     const agentEnvironmentId = await AgentModel.findEnvironmentId(
@@ -1269,12 +1305,22 @@ async function handleUpdateKnowledgeConnector(params: {
       // Environment isolation: cannot mutate a connector in another environment.
       existingConnector.environmentId !== agentEnvironmentId ||
       (access &&
-        !knowledgeSourceAccessControlService.canAccessConnector(
+        !knowledgeSourceAccessControlService.canUpdateConnector(
           access,
           existingConnector,
         ))
     ) {
       return knowledgeConnectorNotFound(args.id);
+    }
+    if (
+      existingConnector.config.type === "github" &&
+      updates.config?.type === "github"
+    ) {
+      const compatibilityError = githubRepositorySettingsWriteError(
+        existingConnector.config,
+        updates.config,
+      );
+      if (compatibilityError) return errorResult(compatibilityError);
     }
     const nextVisibility = updates.visibility ?? existingConnector.visibility;
     // The permission-sync switch after this update. The request still names it
@@ -1322,10 +1368,30 @@ async function handleUpdateKnowledgeConnector(params: {
       return errorResult(mfilesAuthViolation);
     }
 
-    const connector = await KnowledgeBaseConnectorModel.update(
-      args.id,
-      updates,
-    );
+    const salesforceViolation = salesforceAuthPolicyViolation({
+      connectorType: existingConnector.connectorType,
+      nextConfig: updates.config,
+      existingConfig: existingConnector.config,
+    });
+    if (salesforceViolation) return errorResult(salesforceViolation);
+    if (existingConnector.connectorType === "salesforce" && updates.config) {
+      const validation = await getConnector("salesforce").validateConfig(
+        updates.config,
+      );
+      if (!validation.valid)
+        return errorResult(
+          `Invalid connector configuration: ${validation.error}`,
+        );
+    }
+
+    const githubConfigAffectsSync =
+      existingConnector.config.type === "github" &&
+      updates.config?.type === "github" &&
+      githubSyncConfigurationChanged(existingConnector.config, updates.config);
+    const connector = await KnowledgeBaseConnectorModel.update(args.id, {
+      ...updates,
+      ...(githubConfigAffectsSync ? { checkpoint: null } : {}),
+    });
     if (!connector) {
       return knowledgeConnectorNotFound(args.id);
     }
@@ -1398,7 +1464,7 @@ async function handleDeleteKnowledgeConnector(params: {
       // Environment isolation: cannot delete a connector in another environment.
       existing.environmentId !== agentEnvironmentId ||
       (access &&
-        !knowledgeSourceAccessControlService.canAccessConnector(
+        !knowledgeSourceAccessControlService.canDeleteConnector(
           access,
           existing,
         ))

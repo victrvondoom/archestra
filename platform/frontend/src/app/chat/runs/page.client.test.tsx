@@ -47,7 +47,8 @@ vi.mock("@/components/agent-run-terminal", () => ({
   },
 }));
 
-vi.mock("@/components/agent-run-logs", () => ({
+vi.mock("@/components/agent-run-logs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/agent-run-logs")>()),
   AgentRunLogs: () => <div>Retained run output</div>,
 }));
 
@@ -96,7 +97,7 @@ describe("AgentRunChatSession", () => {
       },
     });
     const { rerender } = render(<AgentRunChatSession taskId="task-1" />);
-    await user.click(screen.getByRole("button", { name: "Resume" }));
+    await user.click(screen.getAllByRole("button", { name: "Resume" })[0]);
     expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
     expect(screen.queryByText("Retained run output")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "More run actions" }));
@@ -113,7 +114,9 @@ describe("AgentRunChatSession", () => {
       },
     };
     rerender(<AgentRunChatSession taskId="task-1" />);
-    expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Resume" })[0],
+    ).toBeInTheDocument();
   });
 
   it("opens the shared terminal while the session is being created", () => {
@@ -180,7 +183,9 @@ describe("AgentRunChatSession", () => {
 
     expect(screen.getByText("Live terminal task-1")).toBeInTheDocument();
     expect(screen.getByText("Running")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: "Stop" })[0],
+    ).toBeInTheDocument();
     expect(terminalState.props).toMatchObject({
       showManualCommand: false,
       showDisconnectedStatus: false,
@@ -233,14 +238,19 @@ describe("AgentRunChatSession", () => {
 
   it("links the owner to the run's LLM trace when they may read logs", async () => {
     const user = userEvent.setup();
-    queryState.value.data = run({ sessionId: "workspace-1" });
+    // The trace is keyed by the session id the runtime sends, not by the
+    // run's own session (workspace) id.
+    queryState.value.data = run({
+      sessionId: "workspace-1",
+      llmSessionId: "agent-run-codex-task1234",
+    });
 
     render(<AgentRunChatSession taskId="task-1" />);
     await user.click(screen.getByRole("button", { name: "More run actions" }));
 
     expect(
       screen.getByRole("menuitem", { name: "View trace" }),
-    ).toHaveAttribute("href", "/llm/logs/workspace-1");
+    ).toHaveAttribute("href", "/llm/logs/agent-run-codex-task1234");
   });
 
   it("leaves the trace out without log:read", async () => {
@@ -248,7 +258,10 @@ describe("AgentRunChatSession", () => {
     vi.mocked(useHasPermissions).mockReturnValue({
       data: false,
     } as ReturnType<typeof useHasPermissions>);
-    queryState.value.data = run({ sessionId: "workspace-1" });
+    queryState.value.data = run({
+      sessionId: "workspace-1",
+      llmSessionId: "agent-run-codex-task1234",
+    });
 
     render(<AgentRunChatSession taskId="task-1" />);
     await user.click(screen.getByRole("button", { name: "More run actions" }));
@@ -336,7 +349,25 @@ describe("AgentRunChatSession", () => {
     expect(screen.getByText("Retained run output")).toBeInTheDocument();
   });
 
-  it("gives a shared viewer read-only output without owner controls on a live run", () => {
+  it("connects a service-account manager while keeping run mutations owner-only", async () => {
+    queryState.value.data = run({
+      viewerRole: "shared",
+      canAttach: true,
+      actorKind: "serviceAccount",
+      actorUserId: null,
+    });
+    render(<AgentRunChatSession taskId="task-1" />);
+    expect(screen.getByText("Live terminal task-1")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "More run actions" }));
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+    await user.click(screen.getByRole("menuitem", { name: "Run history" }));
+    expect(screen.getByText("Retained run output")).toBeVisible();
+    expect(screen.queryByText("Read-only terminal")).toBeNull();
+  });
+
+  it("gives a shared viewer read-only output without owner controls on a live run", async () => {
     queryState.value.data = run({
       state: "TASK_STATE_WORKING",
       endedAt: null,
@@ -362,12 +393,22 @@ describe("AgentRunChatSession", () => {
     expect(
       screen.queryByRole("button", { name: "Share" }),
     ).not.toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "More run actions" }));
     expect(
-      screen.queryByRole("button", { name: "More run actions" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("menuitem", { name: "Download logs" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Download trajectory" }),
+    ).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
+    expect(
+      screen.queryByRole("menuitem", { name: "Delete saved files" }),
+    ).toBeNull();
   });
 
-  it("shows a shared viewer retained output for an ended run without owner controls", () => {
+  it("shows a shared viewer retained output for an ended run without owner controls", async () => {
     queryState.value.data = run({
       state: "TASK_STATE_COMPLETED",
       lastModelActivityAt: "2026-08-28T17:30:00.000Z",
@@ -378,6 +419,16 @@ describe("AgentRunChatSession", () => {
     render(<AgentRunChatSession taskId="task-1" />);
 
     expect(screen.getByText("Retained run output")).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "More run actions" }));
+    expect(
+      screen.getByRole("menuitem", { name: "Download logs" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Download trajectory" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Share" })).toBeNull();
     // No live terminal to contrast, so no read-only banner once the run has ended.
     expect(screen.queryByText(/read-only mode/i)).not.toBeInTheDocument();
     expect(
@@ -391,6 +442,7 @@ function run(overrides: Record<string, unknown>) {
     taskId: "task-1",
     title: "Nightly dependency audit",
     workloadName: "agent-task-1",
+    llmSessionId: "agent-task-1",
     prompt: "Implement the small feature",
     state: "TASK_STATE_SUBMITTED",
     statusReason: null,

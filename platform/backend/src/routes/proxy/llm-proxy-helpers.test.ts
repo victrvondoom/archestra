@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { ApiError, ArchestraInternalErrorCode } from "@archestra/shared";
 import { context as otelContext } from "@opentelemetry/api";
 import type { FastifyReply } from "fastify";
+import { APIError as OpenAIAPIError } from "openai";
 import { describe, expect, test, vi } from "vitest";
 import { attestToolDescription } from "@/archestra-mcp-server/tool-attestation";
 import { SESSION_ID_KEY } from "@/observability/request-context";
@@ -26,42 +27,6 @@ vi.mock("prom-client", () => ({
     register: { removeSingleMetric: vi.fn() },
   },
 }));
-
-// Mock cost-optimization
-const mockCalculateCost =
-  vi.fn<
-    (
-      model: string,
-      inputTokens: number | null | undefined,
-      outputTokens: number | null | undefined,
-      provider: string,
-    ) => Promise<number | undefined>
-  >();
-const mockCalculateCacheCost =
-  vi.fn<
-    (
-      model: string,
-      provider: string,
-      readTokens: number,
-      writeTokens: number,
-    ) => Promise<
-      | { cacheCost: number; cacheSavings: number; cacheReadSavings: number }
-      | undefined
-    >
-  >();
-vi.mock("@/routes/proxy/utils/cost-optimization", async (importOriginal) => {
-  const original =
-    await importOriginal<
-      typeof import("@/routes/proxy/utils/cost-optimization")
-    >();
-  return {
-    ...original,
-    calculateCost: (...args: Parameters<typeof mockCalculateCost>) =>
-      mockCalculateCost(...args),
-    calculateCacheCost: (...args: Parameters<typeof mockCalculateCacheCost>) =>
-      mockCalculateCacheCost(...args),
-  };
-});
 
 // Mock tracing
 const mockRecordBlockedToolSpans = vi.fn();
@@ -83,7 +48,6 @@ import { metrics } from "@/observability";
 import { upstreamHttpError } from "./adapters/upstream-http-error";
 import {
   buildInteractionRecord,
-  calculateInteractionCosts,
   handleError,
   isRetryableUpstreamConnectionFailure,
   normalizeToolCallsForPolicy,
@@ -683,81 +647,6 @@ describe("normalizeToolCallsForPolicy", () => {
 });
 
 // --------------------------------------------------------------------------
-// calculateInteractionCosts
-// --------------------------------------------------------------------------
-describe("calculateInteractionCosts", () => {
-  test("prices the model actually used, once", async () => {
-    mockCalculateCost.mockResolvedValue(0.0005);
-    mockCalculateCacheCost.mockResolvedValue({
-      cacheCost: 0.0001,
-      cacheSavings: 0.0009,
-      cacheReadSavings: 0.001,
-    });
-
-    const result = await calculateInteractionCosts({
-      actualModel: "gpt-3.5-turbo",
-      usage: { inputTokens: 100, outputTokens: 50 },
-      providerName: "openai",
-    });
-
-    expect(result).toEqual({
-      actualCost: 0.0005,
-      cacheCost: 0.0001,
-      cacheSavings: 0.0009,
-      cacheReadSavings: 0.001,
-    });
-    expect(mockCalculateCost).toHaveBeenCalledTimes(1);
-    expect(mockCalculateCost).toHaveBeenCalledWith(
-      "gpt-3.5-turbo",
-      100,
-      50,
-      "openai",
-      {
-        readTokens: 0,
-        writeTokens: 0,
-        write1hTokens: 0,
-      },
-    );
-  });
-
-  test("records the cost the provider reports instead of the price-table estimate", async () => {
-    mockCalculateCost.mockResolvedValue(0.0099);
-    mockCalculateCacheCost.mockResolvedValue(undefined);
-
-    const result = await calculateInteractionCosts({
-      actualModel: "anthropic/claude-sonnet-4.5",
-      usage: {
-        inputTokens: 1200,
-        outputTokens: 300,
-        providerReportedCost: 0.0123,
-      },
-      providerName: "openrouter",
-    });
-
-    expect(result.actualCost).toBe(0.0123);
-    expect(mockCalculateCost).not.toHaveBeenCalled();
-  });
-
-  test("handles undefined costs (model not found)", async () => {
-    mockCalculateCost.mockResolvedValue(undefined);
-    mockCalculateCacheCost.mockResolvedValue(undefined);
-
-    const result = await calculateInteractionCosts({
-      actualModel: "unknown-model",
-      usage: { inputTokens: 100, outputTokens: 50 },
-      providerName: "openai",
-    });
-
-    expect(result).toEqual({
-      actualCost: undefined,
-      cacheCost: undefined,
-      cacheSavings: undefined,
-      cacheReadSavings: undefined,
-    });
-  });
-});
-
-// --------------------------------------------------------------------------
 // buildInteractionRecord
 // --------------------------------------------------------------------------
 describe("buildInteractionRecord", () => {
@@ -1148,6 +1037,16 @@ describe("handleError", () => {
   const extractMessage = (error: unknown) =>
     error instanceof Error ? error.message : "Internal server error";
 
+  /**
+   * The events of a Responses error frame: the `error` event, then the
+   * terminal, each named on its `event:` line as OpenAI names them.
+   */
+  const responsesEvents = (frame: string) =>
+    frame
+      .split("\n\n")
+      .filter(Boolean)
+      .map((event) => JSON.parse(event.replace(/^event: .*\ndata: /, "")));
+
   test("preserves the internal code carried by a thrown ApiError", () => {
     const { reply } = makeReply(false);
     const upstreamError = new ApiError(
@@ -1299,12 +1198,45 @@ describe("handleError", () => {
     );
 
     expect(writes).toHaveLength(1);
-    const payload = JSON.parse(writes[0].replace(/^data: /, ""));
+    const [payload] = responsesEvents(writes[0]);
     expect(payload.error).toEqual({
       type: "server_error",
       code: "upstream_connection_closed",
       message: CLOSED_MESSAGE,
       param: null,
+    });
+  });
+
+  test("keeps an in-stream provider error's own code and fields on a Responses stream", () => {
+    // The OpenAI SDK throws this when the stream carries an `error` event:
+    // no HTTP status, the event's error object on `.error`. Codex stops a
+    // turn on `misalignment_policy_violation` and shows its review details;
+    // replaced by the error type, the code read as a retryable failure.
+    const upstreamError = {
+      type: "invalid_request_error",
+      code: "misalignment_policy_violation",
+      message: "This request was blocked by our safety systems.",
+      misalignment: {
+        error_type: "other",
+        detailed_explanation: "The agent turned off a safety check.",
+      },
+    };
+    const { reply, writes } = makeReply(true);
+
+    handleError(
+      new OpenAIAPIError(undefined, upstreamError, undefined, new Headers()),
+      reply,
+      extractMessage,
+      true,
+      () => undefined,
+      formatResponsesStreamErrorFrame,
+    );
+
+    const events = responsesEvents(writes[0]);
+    expect(events[0].error).toMatchObject(upstreamError);
+    expect(events.at(-1)).toMatchObject({
+      type: "response.failed",
+      response: { status: "failed", error: upstreamError },
     });
   });
 

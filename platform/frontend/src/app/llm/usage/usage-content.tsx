@@ -13,7 +13,6 @@ import {
   QueryChip,
   Segmented,
   SummaryTable,
-  ViewPills,
 } from "../(costs)/costs/cost-explorer-parts";
 import { fmtMetric, KpiTile } from "../(costs)/costs/cost-overview";
 import type { UsageViewProps } from "./usage-data";
@@ -31,6 +30,8 @@ const VIEWS: { label: string; group: UsageGroup; metric: UsageMetric }[] = [
   { label: "Spend by model", group: "model", metric: "billed" },
   { label: "Usage by client", group: "client", metric: "requests" },
   { label: "Activity over time", group: "time", metric: "requests" },
+  { label: "Cache reads by model", group: "model", metric: "cacheRead" },
+  { label: "Prompt cache savings", group: "overall", metric: "cacheSavings" },
   { label: "Token mix", group: "token", metric: "tokens" },
   { label: "Context size", group: "context", metric: "requests" },
   { label: "Costliest sessions", group: "session", metric: "billed" },
@@ -52,7 +53,8 @@ export function UsageContent(props: UsageViewProps) {
     USAGE_METRICS.find((m) => m.id === metric)?.label ?? "Billed spend";
   function select(nextGroup: UsageGroup, nextMetric: UsageMetric) {
     setGroup(nextGroup);
-    if (nextGroup !== "time")
+    if (nextMetric === "cacheSavings") setChart("table");
+    else if (nextGroup !== "time")
       setChart((current) => (current === "lines" ? "bars" : current));
     setMetric(
       supportsUsage(nextGroup, nextMetric)
@@ -84,6 +86,9 @@ export function UsageContent(props: UsageViewProps) {
     })),
   };
   const { statistics } = props;
+  const activeView = VIEWS.find(
+    (v) => v.group === group && v.metric === metric,
+  );
   const tiles = [
     {
       id: "billed",
@@ -107,7 +112,8 @@ export function UsageContent(props: UsageViewProps) {
       id: "tokens",
       label: "Tokens",
       value: statistics.totalTokens,
-      caption: "Input + output; excludes cache reads",
+      caption:
+        "Newly processed input and output. Reused cached input is separate.",
     },
   ] as const;
   return (
@@ -133,10 +139,6 @@ export function UsageContent(props: UsageViewProps) {
                     : "text-chart-1"
             }
             estimate={t.id === "subscription"}
-            active={metric === t.id}
-            onClick={() =>
-              select(supportsUsage(group, t.id) ? group : "model", t.id)
-            }
           />
         ))}
         <KpiTile
@@ -149,36 +151,57 @@ export function UsageContent(props: UsageViewProps) {
           }
         />
       </section>
-      <ViewPills
-        label="Usage views"
-        items={VIEWS.map((v) => ({
-          id: v.label,
-          label: v.label,
-          active: group === v.group && metric === v.metric,
-          onSelect: () => select(v.group, v.metric),
-        }))}
-      />
       <section
         aria-label="Usage explorer"
         className="min-w-0 overflow-hidden rounded-xl border bg-card"
       >
         <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-3 py-2.5">
+          {/* A view is a preset of the controls beside it; changing any of
+              them makes the view custom. */}
+          <QueryChip
+            label="View"
+            className="max-sm:grow"
+            value={activeView?.label ?? CUSTOM_VIEW}
+            options={[
+              ...VIEWS.map((v) => ({ id: v.label, label: v.label })),
+              ...(activeView
+                ? []
+                : [{ id: CUSTOM_VIEW, label: "Custom", disabled: true }]),
+            ]}
+            onChange={(id) => {
+              const view = VIEWS.find((v) => v.label === id);
+              if (view) select(view.group, view.metric);
+            }}
+          />
+          <span
+            aria-hidden="true"
+            className="mx-0.5 h-5 w-px bg-border max-sm:hidden"
+          />
           <QueryChip
             label="Show"
             className="max-sm:grow"
             value={metric}
-            options={USAGE_METRICS.map((m) => ({
-              ...m,
-              disabled: !supportsUsage(group, m.id),
-              hint: "Not available for this grouping",
-            }))}
-            onChange={(m) => select(group, m)}
+            options={USAGE_METRICS}
+            onChange={(m) =>
+              select(
+                supportsUsage(group, m)
+                  ? group
+                  : m === "cacheSavings"
+                    ? "overall"
+                    : "model",
+                m,
+              )
+            }
           />
           <QueryChip
             label="by"
             className="max-sm:grow"
             value={group}
-            options={USAGE_GROUPS}
+            options={USAGE_GROUPS.map((g) => ({
+              ...g,
+              disabled: !supportsUsage(g.id, metric),
+              hint: "Not available for this metric",
+            }))}
             onChange={(g) => select(g, metric)}
           />
           <QueryChip
@@ -189,7 +212,7 @@ export function UsageContent(props: UsageViewProps) {
               { id: "none", label: "None" },
               {
                 id: "token",
-                label: "Input / output",
+                label: "Token type",
                 disabled: !canSplit,
                 hint: "Available for model or client tokens",
               },
@@ -201,6 +224,7 @@ export function UsageContent(props: UsageViewProps) {
           />
           <div className="ml-auto">
             <ChartKindToggle
+              linesDisabled={!supportsUsage("time", metric)}
               value={chart}
               onChange={(kind) => {
                 setChart(kind);
@@ -332,3 +356,5 @@ export function UsageContent(props: UsageViewProps) {
     </div>
   );
 }
+
+const CUSTOM_VIEW = "custom";

@@ -5,7 +5,7 @@
  * request/response orchestration. Each function is independently testable.
  */
 
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac, createSecretKey, randomBytes } from "node:crypto";
 import {
   credentialRequiresPerUserScope,
   hasArchestraTokenPrefix,
@@ -13,13 +13,19 @@ import {
   LLM_PROXY_OAUTH_SCOPE,
   perUserCredentialLabel,
   type SupportedProvider,
+  stripClaudeContextVariantSuffix,
 } from "@archestra/shared";
 import type { FastifyRequest } from "fastify";
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import { serviceAccountUserId } from "@/auth/service-account-user-id";
-import { type AllowedCacheKey, CacheKey, cacheManager } from "@/cache-manager";
-import { takeInternalCall } from "@/clients/internal-call";
-import config from "@/config";
+import {
+  type AllowedCacheKey,
+  CacheKey,
+  cacheManager,
+  LRUCacheManager,
+} from "@/cache-manager";
+import { internalCallProvenance } from "@/clients/internal-call";
+import config, { getProviderConfiguredBaseUrl } from "@/config";
 import logger from "@/logging";
 import {
   AgentModel,
@@ -27,15 +33,19 @@ import {
   ManagedOauthClientModel as LlmOauthClientModel,
   LlmProviderApiKeyModel,
   MemberModel,
+  ModelPoolModel,
   OAuthAccessTokenModel,
   OAuthClientModel,
   OrganizationModel,
+  type UserModel,
   UserTokenModel,
   VirtualApiKeyModel,
 } from "@/models";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
 import { validateExternalIdpToken } from "@/routes/mcp-gateway/utils";
 import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
 import { isAppConnectorAudienceRef } from "@/services/apps/app-connector-resource";
+import { configCache } from "@/services/config-cache";
 import { resolveOauthClientProviderMappings } from "@/services/oauth-client-providers";
 import { resolveOauthServiceAccount } from "@/services/oauth-service-account";
 import { ResourcePermissions } from "@/services/resource-permissions";
@@ -43,7 +53,12 @@ import { assertSubscriptionCredentialForProvider } from "@/services/subscription
 import { resolveVirtualKeyProviderMappings } from "@/services/virtual-key-providers";
 import { ApiError, type GatewayAgent } from "@/types";
 import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
-import { selectMappedProviderKey } from "@/utils/provider-key-mappings";
+import {
+  type ProviderKeySelection,
+  selectMappedProviderKey,
+} from "@/utils/provider-key-mappings";
+import { type ModelPoolCaller, mayUseModelPool } from "./model-pool-failover";
+import type { PassthroughIdentity } from "./passthrough-log";
 import { getPassthroughVirtualKeyToken } from "./utils/headers/virtual-key";
 
 export function isJwtLike(token: string): boolean {
@@ -80,25 +95,7 @@ function requestedModelFromBody(request: FastifyRequest): string | null {
 export async function resolveAgent(
   agentId: string | undefined,
 ): Promise<GatewayAgent> {
-  if (agentId) {
-    const agent = await AgentModel.findGatewayAgentById(agentId);
-    if (!agent) {
-      throw new ApiError(404, `Agent with ID ${agentId} not found`);
-    }
-    if (agent.agentType === "llm_proxy" || agent.agentType === "profile") {
-      if (agent.agentType === "llm_proxy" && agent.isDefault) {
-        return agent;
-      }
-      return AgentModel.getOrgLlmProxy(agent.organizationId);
-    }
-    return agent;
-  }
-
-  const llmProxy = await AgentModel.getDeploymentLlmProxy();
-  if (!llmProxy) {
-    throw new ApiError(503, "No organization exists yet.");
-  }
-  return llmProxy;
+  return configCache.read(`agent:${agentId ?? ""}`, () => readAgent(agentId));
 }
 
 // =========================================================================
@@ -118,14 +115,22 @@ export interface VirtualKeyValidationResult {
   virtualKeyAuthorId?: string | null;
   /** Team the key's spend is charged to, when it has one. */
   billingTeamId?: string;
+  /**
+   * The key maps no key of this provider and passed only because it may use
+   * the pool the requested model names. No provider key is resolved.
+   */
+  modelPoolId?: string;
 }
 
 export interface PassthroughVirtualKeyResult {
   /** Owner of the passthrough key — the acting Archestra user. */
   userId: string;
+  user: NonNullable<Awaited<ReturnType<typeof UserModel.getProxyIdentity>>>;
   passthroughVirtualKeyId: string;
   /** Team the key's spend is charged to, when it has one. */
   billingTeamId?: string;
+  /** Fresh negative OAuth lookup for this exact request's provider token. */
+  nonOAuthTokenHash?: string;
 }
 
 type ResolvedVirtualApiKey = NonNullable<
@@ -174,6 +179,13 @@ export async function validateVirtualApiKey(params: {
    * serves the model. Without it the key's preferred endpoint answers.
    */
   requestedModel?: string | null;
+  providerKeySelection?: ProviderKeySelection;
+  /**
+   * Set by callers that can serve a model pool. A key that maps no key of
+   * this provider then still passes when it may use the pool the requested
+   * model names.
+   */
+  allowModelPool?: boolean;
 }): Promise<VirtualKeyValidationResult> {
   const { tokenValue, expectedProvider, expectedOrganizationId } = params;
   const resolved = await validateVirtualApiKeyToken(tokenValue);
@@ -197,21 +209,50 @@ export async function validateVirtualApiKey(params: {
       "Passthrough virtual keys carry no provider credential — send them in the X-Archestra-Virtual-Key header, not Authorization.",
     );
   }
+  const mappings = await resolveVirtualKeyProviderMappings(
+    resolved.virtualKey.id,
+  );
   const mappedProviderKey = isSupportedProvider(expectedProvider)
     ? await selectMappedProviderKey({
-        mappings: await resolveVirtualKeyProviderMappings(
-          resolved.virtualKey.id,
-        ),
+        mappings,
         provider: expectedProvider,
         modelId: params.requestedModel,
+        selection: params.providerKeySelection,
       })
     : undefined;
+  const modelPoolId =
+    !mappedProviderKey && params.allowModelPool
+      ? await usableModelPoolId({
+          organizationId: resolved.virtualKey.organizationId,
+          caller: {
+            virtualKeyId: resolved.virtualKey.id,
+            providerApiKeyIds: mappings.map(
+              (mapping) => mapping.providerApiKeyId,
+            ),
+          },
+          requestedModel: params.requestedModel,
+        })
+      : undefined;
+  if (modelPoolId) {
+    return {
+      ...(await virtualKeyIdentity(resolved.virtualKey)),
+      modelPoolId,
+    };
+  }
   if (!mappedProviderKey) {
     throw new ApiError(
       400,
       `Virtual API key is not mapped to provider "${expectedProvider}".`,
     );
   }
+  if (
+    mappedProviderKey.organizationId !== resolved.virtualKey.organizationId ||
+    mappedProviderKey.providerApiKeyProvider !== expectedProvider
+  )
+    throw new ApiError(
+      403,
+      "Virtual API key references an unavailable provider account.",
+    );
 
   // Resolve the real provider API key from the secret first — the per-user
   // check below needs it to recognize a ChatGPT-subscription (Codex) credential.
@@ -279,14 +320,37 @@ export async function validateVirtualApiKey(params: {
     apiKey,
     baseUrl: mappedProviderKey.baseUrl ?? undefined,
     chatApiKeyId: mappedProviderKey.providerApiKeyId,
-    virtualKeyId: resolved.virtualKey.id,
-    virtualKeyIsPersonal: await VirtualApiKeyModel.isPersonal(
-      resolved.virtualKey,
-    ),
-    virtualKeyAuthorId: resolved.virtualKey.authorId,
-    serviceAccountId:
-      resolved.virtualKey.createdByServiceAccountId ?? undefined,
-    billingTeamId: resolved.virtualKey.billingTeamId ?? undefined,
+    ...(await virtualKeyIdentity(resolved.virtualKey)),
+  };
+}
+
+async function usableModelPoolId(params: {
+  organizationId: string;
+  caller: ModelPoolCaller;
+  requestedModel?: string | null;
+}): Promise<string | undefined> {
+  if (!config.llmProxy.modelPoolsEnabled || !params.requestedModel)
+    return undefined;
+  const pool = await ModelPoolModel.findByName({
+    organizationId: params.organizationId,
+    name: stripClaudeContextVariantSuffix(params.requestedModel),
+  });
+  return pool && mayUseModelPool({ pool, caller: params.caller })
+    ? pool.id
+    : undefined;
+}
+
+async function virtualKeyIdentity(
+  virtualKey: Awaited<
+    ReturnType<typeof validateVirtualApiKeyToken>
+  >["virtualKey"],
+) {
+  return {
+    virtualKeyId: virtualKey.id,
+    virtualKeyIsPersonal: await VirtualApiKeyModel.isPersonal(virtualKey),
+    virtualKeyAuthorId: virtualKey.authorId,
+    serviceAccountId: virtualKey.createdByServiceAccountId ?? undefined,
+    billingTeamId: virtualKey.billingTeamId ?? undefined,
   };
 }
 
@@ -304,13 +368,51 @@ export async function validateVirtualApiKey(params: {
  * Throws ApiError on validation failure (401 invalid/expired, 400 wrong key
  * type, 403 no proxy access).
  */
+/**
+ * Prefetch the gateway and credential rows; the caller must still rate-limit
+ * and validate. The rows can come from the proxy configuration cache: the
+ * token is still compared with its stored secret, and expiry and membership
+ * are still checked, on every request.
+ */
+export async function readPassthroughAuthenticationSnapshot(params: {
+  tokenValue: string;
+  oauthTokenCandidate?: string;
+}) {
+  const oauthTokenHash = params.oauthTokenCandidate
+    ? OAuthAccessTokenModel.hashTokenForLookup(params.oauthTokenCandidate)
+    : undefined;
+  return configCache.read(
+    `credential:${VirtualApiKeyModel.tokenStartOf(params.tokenValue)}:${oauthTokenHash ?? ""}`,
+    () =>
+      VirtualApiKeyModel.readDeploymentProxyAndTokenOwner(
+        params.tokenValue,
+        oauthTokenHash,
+      ),
+  );
+}
+
 export async function validatePassthroughVirtualKey(params: {
   tokenValue: string;
   agent: GatewayAgent;
+  oauthTokenCandidate?: string;
+  authenticationSnapshot?: Awaited<
+    ReturnType<typeof readPassthroughAuthenticationSnapshot>
+  >;
 }): Promise<PassthroughVirtualKeyResult> {
   const { tokenValue, agent } = params;
 
-  const resolved = await VirtualApiKeyModel.validateToken(tokenValue);
+  const oauthTokenHash = params.oauthTokenCandidate
+    ? OAuthAccessTokenModel.hashTokenForLookup(params.oauthTokenCandidate)
+    : undefined;
+  const resolved = await VirtualApiKeyModel.validateTokenWithOwner(
+    tokenValue,
+    oauthTokenHash,
+    params.authenticationSnapshot?.agent.id === agent.id &&
+      params.authenticationSnapshot.agent.organizationId ===
+        agent.organizationId
+      ? params.authenticationSnapshot
+      : undefined,
+  );
   if (!resolved) {
     throw new ApiError(401, "Invalid passthrough virtual key");
   }
@@ -329,48 +431,56 @@ export async function validatePassthroughVirtualKey(params: {
     throw new ApiError(401, "Passthrough virtual key has no owner");
   }
 
-  const noAccessError = new ApiError(
-    403,
-    "Your passthrough virtual key does not grant access to this LLM proxy. Contact your administrator.",
-  );
+  const noAccessError = () =>
+    new ApiError(
+      403,
+      "Your passthrough virtual key does not grant access to this LLM proxy. Contact your administrator.",
+    );
   if (virtualKey.organizationId !== agent.organizationId) {
-    throw noAccessError;
+    throw noAccessError();
   }
 
   // The key acts as its owner, so the owner must still be a member of the
   // proxy's organization — keys are not purged on membership removal, and the
   // agent-access check below passes for any org-scoped agent regardless of
   // membership.
-  const member = await MemberModel.getByUserId(
-    virtualKey.authorId,
-    agent.organizationId,
-  );
-  if (!member) {
-    throw noAccessError;
+  const { user, membership } = resolved;
+  if (!user || !membership) {
+    throw noAccessError();
   }
+  MemberModel.remember(membership);
 
-  // Proxy access follows the owner's own agent access.
-  const ownerIsAgentAdmin = await ResourcePermissions.allows({
-    userId: virtualKey.authorId,
-    organizationId: agent.organizationId,
-    resource: "agent",
-    scope: "*",
-    action: "update",
-  });
-  const hasProxyAccess = await AgentTeamModel.userHasAgentAccess({
-    userId: virtualKey.authorId,
-    agentId: agent.id,
-    isAgentAdmin: ownerIsAgentAdmin,
-    action: "use",
-  });
-  if (!hasProxyAccess) {
-    throw noAccessError;
+  // The default organization proxy serves every current member and has no
+  // scoped grant namespace. The fresh membership and organization checks above
+  // already prove access; other agent kinds still need their scoped grants.
+  if (agent.agentType !== "llm_proxy" || !agent.isDefault) {
+    const ownerIsAgentAdmin = await ResourcePermissions.allows({
+      userId: virtualKey.authorId,
+      organizationId: agent.organizationId,
+      resource: "agent",
+      scope: "*",
+      action: "update",
+    });
+    const hasProxyAccess = await AgentTeamModel.userHasAgentAccess({
+      userId: virtualKey.authorId,
+      agentId: agent.id,
+      agentAccessContext: agent,
+      isAgentAdmin: ownerIsAgentAdmin,
+      action: "use",
+    });
+    if (!hasProxyAccess) {
+      throw noAccessError();
+    }
   }
 
   return {
     userId: virtualKey.authorId,
+    user,
     passthroughVirtualKeyId: virtualKey.id,
     billingTeamId: virtualKey.billingTeamId ?? undefined,
+    ...(resolved.oauthTokenAbsent && oauthTokenHash
+      ? { nonOAuthTokenHash: oauthTokenHash }
+      : {}),
   };
 }
 
@@ -409,6 +519,8 @@ export type LlmOAuthAccessTokenValidationResult = {
   serviceAccountId?: string;
   /** Team a client-credentials client's spend is charged to, when it has one. */
   billingTeamId?: string;
+  /** A model pool the client may use, for the model the request names. */
+  modelPoolId?: string;
 };
 
 export async function validateLlmOAuthAccessToken(params: {
@@ -421,10 +533,15 @@ export async function validateLlmOAuthAccessToken(params: {
    * that hosts this model rather than an arbitrary sibling.
    */
   requestedModel?: string | null;
+  providerKeySelection?: ProviderKeySelection;
+  /** A request-local negative lookup; never bypasses positive-token checks. */
+  nonOAuthTokenHash?: string;
+  /** As for `validateVirtualApiKey`: the caller can serve a model pool. */
+  allowModelPool?: boolean;
 }): Promise<LlmOAuthAccessTokenValidationResult | null> {
-  const accessToken = await OAuthAccessTokenModel.getByTokenHash(
-    OAuthAccessTokenModel.hashTokenForLookup(params.tokenValue),
-  );
+  const tokenHash = OAuthAccessTokenModel.hashTokenForLookup(params.tokenValue);
+  if (params.nonOAuthTokenHash === tokenHash) return null;
+  const accessToken = await OAuthAccessTokenModel.getByTokenHash(tokenHash);
   if (!accessToken) {
     return null;
   }
@@ -456,6 +573,7 @@ export async function validateLlmOAuthAccessToken(params: {
       expectedProvider: params.expectedProvider,
       agent: params.agent,
       requestedModel: params.requestedModel,
+      providerKeySelection: params.providerKeySelection,
     });
   }
 
@@ -464,6 +582,8 @@ export async function validateLlmOAuthAccessToken(params: {
     expectedProvider: params.expectedProvider,
     agent: params.agent,
     requestedModel: params.requestedModel,
+    providerKeySelection: params.providerKeySelection,
+    allowModelPool: params.allowModelPool,
   });
 }
 
@@ -490,6 +610,7 @@ export async function attemptJwksAuth(
   request: FastifyRequest,
   resolvedAgent: GatewayAgent,
   providerName: string,
+  providerKeySelection?: ProviderKeySelection,
 ): Promise<JwksAuthResult | null> {
   if (!resolvedAgent.identityProviderId) return null;
 
@@ -554,6 +675,7 @@ export async function attemptJwksAuth(
       userId: jwksResult.userId,
       provider: providerName,
       modelName: requestedModelFromBody(request),
+      selection: providerKeySelection,
     });
     apiKey = resolved.apiKey;
     baseUrl = resolved.baseUrl ?? undefined;
@@ -594,7 +716,7 @@ export async function assertPlatformAuthenticated(params: {
   /** A passthrough virtual key from `X-Archestra-Virtual-Key` was validated. */
   wasPassthroughKeyValidated: boolean;
   wasJwksAuthenticated: boolean;
-  /** The request carried a valid in-process proof (see `takeInternalCall`). */
+  /** The request carried a valid in-process proof (see `internalCallProvenance`). */
   isInternalCall: boolean;
   /**
    * True when the backend authenticates upstream with its OWN credentials and
@@ -653,13 +775,21 @@ export async function assertPlatformAuthenticated(params: {
  */
 export function createPassthroughAuthenticator(
   provider: SupportedProvider,
-): (params: { request: FastifyRequest; agentId?: string }) => Promise<void> {
+): (params: {
+  request: FastifyRequest;
+  agentId?: string;
+}) => Promise<PassthroughIdentity | undefined> {
   return async ({ request, agentId }) => {
     try {
-      await authenticatePassthroughProxyRequest({ request, provider, agentId });
+      return await authenticatePassthroughProxyRequest({
+        request,
+        provider,
+        agentId,
+      });
     } catch (error) {
       if (!(error instanceof ApiError) || error.statusCode !== 401) throw error;
       if (!(await allowsUnauthenticatedForAgent(agentId))) throw error;
+      return { agent: await resolveAgent(agentId), authMethod: "unknown" };
     }
   };
 }
@@ -691,6 +821,16 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
  * promptly, long enough to cover a client's ordinary request cadence.
  */
 const RECENTLY_VALIDATED_TTL_MS = 5 * 60_000;
+// Coalesce bookkeeping only. A busy credential's exemption is refreshed at most
+// once per second per process (up to one second less TTL).
+const VALIDATION_MARK_REFRESH_MS = 1_000;
+/**
+ * How long this process skips the distributed bucket read for a credential it
+ * just validated. Every request still validates its credential; only the
+ * failure-count read is skipped, and any failure for the credential ends the
+ * skip. Guessed credentials never validate, so they always read the buckets.
+ */
+const LOCAL_VALIDATION_TTL_MS = RATE_LIMIT_WINDOW_MS;
 
 interface RateLimitEntry {
   count: number;
@@ -746,16 +886,44 @@ interface RateLimitEntry {
  */
 export class VirtualKeyRateLimiter {
   private cache: RateLimitCache;
+  private readonly successWrites = registerProcessLocalCache(
+    new LRUCacheManager<Promise<void>>({
+      maxSize: 10_000,
+      defaultTtl: VALIDATION_MARK_REFRESH_MS,
+    }),
+  );
+
+  /**
+   * Credentials this process validated recently. A credential below its
+   * failure limit when it validated cannot have reached the limit since
+   * without failing here (which clears the mark) or failing elsewhere, and a
+   * failure elsewhere only costs one more validation before this process
+   * reads the buckets again. Validated credentials are exempt from the
+   * IP-wide bucket, so neither bucket can reject them.
+   */
+  private readonly locallyValidated = registerProcessLocalCache(
+    new LRUCacheManager<true>({
+      maxSize: 10_000,
+      defaultTtl: LOCAL_VALIDATION_TTL_MS,
+    }),
+  );
 
   constructor(cache: RateLimitCache) {
     this.cache = cache;
   }
 
+  /** Rate-limit bookkeeping only; this never proves current authorization. */
+  hasRecentValidation(credential: string): boolean {
+    return this.locallyValidated.has(localKey(credential));
+  }
+
   /**
-   * Reads both buckets and the credential's validation mark in one statement.
+   * Reads both buckets and the credential's validation mark in one statement,
+   * unless this process validated the credential recently.
    */
   async check(params: { ip: string; credential?: string }): Promise<void> {
     const { ip, credential } = params;
+    if (credential && this.hasRecentValidation(credential)) return;
     const now = Date.now();
     const credentialKey = this.credentialKey(ip, credential);
     const ipKey = this.ipKey(ip);
@@ -793,6 +961,7 @@ export class VirtualKeyRateLimiter {
     credential?: string;
   }): Promise<void> {
     const { ip, credential } = params;
+    if (credential) this.locallyValidated.delete(localKey(credential));
     await this.cache.incrementFixedWindows({
       keys: [this.credentialKey(ip, credential), this.ipKey(ip)],
       windowMs: RATE_LIMIT_WINDOW_MS,
@@ -810,13 +979,20 @@ export class VirtualKeyRateLimiter {
   async recordSuccess(params: { credential?: string }): Promise<void> {
     const { credential } = params;
     if (!credential) return;
+    this.locallyValidated.set(localKey(credential), true);
+    const key = this.validatedKey(credential);
+    const pending = this.successWrites.get(key);
+    if (pending) return pending;
+    const write = this.writeSuccess(key);
+    this.successWrites.set(key, write);
+    return write;
+  }
+
+  private async writeSuccess(key: AllowedCacheKey): Promise<void> {
     try {
-      await this.cache.set(
-        this.validatedKey(credential),
-        true,
-        RECENTLY_VALIDATED_TTL_MS,
-      );
+      await this.cache.set(key, true, RECENTLY_VALIDATED_TTL_MS);
     } catch (error) {
+      this.successWrites.delete(key);
       // Best-effort: losing the mark only costs this credential its exemption
       // from a backstop that is not currently rejecting anything. Failing the
       // request over it would turn a cache blip into an outage.
@@ -898,6 +1074,8 @@ async function validateClientCredentialsLlmOAuthAccessToken(params: {
   expectedProvider: string;
   agent: GatewayAgent;
   requestedModel?: string | null;
+  providerKeySelection?: ProviderKeySelection;
+  allowModelPool?: boolean;
 }): Promise<LlmOAuthAccessTokenValidationResult> {
   const oauthClient = await LlmOauthClientModel.findByClientId(params.clientId);
   if (!oauthClient) {
@@ -921,6 +1099,7 @@ async function validateClientCredentialsLlmOAuthAccessToken(params: {
     !(await AgentTeamModel.userHasAgentAccess({
       userId: serviceAccountUserId(account.id),
       agentId: params.agent.id,
+      agentAccessContext: params.agent,
       action: "use",
       isAgentAdmin: await ResourcePermissions.allows({
         userId: serviceAccountUserId(account.id),
@@ -932,13 +1111,46 @@ async function validateClientCredentialsLlmOAuthAccessToken(params: {
     }))
   )
     throw new ApiError(403, "Service account cannot access this LLM proxy.");
+  const mappings = await resolveOauthClientProviderMappings(oauthClient);
   const mappedProviderKey = isSupportedProvider(params.expectedProvider)
     ? await selectMappedProviderKey({
-        mappings: await resolveOauthClientProviderMappings(oauthClient),
+        mappings,
         provider: params.expectedProvider,
         modelId: params.requestedModel,
+        selection: params.providerKeySelection,
       })
     : undefined;
+  const modelPoolId = params.allowModelPool
+    ? await usableModelPoolId({
+        organizationId: oauthClient.organizationId,
+        caller: {
+          providerApiKeyIds: mappings.map(
+            (mapping) => mapping.providerApiKeyId,
+          ),
+          modelPoolIds: oauthClient.modelPoolIds,
+        },
+        requestedModel: params.requestedModel,
+      })
+    : undefined;
+  const authenticatedApp = {
+    id: oauthClient.id,
+    name: oauthClient.name,
+    clientId: oauthClient.clientId,
+  };
+  // A client let in only for a pool has no key here; the pool's members
+  // answer instead.
+  if (!mappedProviderKey && modelPoolId) {
+    return {
+      apiKey: undefined,
+      baseUrl: undefined,
+      chatApiKeyId: undefined,
+      authMethod: "oauth_client_credentials",
+      authenticatedApp,
+      billingTeamId: oauthClient.billingTeamId ?? undefined,
+      serviceAccountId: account?.id,
+      modelPoolId,
+    };
+  }
   if (!mappedProviderKey) {
     throw new ApiError(
       400,
@@ -955,6 +1167,14 @@ async function validateClientCredentialsLlmOAuthAccessToken(params: {
       "LLM OAuth client references a missing provider API key.",
     );
   }
+  if (
+    providerApiKey.organizationId !== oauthClient.organizationId ||
+    providerApiKey.provider !== params.expectedProvider
+  )
+    throw new ApiError(
+      403,
+      "LLM OAuth client references an unavailable provider account.",
+    );
   const oauthMappedSecret = providerApiKey.secretId
     ? ((await getSecretValueForLlmProviderApiKey(providerApiKey.secretId)) as
         | string
@@ -986,16 +1206,13 @@ async function validateClientCredentialsLlmOAuthAccessToken(params: {
     actualProvider: providerApiKey.provider,
     expectedProvider: params.expectedProvider,
     authMethod: "oauth_client_credentials",
-    authenticatedApp: {
-      id: oauthClient.id,
-      name: oauthClient.name,
-      clientId: oauthClient.clientId,
-    },
+    authenticatedApp,
   });
   return {
     ...resolvedKey,
     billingTeamId: oauthClient.billingTeamId ?? undefined,
     serviceAccountId: account?.id,
+    modelPoolId,
   };
 }
 
@@ -1005,6 +1222,7 @@ async function validateUserLlmOAuthAccessToken(params: {
   expectedProvider: string;
   agent: GatewayAgent;
   requestedModel?: string | null;
+  providerKeySelection?: ProviderKeySelection;
 }): Promise<LlmOAuthAccessTokenValidationResult> {
   const member = await MemberModel.getByUserId(
     params.userId,
@@ -1017,6 +1235,7 @@ async function validateUserLlmOAuthAccessToken(params: {
   const hasAgentAccess = await AgentTeamModel.userHasAgentAccess({
     userId: params.userId,
     agentId: params.agent.id,
+    agentAccessContext: params.agent,
     isAgentAdmin: false,
     action: "use",
   });
@@ -1035,6 +1254,7 @@ async function validateUserLlmOAuthAccessToken(params: {
     userId: params.userId,
     provider: params.expectedProvider,
     modelName: params.requestedModel,
+    selection: params.providerKeySelection,
   });
   const oauthClient = await OAuthClientModel.findByClientId(params.clientId);
 
@@ -1101,11 +1321,13 @@ function hasLlmProxyScope(scopes: string[] | null | undefined): boolean {
  * effective threshold by the replica count. A deployment with no auth secret
  * configured falls back to a per-process key and accepts that fragmentation.
  */
-const CREDENTIAL_FINGERPRINT_KEY = config.auth.secret
-  ? createHmac("sha256", config.auth.secret)
-      .update("virtual-key-rate-limit-fingerprint")
-      .digest()
-  : randomBytes(32);
+const CREDENTIAL_FINGERPRINT_KEY = createSecretKey(
+  config.auth.secret
+    ? createHmac("sha256", config.auth.secret)
+        .update("virtual-key-rate-limit-fingerprint")
+        .digest()
+    : randomBytes(32),
+);
 
 /**
  * Reduce a presented credential to a stable, non-reversible bucket id for the
@@ -1124,6 +1346,13 @@ const CREDENTIAL_FINGERPRINT_KEY = config.auth.secret
  *
  * Requests that present no credential at all share the "none" bucket.
  */
+/** Full-length digest: a process-local key must never collide with a guess. */
+function localKey(credential: string): string {
+  return createHmac("sha256", CREDENTIAL_FINGERPRINT_KEY)
+    .update(credential)
+    .digest("base64url");
+}
+
 function fingerprintCredential(credential: string | undefined): string {
   if (!credential) return "none";
   const hmac = createHmac("sha256", CREDENTIAL_FINGERPRINT_KEY);
@@ -1169,14 +1398,14 @@ async function authenticatePassthroughProxyRequest(params: {
   request: FastifyRequest;
   provider: SupportedProvider;
   agentId?: string;
-}): Promise<void> {
+}): Promise<PassthroughIdentity | undefined> {
   const { request, provider, agentId } = params;
 
   // In-process callers that carry the internal proof are trusted, matching the
   // keyless-provider allowance in the instrumented handler. The proof is a
   // per-process secret, so a request arriving through the frontend rewrite
   // cannot satisfy it. Taking it also keeps it off the forwarded request.
-  const proof = takeInternalCall(request.headers);
+  const proof = internalCallProvenance(request);
   if (proof.inProcess || proof.guardrail) return;
 
   const unauthenticated = new ApiError(
@@ -1199,17 +1428,26 @@ async function authenticatePassthroughProxyRequest(params: {
   }
 
   const presentedCredential = passthroughToken ?? bearerToken ?? undefined;
+  let authenticatedBearer = false;
+  let providerApiKey: string | null = null;
   await virtualKeyRateLimiter.check({
     ip: request.ip,
     credential: presentedCredential,
   });
-  const authenticate = async (): Promise<void> => {
+  const authenticate = async (): Promise<PassthroughIdentity> => {
     if (passthroughToken) {
-      await validatePassthroughVirtualKey({
+      const agent = await resolveAgent(agentId);
+      const resolved = await validatePassthroughVirtualKey({
         tokenValue: passthroughToken,
-        agent: await resolveAgent(agentId),
+        agent,
       });
-      return;
+      return {
+        agent,
+        authMethod: "passthrough_virtual_key",
+        userId: resolved.userId,
+        passthroughVirtualKeyId: resolved.passthroughVirtualKeyId,
+        billingTeamId: resolved.billingTeamId,
+      };
     }
     if (!bearerToken) {
       throw unauthenticated;
@@ -1229,36 +1467,86 @@ async function authenticatePassthroughProxyRequest(params: {
             agent.organizationId,
           ));
         if (!member) throw unauthenticated;
-        return;
+        authenticatedBearer = true;
+        return {
+          agent,
+          authMethod: "personal_token",
+          userId: personalToken.userId,
+        };
       }
-      // Token validity and expiry are the whole bar here. The provider-mapping
-      // check that validateVirtualApiKey adds decides WHICH upstream credential
-      // to use, and a pass-through forwards none — so requiring it would reject
-      // otherwise-valid platform credentials for no security gain.
-      await validateVirtualApiKeyToken(bearerToken);
-      return;
+      // Token validity and expiry are the whole bar here. A key that maps a
+      // key of this provider also has it forwarded upstream, as the handled
+      // endpoints do; a key that maps none still passes and forwards nothing.
+      const { virtualKey } = await validateVirtualApiKeyToken(bearerToken);
+      authenticatedBearer = true;
+      const agent = await resolveAgent(agentId);
+      providerApiKey = await passthroughProviderApiKey({
+        tokenValue: bearerToken,
+        provider,
+        organizationId: agent.organizationId,
+        requestedModel: requestedModelFromBody(request),
+      });
+      return {
+        agent,
+        authMethod: "virtual_key",
+        virtualKeyId: virtualKey.id,
+        userId: (await VirtualApiKeyModel.isPersonal(virtualKey))
+          ? (virtualKey.authorId ?? undefined)
+          : undefined,
+        serviceAccountId: virtualKey.createdByServiceAccountId ?? undefined,
+        billingTeamId: virtualKey.billingTeamId ?? undefined,
+      };
     }
 
     const agent = await resolveAgent(agentId);
-    if (await attemptJwksAuth(request, agent, provider)) return;
-    if (
-      await validateLlmOAuthAccessToken({
-        tokenValue: bearerToken,
-        expectedProvider: provider,
+    const jwks = await attemptJwksAuth(request, agent, provider);
+    if (jwks) {
+      authenticatedBearer = true;
+      return { agent, authMethod: "jwks", userId: jwks.userId };
+    }
+    const oauth = await validateLlmOAuthAccessToken({
+      tokenValue: bearerToken,
+      expectedProvider: provider,
+      agent,
+      requestedModel: requestedModelFromBody(request),
+    });
+    if (oauth) {
+      authenticatedBearer = true;
+      return {
         agent,
-        requestedModel: requestedModelFromBody(request),
-      })
-    ) {
-      return;
+        authMethod: oauth.authMethod,
+        userId: oauth.userId,
+        serviceAccountId: oauth.serviceAccountId,
+        ...(oauth.authenticatedApp
+          ? {
+              authenticatedApp: {
+                id: oauth.authenticatedApp.id,
+                name: oauth.authenticatedApp.name,
+              },
+            }
+          : {}),
+        billingTeamId: oauth.billingTeamId,
+      };
     }
     throw unauthenticated;
   };
 
   try {
-    await authenticate();
+    const identity = await authenticate();
+    if (authenticatedBearer && bearerToken) {
+      stripAuthenticatedBearer(request, bearerToken);
+      if (providerApiKey) {
+        forwardPassthroughProviderApiKey({
+          request,
+          provider,
+          apiKey: providerApiKey,
+        });
+      }
+    }
     await virtualKeyRateLimiter.recordSuccess({
       credential: presentedCredential,
     });
+    return identity;
   } catch (error) {
     if (error instanceof ApiError && error.statusCode === 401) {
       await virtualKeyRateLimiter.recordFailure({
@@ -1268,4 +1556,153 @@ async function authenticatePassthroughProxyRequest(params: {
     }
     throw error;
   }
+}
+
+/**
+ * The provider key a virtual key maps for a pass-through request's provider,
+ * or null when it maps none that may be forwarded. Not forwarded: a key bound
+ * to another endpoint (its own base URL), and subscription or per-user
+ * credentials, which are no API key for the provider's public API.
+ */
+async function passthroughProviderApiKey(params: {
+  tokenValue: string;
+  provider: SupportedProvider;
+  organizationId: string;
+  requestedModel: string | null | undefined;
+}): Promise<string | null> {
+  let mapped: VirtualKeyValidationResult;
+  try {
+    mapped = await validateVirtualApiKey({
+      tokenValue: params.tokenValue,
+      expectedProvider: params.provider,
+      expectedOrganizationId: params.organizationId,
+      requestedModel: params.requestedModel,
+    });
+  } catch (error) {
+    // No usable mapping: the request still passes, forwarding no credential.
+    if (error instanceof ApiError && error.statusCode < 500) return null;
+    throw error;
+  }
+  const { apiKey, baseUrl } = mapped;
+  if (!apiKey) return null;
+  const upstream = getProviderConfiguredBaseUrl(params.provider);
+  if (baseUrl && trimTrailingSlash(baseUrl) !== trimTrailingSlash(upstream))
+    return null;
+  if (
+    credentialRequiresPerUserScope({ provider: params.provider, apiKey }) ||
+    apiKey.startsWith("sk-ant-oat")
+  )
+    return null;
+  return apiKey;
+}
+
+/**
+ * Puts the mapped provider key on the request in the header the provider
+ * reads, unless the caller already sent its own provider credential there.
+ */
+function forwardPassthroughProviderApiKey(params: {
+  request: FastifyRequest;
+  provider: SupportedProvider;
+  apiKey: string;
+}) {
+  const { request, provider, apiKey } = params;
+  const [name, value] =
+    provider === "anthropic"
+      ? ["x-api-key", apiKey]
+      : ["authorization", `Bearer ${apiKey}`];
+  if (request.raw.headers[name] !== undefined) return;
+  request.headers[name] = value;
+  request.raw.headers[name] = value;
+}
+
+function trimTrailingSlash(url: string | undefined): string | undefined {
+  return url?.replace(/\/+$/, "");
+}
+
+/**
+ * A bearer accepted by the platform is not an upstream credential. Match the
+ * validated value rather than a token prefix: IdP/OAuth tokens have other
+ * formats, and a downstream Archestra may legitimately use an arch_ key.
+ * Keep distinct caller-supplied provider credentials intact.
+ */
+function stripAuthenticatedBearer(request: FastifyRequest, token: string) {
+  const headerNames = new Set([
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+  ]);
+  const stripValue = (value: string): string | undefined => {
+    // Node joins repeated credential headers with commas. Remove matching
+    // credentials from that list without discarding a separate provider key.
+    const values = value.split(",");
+    const retained = values.filter((entry) => {
+      const credential = entry.trim();
+      return (
+        credential !== token &&
+        credential.match(/^Bearer\s+(.+)$/i)?.[1] !== token
+      );
+    });
+    if (retained.length === values.length) return value;
+    return retained.length
+      ? retained.map((entry) => entry.trim()).join(", ")
+      : undefined;
+  };
+  for (const headers of new Set([request.headers, request.raw.headers])) {
+    for (const name of headerNames) {
+      const value = headers[name];
+      if (value === undefined) continue;
+      const retained = (Array.isArray(value) ? value : [value])
+        .map(stripValue)
+        .filter((entry) => entry !== undefined);
+      if (retained.length === 0) delete headers[name];
+      else headers[name] = Array.isArray(value) ? retained : retained[0];
+    }
+  }
+  const rawHeaders = request.raw.rawHeaders;
+  if (rawHeaders) {
+    for (let i = rawHeaders.length - 2; i >= 0; i -= 2) {
+      if (!headerNames.has(rawHeaders[i].toLowerCase())) continue;
+      const retained = stripValue(rawHeaders[i + 1]);
+      if (retained === undefined) rawHeaders.splice(i, 2);
+      else rawHeaders[i + 1] = retained;
+    }
+  }
+  const url = request.raw.url;
+  if (url?.includes("?")) {
+    const queryStart = url.indexOf("?");
+    const segments = url.slice(queryStart + 1).split("&");
+    const retained = segments.filter(
+      (segment) => !new URLSearchParams(segment).getAll("key").includes(token),
+    );
+    if (retained.length !== segments.length) {
+      // Preserve the other parameters byte for byte, including literal question
+      // marks, escaping and order. Re-serializing can change signed provider URLs.
+      request.raw.url =
+        url.slice(0, queryStart) +
+        (retained.length ? `?${retained.join("&")}` : "");
+    }
+  }
+}
+
+async function readAgent(agentId: string | undefined): Promise<GatewayAgent> {
+  if (agentId) {
+    const agent = await AgentModel.findGatewayAgentById(agentId);
+    if (!agent) {
+      throw new ApiError(404, `Agent with ID ${agentId} not found`);
+    }
+    if (agent.agentType === "llm_proxy" || agent.agentType === "profile") {
+      if (agent.agentType === "llm_proxy" && agent.isDefault) {
+        return agent;
+      }
+      return AgentModel.getOrgLlmProxy(agent.organizationId);
+    }
+    return agent;
+  }
+
+  const llmProxy = await AgentModel.getDeploymentLlmProxy();
+  if (!llmProxy) {
+    throw new ApiError(503, "No organization exists yet.");
+  }
+  return llmProxy;
 }

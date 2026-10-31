@@ -2,6 +2,7 @@ import {
   type archestraApiTypes,
   INTERACTION_SOURCE_DISPLAY,
   type InteractionSource,
+  isSupportedProvider,
   type SupportedProvider,
 } from "@archestra/shared";
 import { formatCompactNumber } from "@/lib/utils/format-compact-number";
@@ -60,18 +61,46 @@ export function describeModelOrigin(params: {
   model: string;
   interactionType: string | null | undefined;
 }): ModelOrigin {
-  const maker = makerProviderForModel(params.model);
+  const servedBy = params.interactionType?.split(":")[0];
+  // Kimi Code serves Moonshot's models under plan ids (k3.1-pro, k3, ...).
+  const maker =
+    makerProviderForModel(params.model) ??
+    (servedBy === "kimi-code" && /^k\d/i.test(params.model) ? "kimi" : null);
   if (maker) {
     return { kind: "maker", provider: maker, name: MODEL_MAKER_NAMES[maker] };
   }
-  const servedBy = params.interactionType?.split(":")[0];
   const aggregator = AGGREGATOR_PROVIDERS.find(
     (provider) => provider === servedBy,
   );
   if (aggregator) {
     return { kind: "aggregator", provider: aggregator };
   }
-  return { kind: "unknown", name: unrecognisedVendorName(params.model) };
+  const vendor = unrecognisedVendorName(params.model);
+  if (vendor) return { kind: "unknown", name: vendor };
+  // A first-party provider serves only its own models, so an id no pattern
+  // knows (omni-moderation-latest, tts-1) is still its maker's.
+  if (servedBy && isModelMaker(servedBy)) {
+    return {
+      kind: "maker",
+      provider: servedBy,
+      name: MODEL_MAKER_NAMES[servedBy],
+    };
+  }
+  return { kind: "unknown", name: "Self-hosted" };
+}
+
+/**
+ * The provider a pass-through request went to, when the row is one. Such a
+ * call (a file listing, a batch, a token count) often names no model: it is
+ * labelled "No model" with this provider, not "Unknown model".
+ */
+export function passThroughProvider(
+  interactionType: string | null | undefined,
+): SupportedProvider | null {
+  const [provider, kind] = interactionType?.split(":") ?? [];
+  return kind === "passthrough" && isSupportedProvider(provider)
+    ? provider
+    : null;
 }
 
 /**
@@ -93,7 +122,9 @@ export function shortModelName(model: string): string {
   // (`:free`, Bedrock's `:0`) are not.
   const size = tag && SIZE_PATTERN.test(tag) ? ` ${tag.toUpperCase()}` : "";
 
-  const modern = id.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d+))?/);
+  // Any named Claude family (opus, sonnet, haiku, fable, …): the family
+  // leads, then its version with a dot, as people say it.
+  const modern = id.match(/^claude-([a-z]+)-(\d+)(?:[-.](\d{1,2}))?(?!\d)/);
   if (modern) {
     return `${capitalize(modern[1])} ${version(modern[2], modern[3])}`;
   }
@@ -112,9 +143,7 @@ export function shortModelName(model: string): string {
     return [`GPT-${gptVersion}`, ...rest.map(formatWord)].join(" ") + size;
   }
   return (
-    id
-      .split("-")
-      .filter(Boolean)
+    joinVersionParts(id.split("-").filter(Boolean))
       .map((part, index) => (index === 0 ? capitalize(part) : formatWord(part)))
       .join(" ") + size
   );
@@ -257,6 +286,28 @@ const KNOWLEDGE_TASK_TITLES: Record<KnowledgeSource, string> = {
 const SIZE_PATTERN = /^\d+(\.\d+)?[bmk]$/i;
 
 /**
+ * A dash-separated id spells a version as separate numbers (`llama-3-1-70b`,
+ * `claude-fable-5-1`); read as words they come out "3 1". Adjacent short
+ * numbers are one version: "3.1".
+ */
+function joinVersionParts(parts: string[]): string[] {
+  const joined: string[] = [];
+  for (const part of parts) {
+    const previous = joined.at(-1);
+    if (
+      previous !== undefined &&
+      /^\d{1,2}$/.test(part) &&
+      /^\d{1,2}(\.\d{1,2})*$/.test(previous)
+    ) {
+      joined[joined.length - 1] = `${previous}.${part}`;
+    } else {
+      joined.push(part);
+    }
+  }
+  return joined;
+}
+
+/**
  * Who made a model, by provider id. These name the vendor of the weights, not
  * the provider integration a request went through, so they deliberately do not
  * follow an organization's provider renames (that is what the `aggregator`
@@ -318,7 +369,12 @@ function makerProviderForModel(model: string): ModelMakerProvider | null {
   return null;
 }
 
-function unrecognisedVendorName(model: string): string {
+function isModelMaker(provider: string): provider is ModelMakerProvider {
+  return provider in MODEL_MAKER_NAMES;
+}
+
+/** The vendor an id's prefix or family names; null when nothing in it says. */
+function unrecognisedVendorName(model: string): string | null {
   const id = model.toLowerCase();
   const prefix = id.includes("/") ? id.split("/")[0] : null;
   const base = id.split("/").pop() || id;
@@ -326,7 +382,7 @@ function unrecognisedVendorName(model: string): string {
     if ((prefix && pattern.test(prefix)) || pattern.test(base)) return name;
   }
   if (prefix) return capitalize(prefix.replace(/-.*$/, ""));
-  return "Self-hosted";
+  return null;
 }
 
 const OPEN_WEIGHT_VENDORS: ReadonlyArray<[RegExp, string]> = [

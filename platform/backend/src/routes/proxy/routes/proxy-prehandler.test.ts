@@ -1,7 +1,9 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import LimitModel from "@/models/limit";
 import { ApiError } from "@/types";
 import { OPENAI_HANDLED_ENDPOINT_SUFFIXES } from "../common";
+import type { PassthroughIdentity } from "../passthrough-log";
 import { createProxyPreHandler } from "./proxy-prehandler";
 
 const TEST_UUID = "44f56e01-7167-42c1-88ee-64b566fbc34d";
@@ -41,6 +43,16 @@ describe("createProxyPreHandler", () => {
     mockUpstream.get("/chat/completions", async () => ({
       result: "proxied",
     }));
+    for (const url of [
+      "/files",
+      "/uploads",
+      "/uploads/file-1/parts",
+      "/batches/job-1/cancel",
+    ]) {
+      mockUpstream.post(url, async () => ({ result: "proxied" }));
+    }
+    mockUpstream.get("/batches/job-1", async () => ({ status: "completed" }));
+    mockUpstream.delete("/files/file-1", async () => ({ deleted: true }));
 
     await mockUpstream.listen({ port: 0 });
     const address = mockUpstream.server.address();
@@ -50,6 +62,50 @@ describe("createProxyPreHandler", () => {
   afterEach(async () => {
     await app?.close();
     await mockUpstream?.close();
+  });
+
+  test("a model-scoped quota on another key preserves metadata, files, status and cancellation but blocks unhandled inference", async () => {
+    await LimitModel.create({
+      entityType: "virtual_key",
+      entityId: TEST_UUID,
+      limitType: "requests_per_minute",
+      limitValue: 1,
+      model: ["model-a"],
+    });
+    await setupProxy({
+      apiPrefix: "/v1/openai",
+      endpointSuffix: "/chat/completions",
+      providerName: "OpenAI",
+    });
+    for (const [method, path] of [
+      ["GET", "/v1/models/model-b"],
+      ["GET", "/batches/job-1"],
+      ["POST", "/files"],
+      ["POST", "/uploads"],
+      ["POST", "/uploads/file-1/parts"],
+      ["POST", "/batches/job-1/cancel"],
+      ["DELETE", "/files/file-1"],
+    ] as const) {
+      const response = await app.inject({ method, url: `/v1/openai${path}` });
+      expect(response.statusCode, response.body).toBe(200);
+    }
+    const hits = upstreamHits;
+    for (const path of [
+      "/images/generations",
+      "/audio/speech",
+      "/batches",
+      "/realtime",
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: `/v1/openai${path}`,
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { code: "archestra_quota_unsupported_endpoint" },
+      });
+    }
+    expect(upstreamHits).toBe(hits);
   });
 
   async function setupProxy(params: {
@@ -62,7 +118,7 @@ describe("createProxyPreHandler", () => {
     authenticate?: (params: {
       request: FastifyRequest;
       agentId?: string;
-    }) => Promise<void>;
+    }) => Promise<PassthroughIdentity | undefined>;
   }) {
     const {
       apiPrefix,
@@ -126,6 +182,7 @@ describe("createProxyPreHandler", () => {
         providerName: "OpenAI",
         authenticate: async ({ agentId }) => {
           seen.push(agentId);
+          return undefined;
         },
       });
 
@@ -151,6 +208,7 @@ describe("createProxyPreHandler", () => {
           seenKeys.push(
             request.headers["x-archestra-virtual-key"] as string | undefined,
           );
+          return undefined;
         },
       });
 

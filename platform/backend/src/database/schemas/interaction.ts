@@ -22,6 +22,7 @@ import type {
   InteractionResponse,
   ToolCallBlock,
 } from "@/types";
+import type { AttributionLabels } from "@/types/attribution-label";
 import type { InteractionSessionPreview } from "@/types/interaction";
 import agentsTable from "./agent";
 import environmentsTable from "./environment";
@@ -130,6 +131,24 @@ const interactionsTable = pgTable(
      */
     appId: uuid("app_id"),
     /**
+     * Provider key (chat_api_keys row) that served this call, when it went
+     * through a managed key. Not a foreign key and not indexed, for the same
+     * reason as `connectorId`: a deleted key's id is kept and resolves to no
+     * name on read.
+     */
+    providerApiKeyId: uuid("provider_api_key_id"),
+    /**
+     * Model pool this call was balanced through, with the attempt's 1-based
+     * number and outcome. A request that fails over writes one row per
+     * attempt, and a failed one says why in `failureReason`. A refused
+     * attempt carries no tokens or cost; one cut off by a timeout carries an
+     * estimate of the input it read. Null on calls that no pool handled.
+     */
+    modelPoolId: uuid("model_pool_id"),
+    attempt: integer("attempt"),
+    attemptOutcome: varchar("attempt_outcome"),
+    failureReason: text("failure_reason"),
+    /**
      * Session ID to group related LLM requests together.
      * Can be extracted from:
      * - X-Archestra-Session-Id header (explicit)
@@ -145,7 +164,8 @@ const interactionsTable = pgTable(
      * Provenance of the session ID (NOT the client app — that is
      * external_agent_id). Values: 'claude_metadata', 'header', 'meta_header',
      * 'openwebui_chat', 'codex_session', 'opencode_session', 'kilo_session',
-     * 'claude_code_header', 'appa_header', 'openai_user', null. Legacy rows may
+     * 'pi_session', 'kimi_code_session', 'claude_code_header', 'appa_header',
+     * 'openai_user', null. Legacy rows may
      * carry 'claude_code' / 'claude_desktop'.
      */
     sessionSource: varchar("session_source"),
@@ -187,6 +207,8 @@ const interactionsTable = pgTable(
      * history on this write-hot table.
      */
     billingTeamId: text("billing_team_id"),
+    /** Admission-time labels; later edits/deletions must not rewrite showback. */
+    attributionLabels: jsonb("attribution_labels").$type<AttributionLabels>(),
     request: jsonb("request").$type<InteractionRequest>().notNull(),
     sessionPreview: jsonb("session_preview").$type<InteractionSessionPreview>(),
     processedRequest: jsonb("processed_request").$type<InteractionRequest>(),
@@ -314,7 +336,9 @@ const interactionsTable = pgTable(
     // migrations so its build remains concurrent on existing large tables.
     // The partial interactions_session_preview_missing_idx (rows still without
     // a session preview) is built concurrently from worker startup
-    // (database/index-maintenance.ts), for the same reason.
+    // (database/index-maintenance.ts), for the same reason. So is the partial
+    // interactions_media_cost_unavailable_idx (calls whose media cost is
+    // unavailable), read by the default user limit's spend aggregation.
     // Note: interactions deliberately has NO trgm/GIN indexes on the request/
     // response payload columns. Migration 0116 used to create them for a
     // free-text log search that no longer exists (the LLM logs UI filters by

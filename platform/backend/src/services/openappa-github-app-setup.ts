@@ -16,12 +16,12 @@ import {
   RuntimeCredentialDefinitionModel,
   VerificationModel,
 } from "@/models";
-import { isByosEnabled } from "@/secrets-manager";
 import {
   createRuntimeCredentialDefinition,
   deleteRuntimeCredentialDefinition,
   setRuntimeCredentialConnection,
 } from "@/services/agent-runtime/runtime-credentials";
+import { lookupAccount } from "@/services/github-app-manifest-setup";
 import { resolveOpenAppaGitlabAccess } from "@/services/openappa-github-access";
 import { openappaGitlab } from "@/services/openappa-gitlab";
 import { ApiError } from "@/types";
@@ -109,7 +109,7 @@ class OpenAppaGithubAppSetup {
     if (!app?.success) {
       logger.warn(
         { status: response.status },
-        "GitHub App manifest conversion failed",
+        "OpenAPPA GitHub App manifest conversion failed",
       );
       throw new ApiError(
         502,
@@ -402,11 +402,7 @@ class OpenAppaGithubAppSetup {
         409,
         "Enable OpenAPPA on the server before configuring Git sync",
       );
-    if (isByosEnabled())
-      throw new ApiError(
-        400,
-        "Creating a GitHub App requires writable secret storage. Add an existing App instead.",
-      );
+
     if (
       !(await userHasPermission(
         owner.userId,
@@ -611,33 +607,6 @@ function parseGithubUrl(value: string) {
   return { web: getGithubWebOrigin(api), api };
 }
 
-/** The GitHub account that will own the App, from GitHub's public profile. */
-async function lookupAccount(params: { api: string; login: string }) {
-  const { login } = params;
-  const response = await fetch(
-    `${params.api}/users/${encodeURIComponent(login)}`,
-    {
-      headers: {
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-      redirect: "error",
-      signal: AbortSignal.timeout(15_000),
-    },
-  );
-  // Private Enterprise Server instances need a sign-in to read profiles.
-  if (response.status === 401 || response.status === 403)
-    return { login, type: "Organization" as const };
-  if (response.status === 404)
-    throw new ApiError(400, `GitHub has no account named ${login}.`);
-  const account = response.ok
-    ? AccountSchema.safeParse(await response.json())
-    : null;
-  if (!account?.success)
-    throw new ApiError(502, `GitHub didn't return the ${login} account.`);
-  return account.data;
-}
-
 async function listRepositories(params: {
   api: string;
   appId: string;
@@ -725,9 +694,4 @@ const VALIDATION_DIRECTORY = "traces";
 const RepositorySchema = z.object({
   private: z.boolean(),
   template_repository: z.object({ full_name: z.string() }).nullish(),
-});
-
-const AccountSchema = z.object({
-  login: z.string(),
-  type: z.enum(["User", "Organization"]),
 });

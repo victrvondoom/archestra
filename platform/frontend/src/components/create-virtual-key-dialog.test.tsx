@@ -9,6 +9,7 @@ import {
 } from "@/lib/auth/auth.query";
 import { useAppName } from "@/lib/hooks/use-app-name";
 import { useLlmModels, useModelsWithApiKeys } from "@/lib/llm-models.query";
+import { useLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
 import { useOrganization } from "@/lib/organization.query";
 import { useMyTeams, useTeams } from "@/lib/teams/team.query";
 import { useCreateVirtualApiKey } from "@/lib/virtual-api-keys.query";
@@ -28,6 +29,10 @@ vi.mock("@/lib/llm-models.query", () => ({
   useModelsWithApiKeys: vi.fn(),
   // The key pickers' per-key model counts.
   useLlmModelIdsByKey: () => ({ data: [], isPending: false }),
+}));
+vi.mock("@/lib/llm-provider-api-keys.query", async (importOriginal) => ({
+  ...(await importOriginal()),
+  useLlmProviderApiKeys: vi.fn(() => ({ data: [] })),
 }));
 vi.mock("@/lib/organization.query");
 vi.mock("@/lib/auth/auth.query");
@@ -390,6 +395,71 @@ describe("CreateVirtualKeyDialog", () => {
     expect(dialog).toHaveTextContent("Authorization: Bearer arch_created");
     expect(dialog).toHaveTextContent("NameLaptop");
     expect(dialog).toHaveTextContent("Visible toOnly you");
+  });
+
+  it("hands off a key on current and future providers with a request for its primary keys", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useLlmProviderApiKeys).mockReturnValue({
+      data: [
+        { id: "openai-key", provider: "openai", isPrimary: true, userId: null },
+      ],
+    } as unknown as ReturnType<typeof useLlmProviderApiKeys>);
+    mutateAsync.mockResolvedValue({
+      ...createdKey("standard", []),
+      includeFutureProviders: true,
+    });
+    renderDialog("standard");
+    await createFromAnyStep(user);
+
+    const dialog = await screen.findByTestId("virtual-key-create-dialog");
+    expect(dialog).toHaveTextContent('"model": "openai:gpt-5.6-sol"');
+  });
+
+  it("offers image-only mapped Azure deployments with generation and multipart edit examples", async () => {
+    const user = userEvent.setup();
+    vi.mocked(useModelsWithApiKeys).mockReturnValue({
+      isPending: false,
+      data: [
+        {
+          modelId: "studio-images",
+          provider: "azure",
+          isBest: true,
+          apiKeys: [{ id: "azure-key" }],
+          ignored: false,
+          embeddingDimensions: null,
+          inputModalities: ["text", "image"],
+          outputModalities: ["image"],
+          supportedEndpoints: null,
+        },
+      ],
+    } as unknown as ReturnType<typeof useModelsWithApiKeys>);
+    mutateAsync.mockResolvedValue(
+      createdKey("standard", [
+        { provider: "azure", providerApiKeyId: "azure-key" },
+      ]),
+    );
+    renderDialog("standard");
+    await createFromAnyStep(user);
+    const dialog = await screen.findByTestId("virtual-key-create-dialog");
+    expect(dialog).not.toHaveTextContent("/model-router/images");
+    expect(dialog).toHaveTextContent(
+      "Choose the native provider API for image generation examples.",
+    );
+    await user.click(within(dialog).getByText("Native provider API"));
+    expect(dialog).toHaveTextContent(
+      "https://proxy.example.com/azure/images/generations",
+    );
+    expect(dialog).toHaveTextContent('"model": "studio-images"');
+    expect(dialog).not.toHaveTextContent('"messages"');
+    await user.click(within(dialog).getByLabelText("Image operation"));
+    await user.click(screen.getByRole("option", { name: "Edit an image" }));
+    expect(dialog).toHaveTextContent(
+      "https://proxy.example.com/azure/images/edits",
+    );
+    expect(dialog).toHaveTextContent("image[]=@edit.png");
+    expect(dialog).toHaveTextContent("Authorization: Bearer arch_created");
+    expect(dialog).toHaveTextContent("Save your input image as edit.png");
+    expect(dialog).not.toHaveTextContent("Content-Type: application/json");
   });
 
   it("uses a Copilot model's published Responses endpoint in the native example", async () => {

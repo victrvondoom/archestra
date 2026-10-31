@@ -24,7 +24,7 @@
  *      mcp_server_user,
  *      organization_role, processed_email, secret,
  *      site_notification, skill_team,
- *      team_external_group, team_token, team_vault_folder, user_token,
+ *      team_external_group, team_token, user_token,
  *      virtual_api_key_provider_api_key, virtual_api_key_team
  *
  * New tables must be plural. Tables not listed in (1) or (2) must be plural.
@@ -65,6 +65,7 @@ export { default as agentKnowledgeBasesTable } from "./agent-knowledge-base";
 export { default as agentLabelsTable } from "./agent-label";
 export { default as agentPinsTable } from "./agent-pin";
 export { default as agentRunsTable } from "./agent-run";
+export { default as agentRunAttentionNoticesTable } from "./agent-run-attention-notice";
 export { default as agentRunInputsTable } from "./agent-run-input";
 export {
   agentRunShareTeamsTable,
@@ -101,6 +102,7 @@ export {
   chatActiveRunsTable,
 } from "./chat-active-run";
 export { default as chatopsChannelBindingsTable } from "./chatops-channel-binding";
+export { default as chatopsMsTeamsUserConnectionsTable } from "./chatops-ms-teams-user-connection";
 export { default as chatopsProcessedMessagesTable } from "./chatops-processed-message";
 export { default as chatopsThreadContextsTable } from "./chatops-thread-context";
 export { default as chatopsUserAdmissionsTable } from "./chatops-user-admission";
@@ -135,6 +137,7 @@ export { default as hookFilesTable } from "./hook-file";
 export { default as identityProvidersTable } from "./identity-provider";
 export { default as incomingEmailSubscriptionsTable } from "./incoming-email-subscription";
 export { default as interactionsTable } from "./interaction";
+export { default as interactionBillingTable } from "./interaction-billing";
 export {
   interactionSessionHeadsBackfillTable,
   interactionSessionHeadsTable,
@@ -148,6 +151,11 @@ export {
 } from "./interaction-user-activity";
 export { default as internalMcpCatalogTable } from "./internal-mcp-catalog";
 export { default as invitationsTable } from "./invitation";
+export {
+  jiraChatOpsDeliveriesTable,
+  jiraChatOpsEventsTable,
+} from "./jira-chatops-event";
+export { default as jiraChatOpsIdentitiesTable } from "./jira-chatops-identity";
 export { default as jwksTable } from "./jwks";
 export {
   kbBm25CorpusStatsTable,
@@ -177,6 +185,7 @@ export { default as knowledgeBaseLabelsTable } from "./knowledge-base-label";
 export { default as labelKeysTable } from "./label-key";
 export { default as labelValuesTable } from "./label-value";
 export { default as limitsTable } from "./limit";
+export { default as limitBillingUsageTable } from "./limit-billing-usage";
 export { default as limitLabelsTable } from "./limit-label";
 export { default as limitModelUsageTable } from "./limit-model-usage";
 export { default as llmProviderApiKeysTable } from "./llm-provider-api-key";
@@ -192,12 +201,17 @@ export { default as mcpHttpSessionsTable } from "./mcp-http-session";
 export { default as mcpPresetEntriesTable } from "./mcp-preset-entry";
 export { default as mcpServersTable } from "./mcp-server";
 export { default as mcpServerAlertMutesTable } from "./mcp-server-alert-mute";
+export { default as mcpServerToolDescriptionsTable } from "./mcp-server-tool-description";
 export { default as mcpServerUsersTable } from "./mcp-server-user";
 export { default as mcpToolCallsTable } from "./mcp-tool-call";
 export { default as membersTable } from "./member";
 export { default as messagesTable } from "./message";
 export { default as modelsTable } from "./model";
+export { default as modelCostBackfillsTable } from "./model-cost-backfill";
 export { default as modelLabelsTable } from "./model-label";
+export { default as modelPoolsTable } from "./model-pool";
+export { default as modelPoolMembersTable } from "./model-pool-member";
+export { default as modelPoolVirtualApiKeysTable } from "./model-pool-virtual-api-key";
 export { default as modelTeamsTable } from "./model-team";
 export { default as modelUsersTable } from "./model-user";
 export { default as oauthAccessTokensTable } from "./oauth-access-token";
@@ -214,6 +228,7 @@ export {
   openappaPolicyTestSuitesTable,
 } from "./openappa-policy-tests";
 export { openappaYellsTable } from "./openappa-yell";
+export { default as orgTrioPendingNormalTierTable } from "./org-trio-pending-normal-tier";
 export { default as organizationsTable } from "./organization";
 export { organizationRole as organizationRolesTable } from "./organization-role";
 export { default as pluginsTable } from "./plugin";
@@ -232,7 +247,16 @@ export {
 export { default as projectAppsTable } from "./project-app";
 export { default as projectLabelsTable } from "./project-label";
 export { default as projectPinsTable } from "./project-pin";
+export { default as proxyProviderFilesTable } from "./proxy-provider-file";
 export { default as resourcePermissionPoliciesTable } from "./resource-permission-policy";
+export { default as routingBackfillsTable } from "./routing-backfill";
+export { default as routingDecisionsTable } from "./routing-decision";
+export { default as routingHistoryScoresTable } from "./routing-history-score";
+export { default as routingHistorySessionsTable } from "./routing-history-session";
+export { default as routingHistoryUsageTable } from "./routing-history-usage";
+export { default as routingPlansTable } from "./routing-plan";
+export { default as routingScorerVersionsTable } from "./routing-scorer-version";
+export { default as routingUsageTable } from "./routing-usage";
 export { default as runtimeCredentialConnectionsTable } from "./runtime-credential-connection";
 export { default as runtimeCredentialDefinitionsTable } from "./runtime-credential-definition";
 export { default as scheduleTriggersTable } from "./schedule-trigger";
@@ -271,12 +295,12 @@ export { team as teamsTable, teamMember as teamMembersTable } from "./team";
 export { default as teamExternalGroupsTable } from "./team-external-group";
 export { default as teamLabelsTable } from "./team-label";
 export { default as teamTokensTable } from "./team-token";
-export { default as teamVaultFoldersTable } from "./team-vault-folder";
 export { default as toolsTable } from "./tool";
 export { default as toolObservationsTable } from "./tool-observation";
 export { default as twoFactorsTable } from "./two-factor";
 export { default as usersTable } from "./user";
 export { default as userCredentialsTable } from "./user-credential";
+export { default as userLimitUsageResetsTable } from "./user-limit-usage-reset";
 export { default as userOnboardingSeenItemsTable } from "./user-onboarding-seen-item";
 export { default as userTokensTable } from "./user-token";
 export { default as verificationsTable } from "./verification";

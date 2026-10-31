@@ -134,7 +134,7 @@ Before dispatch, the host compares root revisions and the revision-0 starter has
 
 ### Policy revisions
 
-By default, conversations follow their organization's current policy revision. Each organization has one OpenAPPA deployment line, named by the organization id. The runtime keeps the line's head in `openappa_deployments` and every revision it published in `openappa_policy_revisions` ([`deployments.rs`](../platform/archestra-rs/openappa-rs/src/deployments.rs)).
+Conversations follow their organization's current policy revision. Each organization has one OpenAPPA deployment line, named by the organization id. The runtime keeps the line's head in `openappa_deployments` and every revision it published in `openappa_policy_revisions` ([`deployments.rs`](../platform/archestra-rs/openappa-rs/src/deployments.rs)).
 
 - **Publish.** A dispatch prepares the effective policy it carries and publishes it as the line's head. Bytes the head already names publish nothing, so every pod, a restart, and a credential rotation share one revision. A saved change publishes at the organization's next protected call, on whichever pod serves it. Saving the composition and publishing its runtime revision are separate: a call already preparing before the save may finish before that newer revision is published.
 - **Pin.** The dispatch runs through a view pinned to that head. A runtime follows a publish its own process made. A publish by another pod makes a pinned view refuse the dispatch, retryably, and nothing is appended. The binding then pins the head when it names the same policy file, and runs the dispatch once more.
@@ -142,43 +142,19 @@ By default, conversations follow their organization's current policy revision. E
 - **Offers.** A publish retires every pending remedy offer and approval. The runtime answers "this offer no longer stands; re-propose the call", and the agent proposes the call again under the new revision. When a reviewer answers a review after a publish, the gateway says that the policy changed instead of reporting the approval, and Chat shows "Policy changed, the agent will ask again".
 - **Running calls.** A tool call running across a publish finishes. Its result is labelled under the terms its release recorded, narrowed by the head's.
 - **Display.** The chat status rail shows the revision a conversation's next call is decided under. The Guardrails **Effective** view shows the runtime revision and when it was published.
-- **Earlier releases.** A conversation that the previous Archestra release started keeps that release's behaviour until it ends: it stays on the policy file it opened under, and the retired-annotator 409 still applies to it.
-
-#### Policy for new sessions
-
-**Settings → Guardrails → Policy for new sessions** takes the deployment back to snapshot policies without a redeploy. It is deployment-wide, beside the enforcement switch: `guardrails_deployment.new_session_policy`, `live` (the default) or `snapshot`. Changing it needs `organizationSettings:update` and is audited like the other deployment settings. The backend reads it with every policy read and sends it to the runtime as `DispatchPolicy.snapshot`.
-
-- **`snapshot`.** No policy revision is published on any line. A conversation already following its line keeps deciding at the line's current head (frozen). A new conversation opens as a pinned family under the policy composed at its first call and keeps it until it ends, as conversations did before policy revisions; the retired-annotator 409 applies to it again. A saved change reaches new conversations only. The chat rail shows "policy snapshot" for a pinned conversation, and **Effective** says that new sessions keep a policy snapshot.
-- **Back to `live`.** New conversations open following again. A following conversation takes the next publish at its next call. A conversation that opened pinned stays pinned until it ends: OpenAPPA never turns a pinned family into a following one.
-
-| Family | While snapshot is selected | After selecting live again |
-| --- | --- | --- |
-| Already following its deployment line | Decides at the frozen head, even after a policy save | Follows the next published revision |
-| Opens while snapshot is selected | Opens pinned to the current saved policy; later saves do not change it | Keeps its opening snapshot |
-| Legacy pinned family | Keeps its opening snapshot | Keeps its opening snapshot |
-
-The binding reads the family's opening row to choose the view. New and pinned families use `Runtime::snapshot`; following families use the stored head's policy file, compiled with the organization's current credentials. That file retains external annotator bindings and `token_env` names, and must compile back to the head's exact key. A mismatch fails closed rather than serving different bytes.
-
-Frozen views and live retry repins use the read-only `Runtime::at_revision` API, never `publish`. It verifies the prepared file against the exact stored revision without moving the head. If another live pod advances the head after it was read, the stale view refuses with `PolicyMoved`; retrying can pin the newer head but cannot republish the old policy. Credential rotation can rebuild a view without publishing a revision. A pinned family's status has no served `policyRevision`, including after live mode resumes; a following family's status names its served head.
+- **Legacy conversations.** A conversation that opened pinned to its first policy, before live policy revisions or while an earlier release kept a policy snapshot for new sessions, is refused with the code `legacy_family`: a non-retryable 409 that says "This conversation was opened under an earlier policy model. Start a new conversation." The next conversation follows the line. `pnpm --dir backend db:openappa-count-legacy` counts such conversations per organization before an upgrade.
 
 #### Rolling out and rolling back
-
-When live policy revisions misbehave, select **New sessions keep a policy snapshot** first:
-
-1. Select it. Dispatches that read the setting stop publishing; following conversations use the stored head, and new ones keep the policy they open with. Let already-running live dispatches finish before treating the head as frozen.
-2. Observe. Once every serving pod honors the setting, `openappa_deployments.head` stops moving while policies are saved. Check for unexpected 503 responses with code `policy_moved`; a live pod can still move the head during a mixed-version rollout, so keep policy edits frozen during that rollout.
-3. Fix the cause: the policy, a battery, or the release.
-4. Select **New sessions reference the live policy** again. Following conversations take the next publish; pinned ones keep their snapshot.
-
-A redeploy of the previous image stays the last resort (below).
 
 A policy published while pods of two releases run can make an old pod's decision a regression for one conversation. Freeze policy edits for the roll:
 
 1. Freeze everything that recomposes: Guardrails saves, Git sync pulls, battery, alias and credential changes. The hourly recompose may run; unchanged inputs publish nothing.
-2. The pre-upgrade migration job creates `openappa_deployments` and `openappa_policy_revisions` and adds `guardrails_deployment.new_session_policy` with default `live`. The previous release ignores these additions. New pods need them before they open a conversation.
+2. The pre-upgrade migration job applies the release's schema changes. New pods need them before they open a conversation.
 3. Roll the web and worker pods as usual. Expected refusals: none.
 4. Unfreeze. Check that `openappa_deployments` holds one row per organization, that a policy change publishes the next revision and an open conversation's next call decides under it, and that no burst of the 503 above follows.
-5. To roll back, deploy the previous image. The two tables are harmless to it. A conversation that already received a decision under a later revision is refused by the previous release until the next upgrade, which is why edits stay frozen.
+5. To roll back, deploy the previous image. A conversation that already received a decision under a later revision is refused by the previous release until the next upgrade, which is why edits stay frozen.
+
+A rollback to the release before policy snapshots were removed needs `guardrails_deployment.new_session_policy`, `openappa_effective_policies.retained_annotators` and `openappa_root_openings` re-created first (the SQL is in the release notes). That release refuses every conversation this one opened, and every earlier conversation this one continued, so each of them restarts once more.
 
 Nothing in Archestra enforces the freeze yet. A follow-up could add a deployment-level "policy edits paused" switch that every recompose trigger reads.
 
@@ -190,9 +166,7 @@ Nothing in Archestra enforces the freeze yet. A follow-up could add a deployment
 - Two processes serving different bytes on one line refuse each other's dispatches until one serves the other's head. The stale-read check above keeps this to the moment of a save.
 - After a revision changes the trust chain, file tools refuse calls in workspaces opened under the earlier chain.
 - A held or embedded peer message the previous release wrote carries its trust as a position, not a rank name. Read after a publish that reorders ranks, it takes the rank now at that position. The freeze closes this window.
-- Conversations the previous release started keep its behaviour until they end.
-- With **New sessions keep a policy snapshot** selected, a policy change reaches no running conversation. A conversation that opened pinned keeps its snapshot after **live** is selected again, so it takes a policy change only when the user starts a new conversation.
-- The setting stops publishes, not saves: a save, a Git sync pull, or a battery change still recomposes, and new conversations open under that composition.
+- A legacy conversation cannot be continued; its user starts a new conversation.
 
 ### Helpers
 
@@ -568,10 +542,11 @@ flowchart TD
   Fork --> Start
 ```
 
-Adapters match in precedence order: Claude Code, Codex, OpenCode, then Chat. `X-Appa-Session-ID` overrides native extraction. `X-Appa-Parent-ID` overrides extracted parent metadata. Verified child bindings reject explicit claims that contradict known parents or child IDs.
+Adapters match in precedence order: Pi, Claude Desktop, Claude Code, Codex, Kilo Code, OpenCode, then Chat. `X-Appa-Session-ID` overrides native extraction. `X-Appa-Parent-ID` overrides extracted parent metadata. Verified child bindings reject explicit claims that contradict known parents or child IDs.
 
 | Client | Match Rule | Session Source | Notes |
 | --- | --- | --- | --- |
+| Claude Desktop | `anthropic_claude_desktop` agent ID header, `claude-desktop` user agent, or `cowork` / `claude-desktop` billing entrypoint | `x-claude-code-session-id`, otherwise session parsed from `metadata.user_id` | Shares Claude Code's runtime, tool names, subagent spawns, relays, and `AskUserQuestion` reviews in Code and Cowork tabs. Native Desktop background probes and title requests pass through without opening a session. |
 | Claude Code | `claude-code` / `claude-cli` user agent, or native session header | `x-claude-code-session-id`, otherwise session parsed from `metadata.user_id` | Stable across resume and native compaction. `Agent` and `Task` are child-spawn tools. A skill stays in the caller's trajectory. |
 | Codex | User agent/originator, `x-codex-turn-metadata`, or recognized `client_metadata` | Reconcile body `client_metadata`, its nested turn metadata, the turn-metadata header, and `session-id`. Prefer `thread_id` over session ID. | Contradictory claims return 400. A `forked_from_thread_id` alone does not establish a child. |
 | OpenCode | User agent/originator or `x-opencode-session` | Reconcile `x-session-id`, `x-session-affinity`, and `session-id`, plus hosted `x-opencode-session`. Contradictory claims are refused. | A differing `x-session-id` can identify the parent of the hosted session. Parent metadata still requires child-binding checks. |
@@ -614,7 +589,7 @@ Archestra uses distinct markers for different boundaries. Display text, signed l
 | `<toolu\|call\|aq>_aq2_<nonce>` | Governed native question call ID | Random ID plus a one-use cache record. Paired question identity admits answers. Kept in history without an HMAC. |
 | `peer_proof` | Peer list/read execution arguments | Signed session, action, call ID, and read target. Separate inbox proof, not remedy routing. Removed from provider history. |
 
-The standard receipt block includes a two-line logo. Non-streaming requests prepend it to the first non-empty text chunk. Streaming requests use the response transform. Significant lines are shown below with inert placeholders:
+The standard receipt block includes a single-line logo. Non-streaming requests prepend it to the first non-empty text chunk. Streaming requests use the response transform. Significant lines are shown below with inert placeholders:
 
 ```text
 protected session ABC-DEFG
@@ -774,11 +749,11 @@ sequenceDiagram
 
 For external clients, the gateway might lack the proxy session or call ID. `rememberYellSession` caches this routing under a hash of organization, message, and `with_trajectory`. `recallYellSession` consumes the entry. Modified arguments or missing cache entries fail to route. The handler also verifies caller session permissions. Internal Chat uses its bound conversation context.
 
-`executeYell` creates an `openappa_yells` row and triggers `yell:<call-id>`. `captureYellReport` opens a temporary loopback listener on `127.0.0.1` using a random token. The native reporter builds the archive. Archestra stores the exact gzip payload, forwarding it only when analytics is permitted. Forwarding preserves `x-appa-signature`, rejects redirects, and applies an 8-second timeout. Delivery failures are recorded locally.
+`executeYell` creates an `openappa_yells` row and triggers `yell:<call-id>`. `captureYellReport` opens a temporary loopback listener on `127.0.0.1` using a random token. The native reporter builds the archive. Archestra stores the exact gzip payload, forwarding it only when `ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED=true`. Forwarding preserves `x-appa-signature`, rejects redirects, and applies an 8-second timeout. Delivery failures are recorded locally. Encrypted-chat reports remain encrypted locally and are never forwarded.
 
 `get_openappa_yell({id})` reads stored reports under `log:read`. Report contents remain untrusted diagnostic data. Reading reports does not resolve them or grant policy edit rights. The first UI chat that reads a report becomes its investigation chat in `openappa_yells.conversation_id`; later chats never replace it. Yell responses return that chat only to its owner, and only while it is not deleted. `resolve_openappa_yell({id, resolved})` sets the status under `log:read` and `update` and writes the same `openappaYell.updated` audit entry as the HTTP route. HTTP routes support listing, summaries, archive downloads, and status updates. Unlike consult logs, reading organization yells does not require the diagnostics `admin` action.
 
-The reporting flag controls `yell` advertisement, while analytics controls upstream transmission. Automatic failure reports (such as missing remedy tools) are recorded locally without invoking the model yell flow.
+The reporting flag controls `yell` advertisement. A separate forwarding flag defaults off in every environment and controls upstream transmission independently of analytics. Enabling it does not automatically resend stored archives. Automatic failure reports (such as missing remedy tools) are recorded locally without invoking the model yell flow.
 
 Sources: [`yell-session.ts`](../platform/backend/src/openappa/yell-session.ts), [`executeYell`](../platform/backend/src/openappa/service.ts), [`yell-receiver.ts`](../platform/backend/src/openappa/yell-receiver.ts), [`client-failure-report.ts`](../platform/backend/src/openappa/client-failure-report.ts), [`yell routes`](../platform/backend/src/routes/openappa-yells/openappa-yells.routes.ts).
 
@@ -837,10 +812,10 @@ Gateway -> Runtime: bind child, inherit restrictions, then deliver inputs
 Gateway -> Ledger: launch outcome under the call ID
 Proxy -> Parent: the recorded outcome, not the client's result
 Runtime -> Proxy: model calls and results under the stored child identity
-Gateway -> Parent: get_run returns the recorded admitted ChildReturn
+Gateway -> Parent: get_agent_run returns the recorded admitted ChildReturn
 ```
 
-Long-lived runtimes use `ChildReturn`, not `ChildEnd`, for each final value. This preserves pending calls and later turns. `get_run` returns only the exact admitted value for that task. Unrelated sessions and oversized values are withheld. File reads cross the same boundary.
+Long-lived runtimes use `ChildReturn`, not `ChildEnd`, for each final value. This preserves pending calls and later turns. `get_agent_run` returns only the exact admitted value for the run's current turn. Unrelated sessions and oversized values are withheld; a run with no governed producer returns metadata and the run link only. File reads cross the same boundary.
 
 Downloads check the pinned content, size, and checksum before issuing a ticket. They require admission without transformation. Protected exports are limited to 4 MiB. HTTP ranges serve the admitted host-side copy from a byte-bounded 64 MiB cache, not the runtime's mutable file. Owner HTTP views remain separate human surfaces. Cross-runtime external publishing is refused without an egress crossing.
 
@@ -868,7 +843,7 @@ On resubmission, the runtime replays a committed decision or continues work it d
 
 Completed receipts return saved decisions without re-running the engine. Reusing IDs with modified arguments causes an immediate rejection. The `(root, seq)` key of `openappa_events` rejects a write at a taken position. The runtime keeps each family's decoded log and validated view, so a step reads and validates only the batches written since.
 
-Notice restoration runs on Anthropic Messages (including Bedrock InvokeModel), OpenAI Responses, and OpenAI Chat Completions. Other protocols evaluate calls and results, but notices remain in history as notice calls. The proxy still removes their record, legacy signed offers, and execution frames before forwarding. Model Router routes that translate to Gemini, Bedrock Converse, or Cohere keep the client's session and subagent checks, because the proxy reads them from the client's wire before the translation. Azure Responses tool traffic is refused while OpenAPPA is enabled.
+Notice restoration runs on Anthropic Messages (including Bedrock InvokeModel), OpenAI Responses, OpenAI Chat Completions, and Bedrock Converse. Other protocols evaluate calls and results, but notices remain in history as notice calls. The proxy still removes their record, legacy signed offers, and execution frames before forwarding. Model Router routes that translate to Gemini, Bedrock Converse, or Cohere keep the client's session and subagent checks, because the proxy reads them from the client's wire before the translation. Azure Responses tool traffic is refused while OpenAPPA is enabled.
 
 Subscription Responses translated to Chat Completions retain each tool's argument snapshots and deltas until completion. Conflicting identities or argument bytes fail closed. Incomplete generations do not release held tool calls. The translator does not replace malformed arguments with empty objects.
 
@@ -909,14 +884,14 @@ The addon compiles with Archestra's native addons and ships inside the standard 
 | `ARCHESTRA_LLM_PROXY_PLUGINS` | `appa` | Always includes `appa`, independently of beta features. |
 | `guardrails_deployment.enabled` | `false` | Database row switch. Effective immediately without restart. |
 | `guardrails_deployment.unsupported_client_action` | `bypass` | Action for unknown clients (`bypass` or `block`). |
-| `guardrails_deployment.new_session_policy` | `live` | `live` publishes and follows the current policy; `snapshot` freezes the head and pins new families to their opening policy. |
 | `ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET` | Auto-derived | Legacy name for retained lineage and execution-proof signing. Not used for remedy routing, new question IDs, or display codes. Min 32 chars if explicit. |
 | `ARCHESTRA_OPENAPPA_POSTGRES_MAX_CONNECTIONS` | `4` | Max native pool connections (cap 64). Requires restart. |
 | `ARCHESTRA_OPENAPPA_YELL_ENABLED` | `true` | Enables yell diagnostic reporting. |
-| `ARCHESTRA_ANALYTICS` | Environment-dependent | Unset enables analytics in production/prod. `disabled` prevents upstream yell forwarding, not local storage. |
+| `ARCHESTRA_OPENAPPA_YELL_FORWARDING_ENABLED` | `false` | Explicit opt-in to upstream yell forwarding, independent of analytics. |
+| `ARCHESTRA_ANALYTICS` | Environment-dependent | Unset enables analytics in production/prod. `disabled` turns analytics off independently of yell forwarding. |
 | `ARCHESTRA_DATABASE_URL` | None | Database connection string. Strips `schema` parameter on init. |
 | `ARCHESTRA_CODE_RUNTIME_ENABLED` | `false` | Required for sandbox helper script execution. |
 
 Helm manages `offer-signing-secret` inside the auth Secret. Never delete the auth Secret to rotate tokens. Rotate secrets deliberately across all pods and restart them. Existing signed tokens become invalid upon rotation.
 
-Native PostgreSQL TLS relies on system certificates and URL parameters. The addon does not support custom CA flags.
+Native PostgreSQL TLS reads the libpq parameters in the database URL. `sslmode` accepts `disable`, `prefer`, `require`, `verify-ca` and `verify-full`. Every TLS connection verifies the certificate chain and the host name. `sslrootcert=<path>` trusts only that PEM bundle; without it, the system store applies. `sslmode=no-verify` is refused.

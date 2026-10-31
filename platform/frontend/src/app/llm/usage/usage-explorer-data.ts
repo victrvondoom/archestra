@@ -1,8 +1,16 @@
 import type { Cube, CubeRow } from "../(costs)/costs/cost-explorer-data";
 import type { UsageViewProps } from "./usage-data";
 
-export type UsageMetric = "billed" | "subscription" | "requests" | "tokens";
+export type UsageMetric =
+  | "billed"
+  | "subscription"
+  | "requests"
+  | "tokens"
+  | "cacheRead"
+  | "cacheWrite"
+  | "cacheSavings";
 export type UsageGroup =
+  | "overall"
   | "model"
   | "client"
   | "time"
@@ -14,8 +22,12 @@ export const USAGE_METRICS = [
   { id: "subscription", label: "Subscription estimate" },
   { id: "requests", label: "Requests" },
   { id: "tokens", label: "Tokens" },
+  { id: "cacheRead", label: "Cache reads" },
+  { id: "cacheWrite", label: "Cache writes" },
+  { id: "cacheSavings", label: "Net cache savings" },
 ] satisfies { id: UsageMetric; label: string }[];
 export const USAGE_GROUPS = [
+  { id: "overall", label: "All usage" },
   { id: "model", label: "Model" },
   { id: "client", label: "Client" },
   { id: "time", label: "Time" },
@@ -25,6 +37,10 @@ export const USAGE_GROUPS = [
 ] satisfies { id: UsageGroup; label: string }[];
 
 export function supportsUsage(group: UsageGroup, metric: UsageMetric) {
+  if (metric === "cacheSavings" || group === "overall")
+    return metric === "cacheSavings" && group === "overall";
+  if (metric === "cacheRead" || metric === "cacheWrite")
+    return group === "model" || group === "client" || group === "time";
   return group === "token"
     ? metric === "tokens"
     : group === "context"
@@ -36,6 +52,7 @@ export function usageSeries(
   statistics: UsageViewProps["statistics"],
   metric: UsageMetric,
 ): number[] | undefined {
+  if (metric === "cacheSavings") return undefined;
   const values = statistics.timeSeries.map((point) =>
     metric === "billed"
       ? (point.billedCost ?? point.value)
@@ -43,9 +60,11 @@ export function usageSeries(
         ? point.subscriptionCost
         : metric === "requests"
           ? point.requests
-          : point.inputTokens !== undefined && point.outputTokens !== undefined
-            ? point.inputTokens + point.outputTokens
-            : undefined,
+          : metric === "cacheRead"
+            ? point.cacheReadTokens
+            : metric === "cacheWrite"
+              ? point.cacheWriteTokens
+              : point.totalTokens,
   );
   return values.length > 0 &&
     values.every((value) => value !== undefined && Number.isFinite(value))
@@ -66,7 +85,11 @@ export function usageCube(
         ? "subscriptionCost"
         : metric === "tokens"
           ? "totalTokens"
-          : "requests";
+          : metric === "cacheRead"
+            ? "cacheReadTokens"
+            : metric === "cacheWrite"
+              ? "cacheWriteTokens"
+              : "requests";
   const format = (n: number) => n.toLocaleString();
   const money = (n: number) => `$${n.toFixed(2)}`;
   const base = (key: string, label: string, total: number): CubeRow => ({
@@ -80,11 +103,21 @@ export function usageCube(
   });
   let rows: CubeRow[] = [];
   let notice =
-    "Personal activity only. Tokens are input + output; cache reads are shown separately.";
+    "Personal activity only. Token totals count newly processed input and output. Reused cached input is listed separately.";
   let extraCols: Cube["extraCols"] = [];
   const buckets =
     group === "time" ? statistics.timeSeries.map((p) => p.timestamp) : [];
-  if (group === "model" || group === "client") {
+  if (group === "overall") {
+    rows = [
+      base("personal-cache", "Your usage", breakdown.tokenMix.cacheSavings),
+    ];
+    notice =
+      "Estimated at API rates, including subscription usage, versus full input pricing after cache-write surcharges. Negative means caching cost more than it saved. Based on reported usage and available prices, not a bill credit. Available as a total for the selected period.";
+    extraCols = [
+      { id: "cacheCost", label: "Cache cost at API rates", format: money },
+    ];
+    rows[0].extras.cacheCost = breakdown.tokenMix.cacheCost;
+  } else if (group === "model" || group === "client") {
     const source =
       group === "model"
         ? statistics.models.map((m) => ({ ...m, key: m.model, label: m.model }))
@@ -97,9 +130,13 @@ export function usageCube(
       ...base(item.key, item.label, item[field]),
       extras: {
         requests: item.requests,
-        input: item.inputTokens,
+        input: Math.max(
+          0,
+          item.totalTokens - item.outputTokens - item.cacheWriteTokens,
+        ),
         output: item.outputTokens,
         cache: item.cacheReadTokens,
+        cacheWrite: item.cacheWriteTokens,
         billed: item.billedCost,
         subscription: item.subscriptionCost,
       },
@@ -108,13 +145,22 @@ export function usageCube(
             {
               key: "input",
               label: "Input",
-              total: item.inputTokens,
+              total: Math.max(
+                0,
+                item.totalTokens - item.outputTokens - item.cacheWriteTokens,
+              ),
               series: [],
             },
             {
               key: "output",
               label: "Output",
               total: item.outputTokens,
+              series: [],
+            },
+            {
+              key: "cacheWrite",
+              label: "Cache writes",
+              total: item.cacheWriteTokens,
               series: [],
             },
           ]
@@ -125,9 +171,12 @@ export function usageCube(
       { id: "input", label: "Input", format },
       { id: "output", label: "Output", format },
       { id: "cache", label: "Cache reads", format },
+      { id: "cacheWrite", label: "Cache writes", format },
       { id: "billed", label: "Billed spend", format: money },
       { id: "subscription", label: "Subscription estimate", format: money },
-    ].filter((c) => c.id !== metric);
+    ].filter(
+      (c) => c.id !== metric && !(metric === "cacheRead" && c.id === "cache"),
+    );
   } else if (group === "time") {
     const series = usageSeries(statistics, metric);
     const complete = series !== undefined;
@@ -151,7 +200,7 @@ export function usageCube(
       ] as const
     ).map(([key, label]) => base(key, label, breakdown.tokenMix[key]));
     notice =
-      "Recorded token mix includes cache reads and writes, so this total differs from the input + output Tokens tile. Cache savings are an estimate against full input pricing, not a bill credit.";
+      "The mix lists cache reads and writes separately. Cache reads are not part of the token total. Cache savings are an estimate against full input pricing, not a bill credit.";
   } else if (group === "context") {
     const labels = {
       under32k: "Under 32K",
@@ -209,10 +258,15 @@ export function usageCube(
             label: "Output",
             total: rows.reduce((n, r) => n + (r.children[1]?.total ?? 0), 0),
           },
+          {
+            key: "cacheWrite",
+            label: "Cache writes",
+            total: rows.reduce((n, r) => n + (r.children[2]?.total ?? 0), 0),
+          },
         ]
       : [],
     total: rows.reduce((n, r) => n + r.total, 0),
-    api: `GET /api/statistics/me${group === "client" || group === "token" || group === "context" || group === "session" ? "/breakdown" : ""}?timeframe=${timeframe}`,
+    api: `GET /api/statistics/me${group === "overall" || group === "client" || group === "token" || group === "context" || group === "session" ? "/breakdown" : ""}?timeframe=${timeframe}`,
     isLoading: false,
     retry: () => {},
     notice,

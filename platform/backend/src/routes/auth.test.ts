@@ -41,6 +41,41 @@ describe("auth routes", () => {
     await app.close();
   });
 
+  test("does not forward direct SSO provider registration", async () => {
+    vi.mocked(betterAuth.handler).mockResolvedValue(
+      new Response("{}", { status: 200 }),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/sso/register",
+      payload: { providerId: "personal-provider" },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(betterAuth.handler).not.toHaveBeenCalled();
+  });
+
+  test("does not relay session cookies from a rejected SSO callback", async () => {
+    vi.mocked(betterAuth.handler).mockResolvedValue(
+      new Response(JSON.stringify({ message: "Sign-in denied" }), {
+        status: 403,
+        headers: {
+          "content-type": "application/json",
+          "set-cookie": "archestra.session_token=fake; HttpOnly; Path=/",
+        },
+      }),
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/auth/sso/callback/test-provider?code=fake",
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.headers["set-cookie"]).toBeUndefined();
+  });
+
   test("applies organization OAuth token lifetime to OAuth 2.1 token responses", async ({
     makeAgent,
     makeOAuthAccessToken,
@@ -903,6 +938,35 @@ describe("auth routes", () => {
         configurable: true,
       });
     }
+  });
+
+  test("explains that an expired OAuth consent request must be restarted", async () => {
+    // Real better-auth: its signed-query check is the behavior under test.
+    vi.mocked(betterAuth.handler).mockRestore();
+    const expiredAtSeconds = Math.floor(Date.now() / 1000) - 60;
+    const oauthQuery = new URLSearchParams({
+      response_type: "code",
+      client_id: "test-client",
+      redirect_uri: "http://127.0.0.1:53280/callback",
+      scope: "mcp",
+      code_challenge: "z3m9itT_If5IIoYttJt26gisBUMM2ywTcv9eqqIZvFE",
+      code_challenge_method: "S256",
+      exp: String(expiredAtSeconds),
+      ba_iat: String((expiredAtSeconds - 600) * 1000),
+      sig: "Xh2WFq2Gyw6f7+noAqYrOse947K9QDXU20UwL8w8VNs=",
+    }).toString();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/oauth2/consent",
+      headers: { origin: config.frontendBaseUrl },
+      payload: { accept: true, scope: "mcp", oauth_query: oauthQuery },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toBe(
+      "This authorization request has expired. Go back to the application and connect again to start a new request.",
+    );
   });
 
   describe("x-archestra-client-ip is never forwarded from client input", () => {

@@ -16,6 +16,7 @@ if (isMainModule) {
   await import("./observability/tracing/sdk");
 }
 
+import { isWorker } from "node:cluster";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -47,16 +48,20 @@ import {
 import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import { fastifyAuthPlugin } from "@/auth";
 import { revokeBasicAuthOnlySessions } from "@/auth/basic-auth-lockout";
+import { applyPendingNormalTiers } from "@/auto-routing/pending-normal-tier";
 import { cacheManager } from "@/cache-manager";
 // SPDX-SnippetBegin
 // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
 // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
-import { registerMcpClientHibernationInvalidation } from "@/clients/mcp-client";
+import mcpClient, {
+  registerMcpClientHibernationInvalidation,
+} from "@/clients/mcp-client";
 // SPDX-SnippetEnd
 import config, {
   resolveAllowedOrigins,
   shouldRunWebServer,
   shouldRunWorker,
+  validateShutdownPodGrace,
 } from "@/config";
 import { verifyEncryptedChatConfig } from "@/content-encryption/encrypted-chat-escrow";
 // biome-ignore lint/style/noRestrictedImports: dual-licensed, self-guards on the license flag
@@ -101,7 +106,9 @@ import { createCachedOpenApiRouteHandler } from "@/openapi/cached-openapi-route"
 import { enrichOpenApiWithRbac } from "@/openapi/enrich-openapi-with-rbac";
 import {
   declareOpenappaInstalls,
+  openappaReadiness,
   recompileAllOnStart,
+  startOpenappaRuntime,
 } from "@/openappa/service";
 import { initializeLlmProxyPlugins } from "@/proxy/plugins/registry";
 import guardrailsNoopAnnotatorRoutes from "@/routes/guardrails-policy/guardrails-noop-annotator.routes";
@@ -125,6 +132,7 @@ import { mcpImageUpdateChecker } from "@/services/mcp-image-update-checker";
 import { mcpToolsRefreshManager } from "@/services/mcp-tools-refresh";
 import { initializeManagedPlaywrightRuntime } from "@/services/playwright-runtime";
 import { ensureScopedResourcePermissionCutover } from "@/services/resource-permissions-cutover";
+import { sreAgentService } from "@/services/sre-agent";
 import { systemKeyManager } from "@/services/system-key-manager";
 import { skillSandboxRuntimeService } from "@/skills-sandbox/skill-sandbox-runtime-service";
 import { createStartupHealthServer } from "@/startup-health";
@@ -168,10 +176,32 @@ import {
   CONNECTION_SETUP_SCRIPT_PREFIX,
   HEALTH_PATH,
   MCP_GATEWAY_PREFIX,
+  MS_TEAMS_SIGN_IN_PATH,
   READY_PATH,
   SKILL_MARKETPLACE_PREFIX,
 } from "./routes/route-paths";
-import { beginLlmProxyDrain } from "./server/llm-proxy-drain";
+import {
+  beginLlmProxyDrain,
+  drainLlmProxyRequests,
+} from "./server/llm-proxy-drain";
+import { drainBackgroundWork } from "./utils/background-work";
+
+async function flushShutdownTelemetry(): Promise<void> {
+  if (isMainModule)
+    await (await import("./observability/tracing/sdk")).shutdownTelemetry();
+}
+
+function shutdownTimeoutMs(): number {
+  return (
+    (Math.max(
+      config.shutdown.drainSeconds,
+      config.kb.taskWorkerShutdownTimeoutSeconds,
+    ) +
+      config.shutdown.cleanupSeconds) *
+    1000
+  );
+}
+
 import {
   UserConfigFieldDefaultSchema,
   UserConfigFieldSchema,
@@ -409,6 +439,7 @@ export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
   fastify.register(routes.groqProxyRoutes);
   fastify.register(routes.jevProxyRoutes);
   fastify.register(routes.kimiProxyRoutes);
+  fastify.register(routes.kimiCodeProxyRoutes);
   fastify.register(routes.microsoft365CopilotProxyRoutes);
   fastify.register(routes.minimaxProxyRoutes);
   fastify.register(routes.modelRouterProxyRoutes);
@@ -752,6 +783,14 @@ const startMcpServerRuntime = async (
             "Failed to finalize managed Playwright runtime initialization",
           ),
         );
+        void sreAgentService
+          .finalize()
+          .catch((error) =>
+            fastify.log.error(
+              { err: error },
+              "Failed to finalize the SRE agent",
+            ),
+          );
       };
 
       McpServerRuntimeManager.onRuntimeStartupError = (error: Error) => {
@@ -807,6 +846,8 @@ const startWebServer = async () => {
     if (url.startsWith(`${SKILL_MARKETPLACE_PREFIX}/`)) return true;
     // one-time setup token is embedded in the URL path; never log it
     if (url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)) return true;
+    // Teams sign-in key and OAuth code are in the query string; never log them
+    if (url.startsWith(MS_TEAMS_SIGN_IN_PATH)) return true;
     return false;
   };
 
@@ -910,6 +951,7 @@ const startWebServer = async () => {
     // text does not declare.
     await declareOpenappaInstalls();
     void recompileAllOnStart();
+    void startOpenappaRuntime();
 
     // With basic auth disabled, a password session that predates the flag
     // would otherwise stay valid until it expired. Runs after seeding so the
@@ -938,6 +980,12 @@ const startWebServer = async () => {
     // Complete the one-time permission upgrade before admitting API traffic.
     await ensureScopedResourcePermissionCutover();
     // SPDX-SnippetEnd
+
+    // Finish the org-trio migration's normal tiers that waited for the Agent
+    // Runtime check; auto routing stays disabled for them meanwhile.
+    void applyPendingNormalTiers().catch((error) => {
+      logger.error({ err: error }, "Failed to apply pending normal tiers");
+    });
 
     // Initialize metrics with keys of custom agent labels
     // Set OpenMetrics content type to enable exemplar support on histograms
@@ -1231,6 +1279,9 @@ const startWebServer = async () => {
       processedEmailCleanupIntervalId,
       activeChatRunReaperIntervalId,
     });
+    // A cluster supervisor must wait for initialization, not the temporary
+    // startup-health listener that opens this same port before seeding.
+    if (isWorker) process.send?.({ type: "archestra.web.ready" });
   } catch (err) {
     await startupHealth.close();
     fastify.log.error(err);
@@ -1291,16 +1342,20 @@ function registerWebServerShutdown(
     shuttingDown = true;
     fastify.log.info(`Received ${signal}, shutting down gracefully...`);
     beginLlmProxyDrain(fastify);
-    // Leave time after the 60s proxy drain for dependency cleanup, but never
-    // let unrelated long-lived connections or cleanup exceed the supervisor.
+    if (publicEndpointsServerInstance)
+      beginLlmProxyDrain(publicEndpointsServerInstance);
+    // Reserve cleanup time beyond HTTP draining and any worker task shutdown.
     const shutdownDeadline = setTimeout(() => {
       fastify.log.error("Graceful shutdown timed out");
       process.exit(1);
-    }, 80_000);
+    }, shutdownTimeoutMs());
     shutdownDeadline.unref();
 
     // Stop accepting new runs before snapshotting, so nothing created after this
     // point escapes the cleanup below.
+    const stoppedWorker = shouldRunWorker
+      ? taskQueueService.stopWorker()
+      : Promise.resolve();
     activeChatRunService.beginShutdown();
     agentRunReconciler.stop();
     // SPDX-SnippetBegin
@@ -1334,6 +1389,13 @@ function registerWebServerShutdown(
     ]);
 
     try {
+      await Promise.all([
+        drainLlmProxyRequests(fastify),
+        publicEndpointsServerInstance
+          ? drainLlmProxyRequests(publicEndpointsServerInstance)
+          : Promise.resolve(),
+        stoppedWorker,
+      ]);
       if (intervalIds.activeChatRunReaperIntervalId) {
         clearInterval(intervalIds.activeChatRunReaperIntervalId);
       }
@@ -1349,6 +1411,7 @@ function registerWebServerShutdown(
 
       await fastify.close();
       fastify.log.info("Main server closed");
+      await drainBackgroundWork();
 
       websocketService.stop();
 
@@ -1359,17 +1422,11 @@ function registerWebServerShutdown(
         clearInterval(intervalIds.processedEmailCleanupIntervalId);
       }
 
-      cacheManager.shutdown();
-
       // Flush any buffered exceptions before exit (internally time-bounded).
       await posthogErrorTrackingService.shutdown();
 
       // Stop accepting new skill-sandbox runs
       await skillSandboxRuntimeService.shutdown();
-
-      if (shouldRunWorker) {
-        await taskQueueService.stopWorker();
-      }
 
       mcpToolsRefreshManager.stop();
 
@@ -1420,6 +1477,11 @@ function registerWebServerShutdown(
         );
       }
 
+      await drainBackgroundWork();
+      await mcpClient.disconnectAll();
+      await drainBackgroundWork();
+      cacheManager.shutdown();
+      await flushShutdownTelemetry();
       clearTimeout(shutdownDeadline);
       process.exit(0);
     } catch (error) {
@@ -1487,6 +1549,7 @@ const startWorker = async () => {
     // carries the legacy rows into the text first, exactly as `start` does.
     await declareOpenappaInstalls();
     void recompileAllOnStart();
+    void startOpenappaRuntime();
 
     registerTaskHandlers(taskQueueService);
     await taskQueueService.seedPeriodicTasks();
@@ -1555,7 +1618,17 @@ const startWorker = async () => {
       if (!dbHealthy) {
         return reply.status(503).send({ status: "error", reason: "database" });
       }
-      return { status: "ok" };
+      const openappa = await openappaReadiness();
+      switch (openappa.state) {
+        case "disabled":
+        case "ready":
+          return { status: "ok" };
+        case "starting":
+        case "unavailable":
+          return reply
+            .status(503)
+            .send({ status: "error", reason: "openappa" });
+      }
     });
 
     // Auth plugin decorates request.user / request.organizationId which route
@@ -1577,30 +1650,34 @@ const startWorker = async () => {
       `Worker server started on port ${port} with ${labelKeys.length} agent label keys`,
     );
 
+    let shuttingDown = false;
     const gracefulShutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       logger.info(`Worker received ${signal}, shutting down...`);
-
-      // Force exit if cleanup takes too long (e.g., long-running task doesn't respect cancellation).
-      // Must exceed taskWorkerShutdownTimeoutSeconds so stopWorker() has time to drain
-      // in-flight tasks and release them back to the queue.
-      const forceExitTimeoutMs =
-        (config.kb.taskWorkerShutdownTimeoutSeconds + 5) * 1000;
+      beginLlmProxyDrain(healthServer);
       const forceExitTimeout = setTimeout(() => {
         logger.warn("Worker shutdown timed out, forcing exit");
         process.exit(1);
-      }, forceExitTimeoutMs);
+      }, shutdownTimeoutMs());
+      const stoppedWorker = taskQueueService.stopWorker();
 
       try {
+        await Promise.all([drainLlmProxyRequests(healthServer), stoppedWorker]);
         await healthServer.close();
+        await drainBackgroundWork();
         // SPDX-SnippetBegin
         // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
         // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
         mcpActiveUseTracker.stop();
         // SPDX-SnippetEnd
-        cacheManager.shutdown();
         await posthogErrorTrackingService.shutdown();
         await skillSandboxRuntimeService.shutdown();
-        await taskQueueService.stopWorker();
+        await drainBackgroundWork();
+        await mcpClient.disconnectAll();
+        await drainBackgroundWork();
+        cacheManager.shutdown();
+        await flushShutdownTelemetry();
         clearTimeout(forceExitTimeout);
         process.exit(0);
       } catch (error) {
@@ -1647,9 +1724,20 @@ process.on("unhandledRejection", (reason) => {
  * This allows other scripts to import helper functions without starting the server
  */
 if (isMainModule) {
-  if (shouldRunWorker && !shouldRunWebServer) {
-    startWorker();
-  } else if (shouldRunWebServer) {
-    startWebServer();
+  try {
+    validateShutdownPodGrace(
+      config.shutdown.podGraceSeconds,
+      config.shutdown.drainSeconds,
+      config.shutdown.cleanupSeconds,
+      config.kb.taskWorkerShutdownTimeoutSeconds,
+    );
+    if (shouldRunWorker && !shouldRunWebServer) {
+      await startWorker();
+    } else if (shouldRunWebServer) {
+      await startWebServer();
+    }
+  } catch (error) {
+    logger.error({ err: error }, "Server failed to start");
+    process.exit(1);
   }
 }

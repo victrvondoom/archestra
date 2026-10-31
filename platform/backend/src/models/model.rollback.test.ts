@@ -1,3 +1,4 @@
+import { azureModelEvidence } from "@archestra/shared/azure-models";
 import { describe, expect, test } from "@/test";
 import LlmProviderApiKeyModel from "./llm-provider-api-key";
 import LlmProviderApiKeyModelLinkModel from "./llm-provider-api-key-model";
@@ -684,8 +685,8 @@ describe("ModelModel", () => {
         "openai",
         "custom-priced",
       );
-      expect(after?.customPricePerMillionInput).toBe("12.00");
-      expect(after?.customPricePerMillionOutput).toBe("36.00");
+      expect(after?.customPricePerMillionInput).toBe("12.00000000");
+      expect(after?.customPricePerMillionOutput).toBe("36.00000000");
     });
   });
 
@@ -848,6 +849,69 @@ describe("ModelModel", () => {
     });
   });
 
+  describe("applyAuthoritativeCapabilities", () => {
+    test("rewrites modalities and tool support and keeps every override", async () => {
+      // Stored as a chat model, the way an older build classified it.
+      const created = await ModelModel.create({
+        externalId: "openai/gpt-realtime-fixture",
+        provider: "openai",
+        modelId: "gpt-realtime-fixture",
+        contextLength: 128000,
+        outputLength: 16384,
+        inputModalities: ["text", "audio", "image"],
+        outputModalities: ["text", "audio"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.000004",
+        lastSyncedAt: new Date(),
+      });
+      await ModelModel.update(created.id, {
+        customPricePerMillionInput: "1.50",
+        customPricePerMillionOutput: "3.00",
+        customPricePerMillionCacheRead: "0.25",
+        customPricePerMillionCacheWrite: "2.00",
+        customContextLength: 32000,
+        customOutputLength: 4096,
+      });
+
+      await ModelModel.applyAuthoritativeCapabilities([
+        {
+          provider: "openai",
+          modelId: "gpt-realtime-fixture",
+          inputModalities: ["text", "audio"],
+          outputModalities: ["audio"],
+          supportsToolCalling: false,
+        },
+        // Nothing is stored under this id, so nothing may be created for it.
+        {
+          provider: "openai",
+          modelId: "never-synced",
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling: true,
+        },
+      ]);
+
+      const after = await ModelModel.findById(created.id);
+      expect(after).toMatchObject({
+        inputModalities: ["text", "audio"],
+        outputModalities: ["audio"],
+        supportsToolCalling: false,
+        customPricePerMillionInput: "1.50000000",
+        customPricePerMillionOutput: "3.00000000",
+        customPricePerMillionCacheRead: "0.25000000",
+        customPricePerMillionCacheWrite: "2.00000000",
+        customContextLength: 32000,
+        customOutputLength: 4096,
+        contextLength: 128000,
+        outputLength: 16384,
+        promptPricePerToken: "0.000004000000",
+      });
+      expect(
+        await ModelModel.findByProviderAndModelId("openai", "never-synced"),
+      ).toBeNull();
+    });
+  });
+
   describe("delete", () => {
     test("returns false when model does not exist", async () => {
       const result = await ModelModel.delete("openai", "nonexistent");
@@ -939,7 +1003,7 @@ describe("ModelModel", () => {
         "repeat-model",
       );
       expect(after?.id).toBe(first?.id);
-      expect(after?.customPricePerMillionInput).toBe("4.00");
+      expect(after?.customPricePerMillionInput).toBe("4.00000000");
     });
   });
 
@@ -1104,6 +1168,51 @@ describe("ModelModel", () => {
       expect(capabilities.supportsToolCalling).toBe(true);
       expect(capabilities.pricePerMillionInput).toBe("5");
       expect(capabilities.pricePerMillionOutput).toBe("15");
+    });
+  });
+
+  describe.each([
+    {
+      modelId: "gpt-image-1",
+      input: ["text"] as const,
+      output: ["image"] as const,
+    },
+    {
+      modelId: "gpt-realtime-translate",
+      input: ["audio"] as const,
+      output: ["text", "audio"] as const,
+    },
+    {
+      modelId: "gpt-audio",
+      input: ["text", "audio"] as const,
+      output: ["text", "audio"] as const,
+    },
+  ])("Azure media Chat capabilities: $modelId", ({
+    modelId,
+    input,
+    output,
+  }) => {
+    test("offers the media model in Chat without advertising agent tools", async () => {
+      const model = await ModelModel.create({
+        externalId: `azure/${modelId}`,
+        provider: "azure",
+        modelId,
+        inputModalities: [...input],
+        outputModalities: [...output],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+      const scopedModel = {
+        ...model,
+        azureCapabilities: azureModelEvidence({
+          underlyingModelName: modelId,
+          source: "deployment",
+        }),
+      };
+      expect(ModelModel.supportsTextChat(scopedModel)).toBe(true);
+      expect(ModelModel.toCapabilities(scopedModel).supportsToolCalling).toBe(
+        false,
+      );
     });
   });
 
@@ -1356,8 +1465,8 @@ describe("ModelModel", () => {
       const updated = await ModelModel.findById(model.id);
 
       const pricing = ModelModel.getEffectivePricing(updated);
-      expect(pricing.pricePerMillionCacheRead).toBe("0.50");
-      expect(pricing.pricePerMillionCacheWrite).toBe("4.00");
+      expect(pricing.pricePerMillionCacheRead).toBe("0.50000000");
+      expect(pricing.pricePerMillionCacheWrite).toBe("4.00000000");
       expect(pricing.cacheSource).toBe("custom");
     });
 

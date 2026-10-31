@@ -28,10 +28,12 @@ import {
 import logger from "@/logging";
 import { OrganizationModel } from "@/models";
 import { ngrokTunnelManager } from "@/ngrok-tunnel-manager";
-import { getByosVaultKvVersion, isByosEnabled } from "@/secrets-manager";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
 import { isAnyAgentRuntimeBackendDriverEnabled } from "@/services/agent-runtime/backends";
+import { DEFAULT_AGENT_RUNTIME_TIER } from "@/services/agent-runtime/runtime-tiers";
+import { devFeedbackService } from "@/services/dev-feedback";
 import { skillSandboxRuntimeService } from "@/skills-sandbox/skill-sandbox-runtime-service";
-import { EmailProviderTypeSchema } from "@/types";
+import { AgentRuntimeTierSchema, EmailProviderTypeSchema } from "@/types";
 import { PUBLIC_CONFIG_PATH } from "./route-paths";
 
 export const publicConfigRoutes: FastifyPluginAsyncZod = async (fastify) => {
@@ -117,11 +119,8 @@ export const ConfigResponseSchema = z.strictObject({
       defaultTtlHours: z.number(),
       defaultIdleTimeoutMinutes: z.number(),
       allowPrivileged: z.boolean(),
-      resources: z.object({
-        cpuRequest: z.string(),
-        memoryRequest: z.string(),
-        memoryLimit: z.string(),
-      }),
+      /** The tier a run gets when its Agent names none. */
+      defaultTier: AgentRuntimeTierSchema,
     }),
     plugins: z.boolean(),
     // Max size of a file the sandbox can stage. The chat composer caps
@@ -135,8 +134,7 @@ export const ConfigResponseSchema = z.strictObject({
     // in one request, so the composer needs this to stop a send that
     // the body parser would reject with an opaque 413.
     apiBodyLimitBytes: z.number(),
-    byosEnabled: z.boolean(),
-    byosVaultKvVersion: z.enum(["1", "2"]).nullable(),
+
     azureOpenAiEntraIdEnabled: z.boolean(),
     anthropicWifEnabled: z.boolean(),
     anthropicKeylessAuthEnabled: z.boolean(),
@@ -164,6 +162,8 @@ export const ConfigResponseSchema = z.strictObject({
     chatopsTelegramEnabled: z.boolean(),
     /** BETA: auto-sync-permissions connector visibility and its Permissions tab UI. */
     kbMfilesConnectorEnabled: z.boolean(),
+    /** BETA: the Model Pools page and pool routing. */
+    llmModelPoolsEnabled: z.boolean(),
     kbMfilesOauthEnabled: z.boolean(),
     /**
      * The BM25 tuning constants an organization inherits until it
@@ -193,6 +193,10 @@ export const ConfigResponseSchema = z.strictObject({
      * discovered from installed MCP servers.
      */
     mcpGatewaySkillsEnabled: z.boolean(),
+    /** Internal UI feedback overlay; on only where its Slack channel is set. */
+    devFeedbackEnabled: z.boolean(),
+    /** ALPHA: the Model Router's "auto" model and its settings. */
+    autoRoutingEnabled: z.boolean(),
   }),
   providerBaseUrls: z.record(SupportedProvidersSchema, z.string().nullable()),
 });
@@ -236,14 +240,13 @@ export function getConfigResponse(): z.infer<typeof ConfigResponseSchema> {
         defaultIdleTimeoutMinutes:
           config.agentRuntime.defaultIdleTimeoutMinutes,
         allowPrivileged: config.agentRuntime.allowPrivileged,
-        resources: config.agentRuntime.resources,
+        defaultTier: DEFAULT_AGENT_RUNTIME_TIER,
       },
       plugins: true,
       sandboxArtifactBytesLimit: config.skillsSandbox.artifactBytesLimit,
       chatAttachmentStorageBytesLimit: config.chat.attachmentStorageBytesLimit,
       apiBodyLimitBytes: config.api.bodyLimit,
-      byosEnabled: isByosEnabled(),
-      byosVaultKvVersion: getByosVaultKvVersion(),
+
       azureOpenAiEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
       anthropicWifEnabled: anthropicWorkloadIdentity.isEnabled(),
       anthropicKeylessAuthEnabled: isAnthropicKeylessAuthEnabled(),
@@ -267,6 +270,7 @@ export function getConfigResponse(): z.infer<typeof ConfigResponseSchema> {
       agentHooksEnabled: config.hooks.enabled,
       chatopsTelegramEnabled: config.chatops.telegramEnabled,
       kbMfilesConnectorEnabled: config.kb.mfilesConnectorEnabled,
+      llmModelPoolsEnabled: config.llmProxy.modelPoolsEnabled,
       kbMfilesOauthEnabled: config.kb.mfilesOauthEnabled,
       kbBm25DefaultK1: config.kb.bm25K1,
       kbBm25DefaultB: config.kb.bm25B,
@@ -278,6 +282,8 @@ export function getConfigResponse(): z.infer<typeof ConfigResponseSchema> {
         redirectUri: getGoogleDriveOAuthRedirectUri(),
       },
       mcpGatewaySkillsEnabled: config.mcpGateway.skillsEnabled,
+      devFeedbackEnabled: devFeedbackService.isAvailable,
+      autoRoutingEnabled: config.autoRouting.enabled,
     },
     providerBaseUrls: {
       openai: config.llm.openai.baseUrl || null,
@@ -301,6 +307,7 @@ export function getConfigResponse(): z.infer<typeof ConfigResponseSchema> {
       deepseek: config.llm.deepseek.baseUrl || null,
       archestra: config.llm.archestra.baseUrl || null,
       kimi: config.llm.kimi.baseUrl || null,
+      "kimi-code": config.llm["kimi-code"].baseUrl || null,
       "github-copilot": config.llm["github-copilot"].baseUrl || null,
       "microsoft-365-copilot":
         config.llm["microsoft-365-copilot"].baseUrl || null,
@@ -343,6 +350,16 @@ export const PublicConfigResponseSchema = z.strictObject({
 let cachedAnalyticsInstanceId: string | null = null;
 let pendingAnalyticsInstanceId: Promise<string | null> | null = null;
 let hasLoggedAnalyticsInstanceIdError = false;
+
+// Shared test workers replace their database between cases; the cached
+// installation identity must not survive that database reset.
+registerProcessLocalCache({
+  clear() {
+    cachedAnalyticsInstanceId = null;
+    pendingAnalyticsInstanceId = null;
+    hasLoggedAnalyticsInstanceIdError = false;
+  },
+});
 
 export async function getPublicConfigResponse(): Promise<
   z.infer<typeof PublicConfigResponseSchema>

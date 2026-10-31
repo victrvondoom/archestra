@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, test } from "vitest";
 
 import { GET } from "./route";
 
@@ -90,6 +90,14 @@ describe("Disconnect agent instructions", () => {
     expect(instructions).toContain(
       "configLibrary/aa157426-f6a9-5ac5-8471-3b30b42bbe8f.json",
     );
+    expect(instructions).toContain("claude-appa-permissions.json");
+    expect(instructions).toContain(
+      "$CLAUDE_CONFIG_DIR/.archestra/claude-appa-permissions.json",
+    );
+    expect(instructions).toContain(
+      "Read the SERVER_NAME entry from ~/.archestra/claude-appa-permissions.json",
+    );
+    expect(instructions).toContain("rules from permissions.allow");
     expect(instructions).toContain("do not change anything there");
     expect(instructions).toContain("Do not force it to close.");
   });
@@ -107,4 +115,19 @@ describe("Disconnect agent instructions", () => {
     );
     expect(instructions).not.toContain("opencode");
   });
+});
+
+test("Pi recovery uses the snapshot helper and preserves shared skills and missing originals", async () => {
+  const response = GET(
+    new Request("http://localhost:3000/disconnect.md?client=pi"),
+  );
+  const text = await response.text();
+  expect(text).toContain("arcpi --disconnect");
+  expect(text).not.toContain("-startup-guard");
+  expect(text).not.toContain("Delete the");
+  expect(text).toContain("install-state.json");
+  expect(text).toContain("Do not infer original settings");
+  expect(text).toContain(
+    "Do not revoke shared keys or remove shared marketplace files",
+  );
 });

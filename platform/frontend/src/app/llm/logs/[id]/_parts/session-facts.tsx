@@ -9,6 +9,7 @@ import {
   formatCompactNumber,
   formatUsageCost,
   type LogSession,
+  passThroughProvider,
   shortModelName,
   sourceLabel,
   uniqueSources,
@@ -293,7 +294,10 @@ export function SessionFacts({
         className="col-span-2 lg:flex-[2_1_240px]"
       >
         {modelEntries.length === 0 ? (
-          <FactValue muted>—</FactValue>
+          <ModelLessFact
+            provider={passThroughProvider(fallbackType)}
+            providerLabel={providerLabel}
+          />
         ) : (
           <ModelsFact models={modelEntries} />
         )}
@@ -305,6 +309,23 @@ export function SessionFacts({
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+/** A session whose requests named no model; a pass-through one says where it went. */
+function ModelLessFact({
+  provider,
+  providerLabel,
+}: {
+  provider: SupportedProvider | null;
+  providerLabel: (provider: SupportedProvider) => string;
+}) {
+  if (!provider) return <FactValue muted>—</FactValue>;
+  return (
+    <>
+      <FactValue muted>No model</FactValue>
+      <FactSub>{providerLabel(provider)} · pass-through</FactSub>
+    </>
+  );
+}
 
 type ModelEntry = {
   id: string;
@@ -385,9 +406,10 @@ function ModelsFact({ models }: { models: ModelEntry[] }) {
                 size={18}
                 ring={false}
               />
-              {/* Phones: name and maker on one line; wide: stacked. */}
+              {/* Phones: name and maker on one line; wide: stacked. Wide
+                  names truncate, or a long one runs into its neighbour. */}
               <span className="flex min-w-0 items-baseline gap-1.5 lg:block">
-                <span className="block text-sm leading-5 font-medium whitespace-nowrap">
+                <span className="block truncate text-sm leading-5 font-medium max-lg:shrink-0">
                   {model.name}
                 </span>
                 <span className="block truncate text-xs leading-4 text-muted-foreground">
@@ -520,7 +542,7 @@ function TrajectoryRow({ t }: { t: Trajectory }) {
       {t.boundBy ? (
         <TrajectoryPair
           label="Grouped by"
-          hint="How these requests were tied into one session: the session id the client sent, and where it was found."
+          hint="Where the session id that ties these requests together came from: the header or client field it was read from."
         >
           <span className="truncate">{groupingLabel(t.boundBy)}</span>
         </TrajectoryPair>
@@ -528,7 +550,7 @@ function TrajectoryRow({ t }: { t: Trajectory }) {
       {t.origins.length > 0 ? (
         <TrajectoryPair
           label={t.origins.length === 1 ? "Source" : "Sources"}
-          hint="Every surface that sent requests into this session. Hover an icon for its name."
+          hint="The apps and features that sent requests into this session, such as a client, chat, or a knowledge base. Hover an icon for its name."
           className="col-span-2"
         >
           <span className="flex min-w-0 gap-1 overflow-x-auto">
@@ -689,13 +711,15 @@ function groupingLabel(sessionSource: string): string {
 }
 
 const GROUPING_LABELS: Record<string, string> = {
-  header: "Session header",
-  meta_header: "Meta header",
-  appa_header: "Guardrails header",
+  // Name the header itself: "Session header" left people asking which one.
+  header: "X-Archestra-Session-Id header",
+  meta_header: "X-Archestra-Meta header",
+  appa_header: "X-Appa-Session-ID header",
   openwebui_chat: "Open WebUI chat",
   codex_session: "Codex session",
   opencode_session: "OpenCode session",
   kilo_session: "Kilo session",
+  kimi_code_session: "Kimi Code session",
   claude_metadata: "Claude session",
   claude_code_header: "Claude Code session",
   claude_code: "Claude session",

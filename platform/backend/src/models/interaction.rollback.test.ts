@@ -272,6 +272,63 @@ describe("InteractionModel", () => {
     });
   });
 
+  describe("record", () => {
+    test("stores the same row create would, for users and non-users", async ({
+      makeUser,
+    }) => {
+      const user = await makeUser();
+      const request = {
+        model: "gpt-4",
+        messages: [{ role: "user" as const, content: "Hello \u0000 there" }],
+      };
+      const ids = [crypto.randomUUID(), crypto.randomUUID()];
+      await InteractionModel.record({
+        id: ids[0],
+        profileId,
+        userId: user.id,
+        request,
+        response: {
+          id: "r",
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4",
+          choices: [],
+        },
+        type: "openai:chatCompletions",
+        model: "gpt-4",
+        inputTokens: 3,
+        outputTokens: 5,
+      });
+      await InteractionModel.record({
+        id: ids[1],
+        profileId,
+        request,
+        response: {
+          id: "r",
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4",
+          choices: [],
+        },
+        type: "openai:chatCompletions",
+      });
+
+      const [withUser, withoutUser] = await Promise.all(
+        ids.map((id) => InteractionModel.findById(id)),
+      );
+      expect(withUser).toMatchObject({
+        userId: user.id,
+        profileId,
+        inputTokens: 3,
+        outputTokens: 5,
+        request: { messages: [{ content: "Hello  there" }] },
+      });
+      expect(withoutUser).toMatchObject({ userId: null, profileId });
+      // Sanitizing copies only what it changes; the caller's payload is intact.
+      expect(request.messages[0].content).toBe("Hello \u0000 there");
+    });
+  });
+
   describe("create - null byte sanitization", () => {
     test("strips null bytes from JSONB fields to avoid PostgreSQL rejection", async () => {
       // PostgreSQL JSONB rejects \u0000 (null byte) Unicode escape sequences.
@@ -1851,6 +1908,52 @@ describe("InteractionModel", () => {
       expect(Number(session?.totalCost)).toBeCloseTo(7, 5);
       expect(Number(session?.totalBilledCost)).toBeCloseTo(2, 5);
       expect(Number(session?.totalSubscriptionCost)).toBeCloseTo(5, 5);
+    });
+  });
+
+  describe("getSessions model pool attempts", () => {
+    test("counts the attempts a pool failed over", async ({
+      makeAdmin,
+      makeAgent,
+    }) => {
+      const admin = await makeAdmin();
+      const agent = await makeAgent({ name: "Agent" });
+      const base = {
+        profileId: agent.id,
+        sessionId: "failed-over-session",
+        request: { model: "gpt-4", messages: [] },
+        response: {
+          id: "r",
+          object: "chat.completion" as const,
+          created: Date.now(),
+          model: "gpt-4",
+          choices: [],
+        },
+        type: "openai:chatCompletions" as const,
+      };
+      await InteractionModel.create({
+        ...base,
+        attempt: 1,
+        attemptOutcome: "failed_over",
+        failureReason: "429",
+      });
+      await InteractionModel.create({
+        ...base,
+        attempt: 2,
+        attemptOutcome: "answered",
+      });
+      await InteractionModel.create(base);
+
+      const sessions = await InteractionModel.getSessionsCursor(
+        { limit: 100 },
+        admin.id,
+        true,
+      );
+      const session = sessions.data.find(
+        (s) => s.sessionId === "failed-over-session",
+      );
+      expect(session?.requestCount).toBe(3);
+      expect(session?.failedOverCount).toBe(1);
     });
   });
 
@@ -4253,14 +4356,19 @@ describe("InteractionModel", () => {
       makeMember,
       makeAdmin,
       makeTeam,
+      makeTeamMember,
     }) => {
       const org = await makeOrganization();
       const admin = await makeAdmin();
       await makeMember(admin.id, org.id, { role: "admin" });
       const team = await makeTeam(org.id, admin.id);
-      const agent = await makeAgent({ access: { teams: [team.id] } });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
       // Team limits follow the agent's team assignment, not its grants.
       await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+      await makeTeamMember(team.id, admin.id);
 
       const agentLimit = await LimitModel.create({
         entityType: "agent",
@@ -4288,6 +4396,7 @@ describe("InteractionModel", () => {
 
       await InteractionModel.create({
         profileId: agent.id,
+        userId: admin.id,
         model: "gpt-4o",
         inputTokens: 80,
         outputTokens: 160,
@@ -4333,15 +4442,20 @@ describe("InteractionModel", () => {
       makeMember,
       makeAdmin,
       makeTeam,
+      makeTeamMember,
     }) => {
       const org = await makeOrganization();
       const admin = await makeAdmin();
       await makeMember(admin.id, org.id, { role: "admin" });
       const team = await makeTeam(org.id, admin.id);
-      const agent = await makeAgent({ access: { teams: [team.id] } });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        access: { teams: [team.id] },
+      });
 
       // Also assign via agent_team table (like production)
       await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+      await makeTeamMember(team.id, admin.id);
 
       const teamLimit = await LimitModel.create({
         entityType: "team",
@@ -4353,6 +4467,7 @@ describe("InteractionModel", () => {
 
       await InteractionModel.create({
         profileId: agent.id,
+        userId: admin.id,
         model: "gpt-4o",
         inputTokens: 80,
         outputTokens: 160,
@@ -4384,6 +4499,7 @@ describe("InteractionModel", () => {
       makeMember,
       makeAdmin,
       makeTeam,
+      makeTeamMember,
     }) => {
       const org = await makeOrganization();
       const admin = await makeAdmin();
@@ -4391,11 +4507,14 @@ describe("InteractionModel", () => {
       const team1 = await makeTeam(org.id, admin.id);
       const team2 = await makeTeam(org.id, admin.id);
       const agent = await makeAgent({
+        organizationId: org.id,
         access: { teams: [team1.id, team2.id] },
       });
 
       // Assign to both teams
       await AgentTeamModel.assignTeamsToAgent(agent.id, [team1.id, team2.id]);
+      await makeTeamMember(team1.id, admin.id);
+      await makeTeamMember(team2.id, admin.id);
 
       // Create all-models limit for ONLY team1
       const team1Limit = await LimitModel.create({
@@ -4417,6 +4536,7 @@ describe("InteractionModel", () => {
 
       await InteractionModel.create({
         profileId: agent.id,
+        userId: admin.id,
         model: "gpt-4o",
         inputTokens: 100,
         outputTokens: 200,
@@ -4621,6 +4741,7 @@ describe("InteractionModel", () => {
       await makeMember(admin.id, org.id, { role: "admin" });
       const team = await makeTeam(org.id, admin.id);
       const agent = await makeAgent({
+        organizationId: org.id,
         access: { teams: [team.id] },
       });
 
@@ -4718,6 +4839,7 @@ describe("InteractionModel", () => {
         makeMember,
         makeAdmin,
         makeTeam,
+        makeTeamMember,
         makeUser,
         makeVirtualApiKey,
       }) => {
@@ -4733,6 +4855,8 @@ describe("InteractionModel", () => {
         });
         await AgentTeamModel.assignTeamsToAgent(agent.id, [team1.id, team2.id]);
         const user = await makeUser();
+        await makeTeamMember(team1.id, user.id);
+        await makeTeamMember(team2.id, user.id);
         const virtualKey = await makeVirtualApiKey(org.id);
         const passthroughKey = await makeVirtualApiKey(org.id);
         const environment = await EnvironmentModel.create({
@@ -5192,6 +5316,221 @@ describe("InteractionModel", () => {
 
       expect(requestTypeOf(sub.id)).toBe("subagent");
       expect(requestTypeOf(main.id)).toBe("main");
+    });
+
+    test("classifies Claude subagent turns carrying metadata.agent_id as subagent and links parallel Claude Desktop title generation to the main session", async ({
+      makeAdmin,
+      makeAgent,
+    }) => {
+      const admin = await makeAdmin();
+      const agent = await makeAgent({
+        name: "Claude Desktop Agent",
+      });
+      const mainSessionId = "desktop-main-session-123";
+      const openingPrompt =
+        "Read https://example.com/welcome.md and summarize capabilities.";
+
+      // 1. Parallel completeOneShot title generation arrives FIRST without a sessionId
+      //    (or with a separate 1-request fallback CLI sessionId) and includes a
+      //    thinking block before the <title>...</title> text block.
+      const titleGenBefore = await InteractionModel.create({
+        profileId: agent.id,
+        sessionId: "fallback-cli-title-session",
+        sessionSource: CLAUDE_METADATA_SESSION_SOURCE,
+        externalAgentId: CLAUDE_DESKTOP_CLIENT_ID,
+        type: "anthropic:messages",
+        request: {
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 200,
+          system: [
+            {
+              type: "text",
+              text: "You write short session titles. Reply with only the tagged fields the prompt asks for.",
+            },
+          ],
+          messages: [
+            {
+              role: "user",
+              content: `You are coming up with a succinct title for an agent chat session based on the initial task description. The user's task description is wrapped in <description> tags below.\n<description>${openingPrompt}</description>`,
+            },
+          ],
+        } as unknown as InsertInteraction["request"],
+        response: {
+          ...ANTHROPIC_RESPONSE,
+          content: [
+            {
+              type: "thinking",
+              thinking: "Let me pick a short title.",
+            },
+            {
+              type: "text",
+              text: "<title>Capabilities summary</title>",
+            },
+          ],
+        } as unknown as InsertInteraction["response"],
+      });
+
+      // 2. Main session Turn 1 arrives with the same openingPrompt.
+      const mainTurn = await InteractionModel.create({
+        profileId: agent.id,
+        sessionId: mainSessionId,
+        sessionSource: CLAUDE_METADATA_SESSION_SOURCE,
+        externalAgentId: CLAUDE_DESKTOP_CLIENT_ID,
+        type: "anthropic:messages",
+        request: {
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          system: [
+            {
+              type: "text",
+              text: "x-anthropic-billing-header: cc_version=2.1.109.786; cc_entrypoint=local-agent; cch=00000;",
+            },
+            {
+              type: "text",
+              text: "You are Claude, an AI assistant created by Anthropic.",
+            },
+          ],
+          tools: [{ name: "Agent", description: "spawn", input_schema: {} }],
+          messages: [{ role: "user", content: openingPrompt }],
+        } as unknown as InsertInteraction["request"],
+        response:
+          ANTHROPIC_RESPONSE as unknown as InsertInteraction["response"],
+      });
+
+      // 3. In-process Agent subagent turn shares mainSessionId and carries metadata.agent_id
+      //    plus multiple turns (tool_use + tool_result).
+      const subagentTurn = await InteractionModel.create({
+        profileId: agent.id,
+        sessionId: mainSessionId,
+        sessionSource: CLAUDE_METADATA_SESSION_SOURCE,
+        externalAgentId: CLAUDE_DESKTOP_CLIENT_ID,
+        type: "anthropic:messages",
+        request: {
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          metadata: {
+            agent_id: "subagent-uuid-1",
+          },
+          system: [
+            {
+              type: "text",
+              text: "x-anthropic-billing-header: cc_version=2.1.109.786; cc_entrypoint=local-agent; cch=00000;",
+            },
+          ],
+          tools: [{ name: "Read", description: "read", input_schema: {} }],
+          messages: [
+            { role: "user", content: "Inspect repository files" },
+            { role: "assistant", content: "Reading..." },
+            { role: "user", content: "Done reading" },
+          ],
+        } as unknown as InsertInteraction["request"],
+        response:
+          ANTHROPIC_RESPONSE as unknown as InsertInteraction["response"],
+      });
+
+      // 4. Built-in Claude Code security monitor sidecar turn shares mainSessionId
+      const securityMonitorTurn = await InteractionModel.create({
+        profileId: agent.id,
+        sessionId: mainSessionId,
+        sessionSource: CLAUDE_METADATA_SESSION_SOURCE,
+        externalAgentId: CLAUDE_DESKTOP_CLIENT_ID,
+        type: "anthropic:messages",
+        request: {
+          model: "claude-sonnet-5",
+          max_tokens: 1024,
+          system: [
+            {
+              type: "text",
+              text: "x-anthropic-billing-header: cc_version=2.1.308.96b; cc_entrypoint=claude-desktop-3p;",
+            },
+            {
+              type: "text",
+              text: "You are a security monitor for autonomous AI coding agents.",
+            },
+          ],
+          messages: [{ role: "user", content: "<transcript>\n..." }],
+        } as unknown as InsertInteraction["request"],
+        response:
+          ANTHROPIC_RESPONSE as unknown as InsertInteraction["response"],
+      });
+
+      // 5. Forked session carrying prior assistant turns must NOT steal mainSessionId's title row
+      const forkSessionId = "88888888-9999-4aaa-8bbb-cccccccccccc";
+      await InteractionModel.create({
+        profileId: agent.id,
+        sessionId: forkSessionId,
+        sessionSource: CLAUDE_METADATA_SESSION_SOURCE,
+        externalAgentId: CLAUDE_DESKTOP_CLIENT_ID,
+        type: "anthropic:messages",
+        request: {
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1024,
+          system: [
+            {
+              type: "text",
+              text: "x-anthropic-billing-header: cc_version=2.1.308.369; cc_entrypoint=claude-desktop-3p;",
+            },
+          ],
+          messages: [
+            { role: "user", content: openingPrompt },
+            { role: "assistant", content: "Prior parent response" },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n</system-reminder>\n",
+                },
+                {
+                  type: "text",
+                  text: "This is a forked branch. Run echo hello",
+                },
+              ],
+            },
+          ],
+        } as unknown as InsertInteraction["request"],
+        response:
+          ANTHROPIC_RESPONSE as unknown as InsertInteraction["response"],
+      });
+
+      const paginated = await InteractionModel.findAllPaginated(
+        { limit: 100, offset: 0 },
+        undefined,
+        admin.id,
+        true,
+        { sessionId: mainSessionId },
+      );
+
+      const byId = new Map(
+        paginated.data.map((row) => [
+          row.id,
+          row as { sessionId?: string | null; requestType?: string },
+        ]),
+      );
+      expect(byId.get(titleGenBefore.id)?.sessionId).toBe(mainSessionId);
+      expect(byId.get(titleGenBefore.id)?.requestType).toBe("subagent");
+      expect(byId.get(mainTurn.id)?.requestType).toBe("main");
+      expect(byId.get(subagentTurn.id)?.requestType).toBe("subagent");
+      expect(byId.get(securityMonitorTurn.id)?.requestType).toBe("subagent");
+
+      const sessions = await InteractionModel.getSessions(
+        { limit: 100, offset: 0 },
+        admin.id,
+        true,
+        { profileId: agent.id },
+      );
+      expect(sessions.data).toHaveLength(2);
+      const bySessionId = new Map(sessions.data.map((s) => [s.sessionId, s]));
+      expect(bySessionId.get(mainSessionId)?.claudeCodeTitle).toBe(
+        "Capabilities summary",
+      );
+      expect(bySessionId.get(mainSessionId)?.lastUserMessagePreview).toBe(
+        openingPrompt,
+      );
+      expect(bySessionId.get(forkSessionId)?.claudeCodeTitle).toBeNull();
+      expect(bySessionId.get(forkSessionId)?.lastUserMessagePreview).toBe(
+        "This is a forked branch. Run echo hello",
+      );
     });
 
     test("getSessions derives the preview from the fully reconstructed chain, even when ancestors are outside the 20-row window", async ({

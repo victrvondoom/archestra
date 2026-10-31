@@ -52,6 +52,7 @@ import {
   upsertCatalogClientSecretValue,
 } from "@/services/mcp-catalog-secrets";
 import { assertInstallAllowedOrBlock } from "@/services/mcp-install-policy";
+import { recordInstallToolDescriptions } from "@/services/mcp-install-tool-descriptions";
 import { reloadToolsForServer } from "@/services/mcp-reinstall";
 import { ResourcePermissions } from "@/services/resource-permissions";
 import { refreshMcpSkillMetadata } from "@/skills/mcp-external";
@@ -238,7 +239,9 @@ const McpConfigToolSchema = z
     transportType: z
       .enum(["stdio", "streamable-http"])
       .optional()
-      .describe("[Local] Transport type."),
+      .describe(
+        "[Local] Transport type. Omit it for remote servers: streamable-http is ignored and stdio is rejected.",
+      ),
     httpPort: z
       .number()
       .optional()
@@ -786,10 +789,15 @@ async function handleGetMcpServerTools(
     ) {
       return errorResult("You do not have permission to view this MCP server.");
     }
+    const reader = {
+      kind: "caller",
+      userId: context.userId,
+      organizationId,
+    } as const;
     const tools =
       args.view === "picker"
-        ? await ToolModel.findPickerToolsByCatalogId(args.mcpServerId)
-        : await ToolModel.findByCatalogId(args.mcpServerId);
+        ? await ToolModel.findPickerToolsByCatalogId(args.mcpServerId, reader)
+        : await ToolModel.findByCatalogId(args.mcpServerId, reader);
     return structuredSuccessResult({ tools }, JSON.stringify(tools, null, 2));
   } catch (error) {
     return catchError(error, "getting MCP server tools");
@@ -1008,6 +1016,13 @@ async function handleEditMcpConfig(
     if (args.oauthConfig !== undefined)
       updateData.oauthConfig = args.oauthConfig;
 
+    const effectiveServerType = args.serverType ?? existing.serverType;
+    const transportTypeError = nonLocalTransportTypeError({
+      serverType: effectiveServerType,
+      transportType: args.transportType,
+    });
+    if (transportTypeError) return errorResult(transportTypeError);
+
     const localConfigUpdates: Record<string, unknown> = {};
     const localFields = [
       "command",
@@ -1024,6 +1039,8 @@ async function handleEditMcpConfig(
       "imagePullPolicy",
     ] as const;
     for (const field of localFields) {
+      if (field === "transportType" && effectiveServerType !== "local")
+        continue;
       if (args[field] !== undefined) {
         localConfigUpdates[field] = args[field];
       }
@@ -1183,6 +1200,12 @@ async function handleCreateMcpServer(
       return errorResult("serverType must be one of: local, remote, builtin.");
     }
 
+    const transportTypeError = nonLocalTransportTypeError({
+      serverType,
+      transportType: args.transportType,
+    });
+    if (transportTypeError) return errorResult(transportTypeError);
+
     const labels = args.labels ? deduplicateLabels(args.labels) : undefined;
 
     const localConfigFields = [
@@ -1201,6 +1224,7 @@ async function handleCreateMcpServer(
     ] as const;
     const localConfig: Record<string, unknown> = {};
     for (const field of localConfigFields) {
+      if (field === "transportType" && serverType !== "local") continue;
       if (args[field] !== undefined) {
         localConfig[field] = args[field];
       }
@@ -1772,6 +1796,11 @@ async function discoverLocalMcpServerTools(params: {
     if (toolsToCreate.length > 0) {
       const createdTools =
         await ToolModel.bulkCreateToolsIfNotExists(toolsToCreate);
+      await recordInstallToolDescriptions({
+        mcpServerId: mcpServer.id,
+        syncedTools: createdTools,
+        reported: toolsToCreate,
+      });
       await assignDiscoveredToolsToAgents({
         agentIds: args.agentIds ?? [],
         toolIds: createdTools.map((tool) => tool.id),
@@ -1836,6 +1865,11 @@ async function discoverRemoteMcpServerTools(params: {
       }));
       const createdTools =
         await ToolModel.bulkCreateToolsIfNotExists(toolsToCreate);
+      await recordInstallToolDescriptions({
+        mcpServerId: mcpServer.id,
+        syncedTools: createdTools,
+        reported: toolsToCreate,
+      });
       await assignDiscoveredToolsToAgents({
         agentIds: args.agentIds ?? [],
         toolIds: createdTools.map((tool) => tool.id),
@@ -2049,4 +2083,21 @@ async function moveCatalogSecretsToBag(params: {
       updateData.clientSecretId = id;
     }
   }
+}
+
+/**
+ * `transportType` describes how a local server's pod speaks MCP, so it only
+ * belongs in a local config. A non-local entry has no pod: "streamable-http"
+ * matches how remote servers are reached and is dropped instead of turning the
+ * entry into an incomplete local config, while "stdio" cannot apply and is
+ * rejected.
+ */
+function nonLocalTransportTypeError(params: {
+  serverType: string;
+  transportType: string | undefined;
+}): string | null {
+  if (params.serverType === "local" || params.transportType !== "stdio") {
+    return null;
+  }
+  return `transportType "stdio" only applies to local MCP servers. Omit transportType for ${params.serverType} servers.`;
 }

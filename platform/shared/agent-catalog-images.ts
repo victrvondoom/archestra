@@ -5,8 +5,7 @@ import { DEFAULT_CLAUDE_CODE_MODEL } from "./model-constants";
 export type AgentCatalogId = keyof typeof AGENT_CATALOG_IMAGE_NAMES;
 
 /** Public registry the maintained catalog images are published to. */
-export const AGENT_CATALOG_IMAGE_REGISTRY =
-  "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public";
+export const AGENT_CATALOG_IMAGE_REGISTRY = "ghcr.io/archestra-ai";
 
 /**
  * The catalog tag that matches a platform version. The approved stable
@@ -57,7 +56,9 @@ export function followAgentCatalogImage(params: {
     const current = params.catalogImages[id];
     if (
       repository === imageRepository(current) ||
-      repository === `${AGENT_CATALOG_IMAGE_REGISTRY}/${name}`
+      repository === `${AGENT_CATALOG_IMAGE_REGISTRY}/${name}` ||
+      repository ===
+        `europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/${name}`
     ) {
       return current;
     }
@@ -72,6 +73,9 @@ export const AGENT_CATALOG_NAMES: Record<AgentCatalogId, string> = {
   opencode: "OpenCode",
   hermes: "Hermes",
   openclaw: "OpenClaw",
+  grok: "Grok Build",
+  kimi: "Kimi Code",
+  copilot: "GitHub Copilot CLI",
 };
 
 /** Every maintained CLI template, in catalog order. */
@@ -96,7 +100,6 @@ export function buildAgentCatalogRuntime(params: {
     backend: "kubernetes" as const,
     steerMode: "tmux_keys" as const,
     privileged: false,
-    resources: null,
     environment: null,
     credentials: [],
     ...(params.id === "claude-code" && {
@@ -120,7 +123,6 @@ export function buildCustomAgentRuntime(params: { image: string }) {
     backend: "kubernetes" as const,
     steerMode: "pipe" as const,
     privileged: false,
-    resources: null,
     environment: null,
     credentials: null,
     ttlHours: null,
@@ -169,6 +171,9 @@ const CATALOG_RUNTIME_PROFILES: Record<
   opencode: { inferenceProtocol: "openai_responses" },
   hermes: { inferenceProtocol: "openai_chat" },
   openclaw: { inferenceProtocol: "openai_chat" },
+  grok: { inferenceProtocol: "openai_chat" },
+  kimi: { inferenceProtocol: "openai_chat" },
+  copilot: { inferenceProtocol: "openai_chat" },
 };
 
 /** An image reference without its tag. A registry port is not a tag. */

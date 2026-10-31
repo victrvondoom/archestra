@@ -1,4 +1,5 @@
 import type {
+  AgentRuntimeTierSettings,
   ContextualRetrievalMode,
   KnowledgeConnectorOverrides,
   MessagingChannelOverrides,
@@ -21,10 +22,10 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import type {
+  BudgetCleanupInterval,
   ConnectionBaseUrl,
   ConnectionClientFutureProviders,
   ConnectionClientProviderKeys,
-  LimitCleanupInterval,
   NetworkPolicy,
   OnboardingWizard,
   OrganizationChatLink,
@@ -60,6 +61,12 @@ const organizationsTable = pgTable("organization", {
   onlineMcpCatalogEnabled: boolean("online_mcp_catalog_enabled")
     .notNull()
     .default(true),
+  /** Initial tool mode for automatically provisioned personal agents and gateways. */
+  defaultPersonalAgentAccessAllTools: boolean(
+    "default_personal_agent_access_all_tools",
+  )
+    .notNull()
+    .default(true),
   onlineSkillCatalogEnabled: boolean("online_skill_catalog_enabled")
     .notNull()
     .default(true),
@@ -73,10 +80,14 @@ const organizationsTable = pgTable("organization", {
   skillMarketplaceAnonymousAccess: boolean("skill_marketplace_anonymous_access")
     .notNull()
     .default(false),
+  /** Controls only the managed built-in browser MCP runtime. */
+  playwrightMcpEnabled: boolean("playwright_mcp_enabled")
+    .notNull()
+    .default(true),
+
   /**
-   * Whether file uploads are allowed in chat.
-   * Defaults to true. Security policies currently only work on text-based content,
-   * so admins may want to disable this until file-based policy support is added.
+   * Whether users can attach files in chat. Enabled by default.
+   * Uploaded files or extracted content may be sent to the chat's AI provider.
    */
   allowChatFileUploads: boolean("allow_chat_file_uploads")
     .notNull()
@@ -93,6 +104,14 @@ const organizationsTable = pgTable("organization", {
   )
     .notNull()
     .default(false),
+
+  /**
+   * Whether LLM proxy and MCP gateway logs keep the images, audio, video and
+   * files that requests, responses and tool calls carry, so Logs can show and
+   * play them. Off, the default, each row keeps the media's place and type
+   * but not its bytes.
+   */
+  keepMediaInLogs: boolean("keep_media_in_logs").notNull().default(false),
 
   /**
    * @deprecated No longer consulted. Dynamic tool access is now gated solely
@@ -183,6 +202,20 @@ const organizationsTable = pgTable("organization", {
    */
   defaultLlmApiKeyId: uuid("default_llm_api_key_id"),
 
+  /**
+   * Optional `fast` / `smart` tiers of the default trio, on any provider.
+   * With `defaultModelId` as the normal tier, the trio is what forked
+   * subagents pick tiers from and what auto routing routes across.
+   */
+  defaultFastModelId: uuid("default_fast_model_id").references(
+    () => modelsTable.id,
+    { onDelete: "set null" },
+  ),
+  defaultSmartModelId: uuid("default_smart_model_id").references(
+    () => modelsTable.id,
+    { onDelete: "set null" },
+  ),
+
   /** Default token-cost limit value applied to every organization member. */
   defaultUserLimitValue: integer("default_user_limit_value"),
 
@@ -194,7 +227,7 @@ const organizationsTable = pgTable("organization", {
   /** Cleanup interval used by default user limits. Null falls back to weekly. */
   defaultUserLimitCleanupInterval: varchar(
     "default_user_limit_cleanup_interval",
-  ).$type<LimitCleanupInterval>(),
+  ).$type<BudgetCleanupInterval>(),
 
   /**
    * Default role assigned to newly provisioned members who don't get an
@@ -441,6 +474,15 @@ const organizationsTable = pgTable("organization", {
    * environment. NULL falls back to built-in unrestricted behavior.
    */
   defaultNetworkPolicy: jsonb("default_network_policy").$type<NetworkPolicy>(),
+
+  /**
+   * Administrator overrides of the Agent Runtime tiers' CPU, memory and warm
+   * spares, per tier and per field. NULL or an omitted field keeps the code
+   * default (`DEFAULT_AGENT_RUNTIME_TIERS` in @archestra/shared).
+   */
+  agentRuntimeTiers: jsonb(
+    "agent_runtime_tiers",
+  ).$type<AgentRuntimeTierSettings>(),
 
   /**
    * ALLOWLIST regex (JS source, no delimiters/flags) for the implicit "default"

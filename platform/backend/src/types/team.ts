@@ -79,6 +79,7 @@ export const UpdateTeamMemberBodySchema = z.object({
 // Team External Group schemas for SSO team sync
 export const SelectTeamExternalGroupSchema = createSelectSchema(
   schema.teamExternalGroupsTable,
+  { role: TeamMemberRoleSchema },
 );
 export const InsertTeamExternalGroupSchema = createInsertSchema(
   schema.teamExternalGroupsTable,
@@ -86,6 +87,16 @@ export const InsertTeamExternalGroupSchema = createInsertSchema(
 
 export const AddTeamExternalGroupBodySchema = z.object({
   groupIdentifier: z.string().min(1, "Group identifier is required"),
+  identityProviderId: z
+    .string()
+    .min(1)
+    .nullish()
+    .describe(
+      "Match the group only for sign-ins through this identity provider. Omit to match it from any provider.",
+    ),
+  role: TeamMemberRoleSchema.default("member").describe(
+    "The team role members of this group receive.",
+  ),
 });
 
 export type Team = z.infer<typeof SelectTeamSchema>;
@@ -104,26 +115,4 @@ export type InsertTeamExternalGroup = z.infer<
 >;
 export type AddTeamExternalGroupBody = z.infer<
   typeof AddTeamExternalGroupBodySchema
->;
-
-// Team Vault Folder schemas for BYOS (Bring Your Own Secrets) feature
-export const SelectTeamVaultFolderSchema = createSelectSchema(
-  schema.teamVaultFoldersTable,
-);
-export const InsertTeamVaultFolderSchema = createInsertSchema(
-  schema.teamVaultFoldersTable,
-);
-export const UpdateTeamVaultFolderSchema = createUpdateSchema(
-  schema.teamVaultFoldersTable,
-);
-
-export const SetTeamVaultFolderBodySchema = z.object({
-  vaultPath: z.string().min(1, "Vault path is required"),
-});
-
-export type TeamVaultFolder = z.infer<typeof SelectTeamVaultFolderSchema>;
-export type InsertTeamVaultFolder = z.infer<typeof InsertTeamVaultFolderSchema>;
-export type UpdateTeamVaultFolder = z.infer<typeof UpdateTeamVaultFolderSchema>;
-export type SetTeamVaultFolderBody = z.infer<
-  typeof SetTeamVaultFolderBodySchema
 >;

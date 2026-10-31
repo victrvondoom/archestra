@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   // SPDX-SnippetBegin
   // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
@@ -443,6 +445,66 @@ describe("McpClient", () => {
     expect(mockConnect).toHaveBeenCalledTimes(2);
   });
 
+  test("disabled browser policy rejects assigned tools, discovery, and direct inspection before opening a connection", async ({
+    makeOrganization,
+    makeUser,
+  }) => {
+    const organization = await makeOrganization();
+    const user = await makeUser();
+    const catalog = await InternalMcpCatalogModel.create({
+      id: PLAYWRIGHT_MCP_CATALOG_ID,
+      name: "playwright",
+      serverType: "remote",
+      serverUrl: "https://browser.example/mcp",
+    });
+    await PlaywrightRuntimeModel.reconcileAll();
+    const server = mustExist(
+      await PlaywrightRuntimeModel.findForEnvironment(null),
+    );
+    const tool = await ToolModel.createToolIfNotExists({
+      name: "playwright__browser_navigate",
+      description: "Navigate",
+      parameters: {},
+      catalogId: catalog.id,
+    });
+    await AgentToolModel.create(agentId, tool.id, { mcpServerId: server.id });
+    await OrganizationModel.patch(organization.id, {
+      playwrightMcpEnabled: false,
+    });
+    mockConnect.mockClear();
+    mockCallTool.mockClear();
+    const result = await mcpClient.executeToolCallForOwner(
+      { id: "disabled-call", name: tool.name, arguments: {} },
+      agentOwner(agentId),
+      {
+        tokenId: "browser-test-token",
+        userId: user.id,
+        teamId: null,
+        isOrganizationToken: false,
+      },
+    );
+    expect(result.isError).toBe(true);
+    await expect(
+      mcpClient.connectAndGetTools({
+        catalogItem: catalog,
+        mcpServerId: server.id,
+        secrets: {},
+      }),
+    ).rejects.toThrow("disabled");
+    await expect(
+      mcpClient.inspectServer({
+        caller: { kind: "caller" },
+        catalogItem: catalog,
+        mcpServerId: server.id,
+        secrets: {},
+        method: "tools/call",
+        toolName: "browser_navigate",
+      }),
+    ).rejects.toThrow("disabled");
+    expect(mockConnect).not.toHaveBeenCalled();
+    expect(mockCallTool).not.toHaveBeenCalled();
+  });
+
   test("isolates a shared Playwright connection per caller and reuses it for that caller", async ({
     makeUser,
     makeApp,
@@ -867,6 +929,7 @@ describe("McpClient", () => {
     mockClose.mockResolvedValueOnce(undefined);
 
     await mcpClient.inspectServer({
+      caller: { kind: "caller" },
       catalogItem: {
         ...catalogItem,
         serverType: "remote",
@@ -919,6 +982,7 @@ describe("McpClient", () => {
       .mockResolvedValueOnce({ tools: [{ name: "list_repos" }] });
 
     const result = await mcpClient.inspectServer({
+      caller: { kind: "caller" },
       catalogItem: {
         ...catalogItem,
         serverType: "remote",
@@ -942,6 +1006,7 @@ describe("McpClient", () => {
 
     await expect(
       mcpClient.inspectServer({
+        caller: { kind: "caller" },
         catalogItem: {
           ...catalogItem,
           serverType: "remote",
@@ -2732,6 +2797,7 @@ describe("McpClient", () => {
         });
 
         await mcpClient.callToolForServer({
+          caller: { kind: "caller" },
           mcpServerId: localMcpServerId,
           name: "test_tool",
         });
@@ -5435,7 +5501,12 @@ describe("McpClient", () => {
           },
         );
 
-        expect(refreshSpy).toHaveBeenCalledWith(secret.id, oauthCatalog.id);
+        expect(refreshSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            secretId: secret.id,
+            catalogId: oauthCatalog.id,
+          }),
+        );
         expect(mockCallTool).toHaveBeenCalledTimes(2);
         expect(result).toMatchObject({
           isError: false,
@@ -6133,7 +6204,12 @@ describe("McpClient", () => {
           },
         );
 
-        expect(refreshSpy).toHaveBeenCalledWith(secret.id, oauthCatalog.id);
+        expect(refreshSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            secretId: secret.id,
+            catalogId: oauthCatalog.id,
+          }),
+        );
         expect(mockCallTool).toHaveBeenCalledTimes(1);
         expect(result).toMatchObject({
           isError: false,
@@ -6225,7 +6301,12 @@ describe("McpClient", () => {
           },
         );
 
-        expect(refreshSpy).toHaveBeenCalledWith(secret.id, oauthCatalog.id);
+        expect(refreshSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            secretId: secret.id,
+            catalogId: oauthCatalog.id,
+          }),
+        );
         expect(mockCallTool).toHaveBeenCalledTimes(1);
         expect(result).toMatchObject({
           isError: false,
@@ -8916,6 +8997,143 @@ describe("McpClient", () => {
     });
 
     describe("oauth client credentials", () => {
+      test.for([
+        "allow",
+        "redirect",
+        "denied-token",
+        "denied-base",
+      ])("enforced client credentials %s runs through the outbound guard before MCP transport", async (mode, {
+        makeOrganization,
+        makeInternalMcpCatalog,
+        makeMcpServer,
+      }) => {
+        const originalEnforcement = config.mcpOAuth.enforceOutboundValidation;
+        const originalProduction = config.production;
+        const originalE2e = config.test.enableE2eTestEndpoints;
+        config.mcpOAuth.enforceOutboundValidation = true;
+        config.production = false;
+        config.test.enableE2eTestEndpoints = false;
+        let tokenPosts = 0;
+        let canary = 0;
+        let received = "";
+        const server = createServer(async (req, res) => {
+          if (req.url === "/canary") {
+            canary++;
+            res.end("bad");
+            return;
+          }
+          tokenPosts++;
+          for await (const chunk of req) received += chunk;
+          if (mode === "redirect") {
+            res.writeHead(307, { location: "/canary" }).end();
+            return;
+          }
+          res.end(
+            JSON.stringify({
+              access_token: createJwt({ exp: futureExpSeconds() }),
+              expires_in: 3600,
+            }),
+          );
+        });
+        await new Promise<void>((resolve) =>
+          server.listen(0, "127.0.0.1", resolve),
+        );
+        try {
+          const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+          const org = await makeOrganization();
+          const environment = await EnvironmentModel.create({
+            organizationId: org.id,
+            name: "oauth-test",
+            networkPolicy: {
+              egressMode: "restricted",
+              domainPreset: "none",
+              allowedDomains: ["api.example.com"],
+              allowedCidrs: ["127.0.0.0/8"],
+            },
+          });
+          const catalog = await makeInternalMcpCatalog({
+            organizationId: org.id,
+            environmentId: environment.id,
+            serverType: "remote",
+            serverUrl:
+              mode === "denied-base"
+                ? "https://denied.example/mcp"
+                : "https://api.example.com/mcp",
+            oauthConfig: {
+              name: "Synthetic",
+              server_url: base,
+              grant_type: "client_credentials",
+              client_id: "synthetic-client",
+              client_secret: "synthetic-secret",
+              redirect_uris: [],
+              scopes: [],
+              default_scopes: [],
+              supports_resource_metadata: false,
+              token_endpoint:
+                mode === "denied-token"
+                  ? "https://denied.example/token"
+                  : `${base}/token`,
+            },
+          });
+          // Keep agent and catalog in the same environment so this reaches OAuth.
+          await AgentModel.update(agentId, { environmentId: environment.id });
+          const secret = await secretManager().createSecret(
+            {
+              client_id: "synthetic-client",
+              client_secret: "synthetic-secret",
+            },
+            "synthetic-client-credentials",
+          );
+          const install = await makeMcpServer({
+            catalogId: catalog.id,
+            secretId: secret.id,
+            serverType: "remote",
+          });
+          const tool = await ToolModel.createToolIfNotExists({
+            name: "synthetic_oauth__read",
+            description: "Read",
+            parameters: {},
+            catalogId: catalog.id,
+          });
+          await AgentToolModel.create(agentId, tool.id, {
+            mcpServerId: install.id,
+          });
+          mockCallTool.mockResolvedValue({
+            content: [{ type: "text", text: "ok" }],
+            isError: false,
+          });
+          const result = await mcpClient.executeToolCallForOwner(
+            {
+              id: "oauth-enforced",
+              name: "synthetic_oauth__read",
+              arguments: {},
+            },
+            agentOwner(agentId),
+          );
+          expect(result.isError, result.error).toBe(mode !== "allow");
+          expect(canary).toBe(0);
+          expect(tokenPosts).toBe(mode.startsWith("denied") ? 0 : 1);
+          const stored = (await secretManager().getSecret(secret.id))?.secret;
+          expect(stored?.client_secret).toBe("synthetic-secret");
+          if (mode === "allow") {
+            expect(stored?.access_token).toBeTruthy();
+            expect(new URLSearchParams(received).get("grant_type")).toBe(
+              "client_credentials",
+            );
+          } else {
+            expect(result.error).toContain(
+              "MCP OAuth outbound request refused",
+            );
+            expect(stored?.access_token).toBeUndefined();
+          }
+        } finally {
+          config.mcpOAuth.enforceOutboundValidation = originalEnforcement;
+          config.production = originalProduction;
+          config.test.enableE2eTestEndpoints = originalE2e;
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      });
       test("exchanges stored client credentials for a bearer token on remote MCP calls", async ({
         makeUser,
       }) => {
@@ -10358,6 +10576,7 @@ describe("readResource (assignment + all-tools dynamic access, end to end)", () 
       try {
         await expect(
           mcpClient.readResourceForServer({
+            caller: { kind: "caller" },
             mcpServerId: randomUUID(),
             uri: RESOURCE_URI,
           }),
@@ -10388,6 +10607,7 @@ describe("readResource (assignment + all-tools dynamic access, end to end)", () 
 
       try {
         const read = mcpClient.readResourceForServer({
+          caller: { kind: "caller" },
           mcpServerId: randomUUID(),
           uri: RESOURCE_URI,
         });

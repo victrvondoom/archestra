@@ -19,7 +19,7 @@ export function enrichOpenApiWithRbac<T extends OpenApiDocument>(spec: T): T {
       if (hasTag(operation, "LLM Proxy")) {
         operation.description = appendDescriptionSection(
           operation.description,
-          createLlmProxyAuthenticationSection(),
+          createLlmProxyAuthenticationSection(operation.operationId),
         );
       }
 
@@ -229,7 +229,32 @@ function createAuthenticationSection(operationId: string): string {
   ].join("\n");
 }
 
-function createLlmProxyAuthenticationSection(): string {
+const PROVIDER_FILE_ROUTES = new Set<string>([
+  RouteId.AzureCreateFile,
+  RouteId.AzureCreateFileWithAgent,
+  RouteId.AzureRetrieveFile,
+  RouteId.AzureRetrieveFileWithAgent,
+  RouteId.AzureListFiles,
+  RouteId.AzureListFilesWithAgent,
+  RouteId.AzureFileContent,
+  RouteId.AzureFileContentWithAgent,
+  RouteId.AzureDeleteFile,
+  RouteId.AzureDeleteFileWithAgent,
+]);
+
+function createLlmProxyAuthenticationSection(operationId?: string): string {
+  if (operationId?.startsWith("modelRouter"))
+    return [
+      "Authentication:",
+      "",
+      "Requires a mapped standard Virtual API Key or LLM OAuth access token, sent as a Bearer token. Provider API keys, passthrough keys, and external identity-provider JWTs are not accepted. See [Model Router](/docs/llm-proxy/model-router).",
+    ].join("\n");
+  if (operationId && PROVIDER_FILE_ROUTES.has(operationId))
+    return [
+      "Authentication:",
+      "",
+      "Requires an authenticated platform principal and one permitted configured Azure account. A provider key alone is insufficient. File handles are scoped to the principal, organization, and provider account. See [Azure Provider Files](/docs/llm-proxy/providers/azure#use-provider-files).",
+    ].join("\n");
   return [
     "Authentication:",
     "",
@@ -271,6 +296,24 @@ const HTTP_METHODS = new Set<HttpMethod>([
 ]);
 
 const DYNAMIC_ROUTE_PERMISSION_NOTES = {
+  [RouteId.GetLimits]:
+    "Requires `llmLimit:read` for organization-wide access. A session-authenticated team admin receives only limits for teams they directly administer, with optional entity filters.",
+  [RouteId.GetLimit]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin for a limit on their own team.",
+  [RouteId.CreateLimit]:
+    "Requires `llmLimit:create`, or a session-authenticated team admin creating a limit on their own team.",
+  [RouteId.UpdateLimit]:
+    "Requires `llmLimit:update`, or a session-authenticated team admin updating a limit on their own team.",
+  [RouteId.ResetLimitUsage]:
+    "Requires `llmLimit:update`, or a session-authenticated team admin resetting a limit on their own team.",
+  [RouteId.DeleteLimit]:
+    "Requires `llmLimit:delete`, or a session-authenticated team admin deleting a limit on their own team.",
+  [RouteId.BulkDeleteLimits]:
+    "Requires `llmLimit:delete`, or a session-authenticated team admin deleting only limits for teams they administer. Unauthorized targets are reported as not found.",
+  [RouteId.GetLimitLabelKeys]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin. Label suggestions include only visible limits.",
+  [RouteId.GetLimitLabelValues]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin. Label suggestions include only visible limits.",
   [RouteId.GetOrganizationMemberOptions]:
     "All authenticated callers may search visible member identities. member:read returns the organization roster; other callers receive only teammates in the active organization.",
   [RouteId.GetAgentCatalog]:

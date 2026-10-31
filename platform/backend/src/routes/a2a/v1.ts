@@ -13,6 +13,7 @@ import {
   validateMCPGatewayToken,
 } from "@/routes/mcp-gateway/utils";
 import { ApiError, UuidIdSchema } from "@/types";
+import { clientErrorMessage } from "@/utils/db";
 
 /**
  * A2A (Agent-to-Agent) Protocol routes
@@ -349,6 +350,14 @@ const a2aRoutes: FastifyPluginAsyncZod = async (fastify) => {
               organizationId,
               userId,
               sessionId,
+              oauthExecution:
+                tokenAuth.oauthClientId && !tokenAuth.userId
+                  ? {
+                      tokenId: tokenAuth.tokenId,
+                      clientId: tokenAuth.oauthClientId,
+                      serviceAccountId: tokenAuth.serviceAccountId,
+                    }
+                  : undefined,
               parentDelegationChain: undefined, // This is the root call, chain starts with agentId
             });
           },
@@ -371,7 +380,7 @@ const a2aRoutes: FastifyPluginAsyncZod = async (fastify) => {
           id,
           error: {
             code: -32603,
-            message: error instanceof Error ? error.message : "Internal error",
+            message: clientErrorMessage(error, "Internal error"),
             data: chatError,
           },
         });

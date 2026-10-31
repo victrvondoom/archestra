@@ -12,6 +12,7 @@ import {
   returnRuntimeValue,
   startRuntimeChild,
 } from "@/openappa/service";
+import { isUnenforcedSession } from "@/openappa/unenforced";
 import {
   getGuardrailsDeployment,
   isGuardrailsV2Active,
@@ -102,9 +103,15 @@ export async function guardRuntimeCrossing(
 /**
  * A runtime bound to a parent answers only to that parent's proof. Returns the
  * refusal for a caller without one, or undefined when the runtime has no
- * parent. A runtime whose session cannot be resolved is refused, not assumed
- * to be unbound. Without a proof the gateway cannot tell the parent from a
- * stranger, so the refusal names the missing proof, not a different session.
+ * parent or OpenAPPA no longer governs its session. A runtime whose session
+ * cannot be resolved is refused, not assumed to be unbound. Without a proof
+ * the gateway cannot tell the parent from a stranger, so the refusal names the
+ * missing proof, not a different session.
+ *
+ * A session that was superyelled, whose parent was, or that started while
+ * enforcement was off gets no proof from the proxy, so its own calls and its
+ * parent's carry none. The gateway asks the same question the proxy does, but
+ * only reads: the proxy records the session on its own next request.
  */
 export async function refuseUnrecognizedCaller(params: {
   organizationId: string;
@@ -124,6 +131,7 @@ export async function refuseUnrecognizedCaller(params: {
     });
   }
   if (!resolved.session.parent_id) return undefined;
+  if (await isUnenforcedSession(resolved.session)) return undefined;
   return reportCrossingRefusal({
     reason: "proof_missing",
     message: UNPROVEN_CALLER_ON_BOUND_RUNTIME,
@@ -246,35 +254,30 @@ export async function classifyRuntimeCaller(params: {
 }): Promise<
   | { kind: "producer"; child: OpenAppaSession }
   | { kind: "parent"; child: OpenAppaSession }
-  | { kind: "refused"; reason: string }
+  | RuntimeCallerRefusal
 > {
-  const report = {
-    workspaceId: params.workspaceId,
-    parentSessionId: params.crossing.source.session_id,
-  };
+  const refuse = (
+    cause: RuntimeCallerRefusal["cause"],
+    message: string,
+  ): RuntimeCallerRefusal => ({
+    kind: "refused",
+    cause,
+    reason: reportCrossingRefusal({
+      reason: cause,
+      message,
+      workspaceId: params.workspaceId,
+      parentSessionId: params.crossing.source.session_id,
+    }),
+  });
   if (params.crossing.source.organization_id !== params.organizationId) {
-    return {
-      kind: "refused",
-      reason: reportCrossingRefusal({
-        reason: "other_organization",
-        message: OTHER_ORGANIZATION,
-        ...report,
-      }),
-    };
+    return refuse("other_organization", OTHER_ORGANIZATION);
   }
   const resolved = await resolveRuntimeSessionForWorkspace({
     organizationId: params.organizationId,
     workspaceId: params.workspaceId,
   });
   if (!resolved) {
-    return {
-      kind: "refused",
-      reason: reportCrossingRefusal({
-        reason: "unverified_session",
-        message: UNVERIFIED_RUNTIME_SESSION,
-        ...report,
-      }),
-    };
+    return refuse("unverified_session", UNVERIFIED_RUNTIME_SESSION);
   }
   if (
     params.crossing.source.session_id === resolved.session.session_id &&
@@ -283,27 +286,26 @@ export async function classifyRuntimeCaller(params: {
     return { kind: "producer", child: resolved.session };
   }
   if (!resolved.session.parent_id) {
-    return {
-      kind: "refused",
-      reason: reportCrossingRefusal({
-        reason: "unparented",
-        message: `This run was started outside any Guardrails session, so this conversation cannot read its output or send it input; nothing from the run was returned. A person can read the output on the run page: ${config.frontendBaseUrl}/chat/runs/${params.workspaceId}. To get a run's output here, start a new run from this conversation.`,
-        ...report,
-      }),
-    };
+    return refuse(
+      "unparented",
+      `This run was started outside any Guardrails session, so this conversation cannot read its output or send it input; nothing from the run was returned. A person can read the output on the run page: ${config.frontendBaseUrl}/chat/runs/${params.workspaceId}. To get a run's output here, start a new run from this conversation.`,
+    );
   }
   if (resolved.session.parent_id !== params.crossing.source.session_id) {
-    return {
-      kind: "refused",
-      reason: reportCrossingRefusal({
-        reason: "different_session",
-        message: BOUND_TO_ANOTHER_SESSION,
-        ...report,
-      }),
-    };
+    return refuse("different_session", BOUND_TO_ANOTHER_SESSION);
   }
   return { kind: "parent", child: resolved.session };
 }
+
+type RuntimeCallerRefusal = {
+  kind: "refused";
+  cause:
+    | "other_organization"
+    | "unverified_session"
+    | "unparented"
+    | "different_session";
+  reason: string;
+};
 
 export async function crossRuntimeOutput(params: {
   crossing: RuntimeCrossing;
@@ -314,7 +316,7 @@ export async function crossRuntimeOutput(params: {
   | { kind: "producer" }
   | { kind: "admitted"; value: string }
   | { kind: "withheld"; reason: string }
-  | { kind: "refused"; reason: string }
+  | RuntimeCallerRefusal
 > {
   const relation = await classifyRuntimeCaller(params);
   if (relation.kind === "refused") return relation;
@@ -421,4 +423,4 @@ const BOUND_TO_ANOTHER_SESSION =
   "This runtime is bound to a different session. The request was refused.";
 
 const UNPROVEN_CALLER_ON_BOUND_RUNTIME =
-  "This runtime is bound to a Guardrails session, and this call carried no proof of its source. The request was refused. Retry from the conversation that started the run, with its model requests going through the LLM Proxy.";
+  "This runtime is bound to a Guardrails session, and this call carried no proof of its source. The request was refused. Only a tool call from the run's own model, or from the conversation that started the run, carries that proof when its model requests go through the LLM Proxy. A script cannot make this call.";

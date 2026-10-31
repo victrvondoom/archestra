@@ -1,6 +1,17 @@
 "use client";
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  E2eTestId,
+  SUBSCRIPTION_CREDENTIAL_KINDS,
+  SUBSCRIPTION_CREDENTIALS,
+} from "@archestra/shared";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockUseLlmProviderApiKeys = vi.fn();
@@ -64,6 +75,13 @@ vi.mock("@/lib/llm-provider-api-keys.query", () => ({
   }),
 }));
 
+vi.mock("./_parts/copilot-organization-connect-dialog", () => ({
+  CopilotOrganizationConnectDialog: ({
+    manage,
+  }: {
+    manage?: { id: string } | null;
+  }) => <div data-testid="copilot-dialog">{manage?.id ?? "connect"}</div>,
+}));
 vi.mock("@/lib/oauth-clients.query", () => ({
   useOauthClients: (...args: unknown[]) => mockUseOauthClients(...args),
 }));
@@ -92,6 +110,8 @@ vi.mock("@/components/create-llm-provider-api-key-dialog", () => ({
     description?: string;
     defaultValues?: unknown;
     allowedProviders?: unknown;
+    reconnectKeyId?: string;
+    onOpenChange: (open: boolean) => void;
   }) =>
     props.open ? (
       <div data-testid="create-dialog">
@@ -99,6 +119,10 @@ vi.mock("@/components/create-llm-provider-api-key-dialog", () => ({
         {props.description}
         {JSON.stringify(props.defaultValues)}
         {JSON.stringify(props.allowedProviders)}
+        <span>{props.reconnectKeyId}</span>
+        <button type="button" onClick={() => props.onOpenChange(false)}>
+          Cancel
+        </button>
       </div>
     ) : null,
 }));
@@ -301,7 +325,7 @@ vi.mock("@/components/ui/select", () => ({
 vi.mock("@/lib/entity-labels.query");
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
 import { useFeature } from "@/lib/config/config.query";
 import { useOrganization } from "@/lib/organization.query";
 import ApiKeysPage from "./page";
@@ -309,6 +333,9 @@ import ApiKeysPage from "./page";
 describe("ApiKeysPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "viewer" } },
+    } as ReturnType<typeof useSession>);
     useDataTableQueryParamsMock.mockReturnValue({
       searchParams: new URLSearchParams(),
       updateQueryParams: updateQueryParamsMock,
@@ -363,6 +390,142 @@ describe("ApiKeysPage", () => {
     );
   });
 
+  it.each(
+    SUBSCRIPTION_CREDENTIAL_KINDS,
+  )("opens the %s recovery flow for the current user only", async (kind) => {
+    const { provider, displayName } = SUBSCRIPTION_CREDENTIALS[kind];
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "viewer" } },
+    } as ReturnType<typeof useSession>);
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [
+        {
+          id: "other-key",
+          provider,
+          scope: "personal",
+          userId: "other",
+          subscriptionKind: kind,
+        },
+        {
+          id: "own-key",
+          provider,
+          scope: "personal",
+          userId: "viewer",
+          subscriptionKind: kind,
+        },
+      ],
+      isPending: false,
+    });
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(`reconnect=${kind}&search=kept`),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    const { rerender } = render(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      `Reconnect ${displayName}`,
+    );
+    expect(screen.getByTestId("create-dialog")).toHaveTextContent("own-key");
+    expect(screen.getByTestId("create-dialog")).not.toHaveTextContent(
+      "other-key",
+    );
+    fireEvent.click(
+      within(screen.getByTestId("create-dialog")).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    expect(vi.mocked(useRouter)().replace).toHaveBeenCalledWith(
+      "/llm/model-providers?search=kept",
+      { scroll: false },
+    );
+    rerender(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+  });
+
+  it("ignores unknown recovery kinds and opens self-service sign-in without key-read permission", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=unknown"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    const { rerender } = render(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=chatgpt"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("reconnect=chatgpt"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    rerender(<ApiKeysPage />);
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      "Sign in with ChatGPT",
+    );
+  });
+
+  it("opens an organization-wide key for the provider a link names", async () => {
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams("create=jev&access=organization"),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+
+    render(<ApiKeysPage />);
+
+    expect(await screen.findByTestId("create-dialog")).toHaveTextContent(
+      JSON.stringify({
+        provider: "jev",
+        initialGrants: [
+          {
+            subject: { type: "organization", id: "*" },
+            actions: ["read", "use"],
+            name: "Everyone in the organization",
+          },
+        ],
+      }),
+    );
+  });
+
+  it.each([
+    "create=xai",
+    "reconnect=x-premium",
+  ])("does not open a hidden provider from %s", (query) => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { xai: { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+    useDataTableQueryParamsMock.mockReturnValue({
+      searchParams: new URLSearchParams(query),
+      updateQueryParams: updateQueryParamsMock,
+    });
+    render(<ApiKeysPage />);
+    expect(screen.queryByTestId("create-dialog")).not.toBeInTheDocument();
+  });
+
   it("still offers subscriptions to a member who cannot read keys", () => {
     // Their key query never runs, so the cards must state the offer rather than
     // sit in a skeleton waiting on a query that will never resolve.
@@ -374,7 +537,7 @@ describe("ApiKeysPage", () => {
 
     render(<ApiKeysPage />);
 
-    expect(screen.getAllByText("Connect")).toHaveLength(4);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
   });
 
   it("clears an active label filter with the other table filters", () => {
@@ -425,8 +588,8 @@ describe("ApiKeysPage", () => {
     expect(cards).toHaveTextContent("GitHub Copilot");
     expect(cards).toHaveTextContent("Microsoft 365 Copilot");
     expect(cards).toHaveTextContent("SuperGrok");
-    expect(screen.getAllByText("Connect")).toHaveLength(4);
-    expect(screen.getAllByText("Not connected")).toHaveLength(4);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
+    expect(personalCards().getAllByText("Not connected")).toHaveLength(4);
   });
 
   it("hides a subscription whose provider the organization turned off", () => {
@@ -443,7 +606,21 @@ describe("ApiKeysPage", () => {
     expect(
       screen.getByTestId("subscription-provider-cards"),
     ).not.toHaveTextContent("SuperGrok");
-    expect(screen.getAllByText("Connect")).toHaveLength(3);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(3);
+  });
+
+  it("offers no enterprise plan when the organization turned GitHub Copilot off", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: { modelProviderOverrides: { "github-copilot": { hidden: true } } },
+    } as unknown as ReturnType<typeof useOrganization>);
+
+    render(<ApiKeysPage />);
+
+    expect(screen.queryByText("Enterprise plans")).toBeNull();
   });
 
   it("keeps a turned-off provider's connected subscription key in the table", () => {
@@ -529,10 +706,65 @@ describe("ApiKeysPage", () => {
       screen.queryByText("Existing ChatGPT credential"),
     ).not.toBeInTheDocument();
     expect(screen.getByText("Connected")).toBeInTheDocument();
-    expect(screen.getAllByText("Connect")).toHaveLength(3);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(3);
     expect(
       screen.getByRole("button", { name: "Disconnect" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows an organization subscription as a card managed in the connect wizard, with the shared Disconnect dialog", async () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+      isPending: false,
+    } as unknown as ReturnType<typeof useHasPermissions>);
+    const appKey = {
+      id: "copilot-app-key",
+      name: "GitHub Copilot (my-org)",
+      provider: "github-copilot",
+      scope: "org",
+      userId: null,
+      secretId: "secret-1",
+      isGithubAppKey: true,
+      githubOrganization: "my-org",
+      requiresReauthentication: false,
+    };
+    mockUseLlmProviderApiKeys.mockReturnValue({
+      data: [appKey],
+      isPending: false,
+    });
+
+    render(<ApiKeysPage />);
+
+    expect(
+      screen.getByText(
+        "Your organization's Copilot plan is linked through a GitHub App. Usage is billed to my-org.",
+      ),
+    ).toBeInTheDocument();
+    // Not a table row, and no extra header action.
+    expect(
+      screen.queryByText("GitHub Copilot (my-org)"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Connect another/ }),
+    ).not.toBeInTheDocument();
+
+    // Manage opens the wizard that connected the plan, on this key, not the
+    // generic key editor.
+    fireEvent.click(screen.getByRole("button", { name: "Manage" }));
+    expect(await screen.findByTestId("copilot-dialog")).toHaveTextContent(
+      "copilot-app-key",
+    );
+    expect(mockLlmProviderApiKeyForm).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingKey: expect.objectContaining({ id: "copilot-app-key" }),
+      }),
+    );
+
+    const disconnects = screen.getAllByRole("button", { name: "Disconnect" });
+    fireEvent.click(disconnects[disconnects.length - 1]);
+    expect(await screen.findByTestId("delete-dialog")).toHaveTextContent(
+      "The GitHub App stays installed on my-org. Uninstall it on GitHub if you no longer need it.",
+    );
   });
 
   it("does not classify an ordinary key from the mutable X Premium display name", () => {
@@ -557,7 +789,7 @@ describe("ApiKeysPage", () => {
     // The subscription card remains unconnected and the same-named ordinary key
     // remains its own credential row.
     expect(screen.getAllByText("SuperGrok")).toHaveLength(2);
-    expect(screen.getAllByText("Connect")).toHaveLength(4);
+    expect(personalCards().getAllByText("Connect")).toHaveLength(4);
   });
 
   it("reopens a SuperGrok key from the edit URL param in subscription mode", async () => {
@@ -778,7 +1010,7 @@ describe("ApiKeysPage", () => {
     expect(mockDeleteApiKey).toHaveBeenCalledTimes(1);
     expect(mockDeleteApiKey).toHaveBeenCalledWith({
       id: "provider-key-1",
-      subscription: false,
+      kind: "key",
     });
   });
 
@@ -817,3 +1049,8 @@ describe("ApiKeysPage", () => {
     );
   });
 });
+
+/** The personal subscription cards, apart from the organization section. */
+function personalCards() {
+  return within(screen.getByTestId(E2eTestId.SubscriptionProviderCards));
+}

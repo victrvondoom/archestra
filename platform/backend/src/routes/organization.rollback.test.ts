@@ -303,7 +303,6 @@ describe("organization routes", () => {
           backend: "kubernetes",
           steerMode: "pipe",
           privileged: false,
-          resources: null,
           environment: null,
           credentials: null,
           ttlHours: null,
@@ -377,7 +376,6 @@ describe("organization routes", () => {
           backend: "kubernetes",
           steerMode: "pipe",
           privileged: false,
-          resources: null,
           environment: null,
           credentials: null,
           ttlHours: null,
@@ -396,6 +394,145 @@ describe("organization routes", () => {
       });
 
       expect(response.statusCode).toBe(200);
+    });
+  });
+
+  describe("PATCH /api/organization/agent-settings - default trio", () => {
+    async function setupKey(
+      makeLlmProviderApiKey: (
+        organizationId: string,
+        secretId: null,
+        overrides: { provider: "anthropic" },
+      ) => Promise<{ id: string }>,
+    ) {
+      const key = await makeLlmProviderApiKey(organizationId, null, {
+        provider: "anthropic",
+      });
+      const create = (modelId: string, supportsToolCalling = true) =>
+        ModelModel.create({
+          externalId: `anthropic/${modelId}`,
+          provider: "anthropic",
+          modelId,
+          inputModalities: ["text"],
+          outputModalities: ["text"],
+          supportsToolCalling,
+          lastSyncedAt: new Date(),
+        });
+      const [normal, fast, noTools] = await Promise.all([
+        create("trio-test-normal"),
+        create("trio-test-fast"),
+        create("trio-test-no-tools", false),
+      ]);
+      await LlmProviderApiKeyModelLinkModel.linkModelsToApiKey(key.id, [
+        normal.id,
+        fast.id,
+        noTools.id,
+      ]);
+      return { key, normal, fast, noTools };
+    }
+
+    test("saves fast and smart on the default key and records the audit change", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal, fast } = await setupKey(makeLlmProviderApiKey);
+      const trio = {
+        defaultLlmApiKeyId: key.id,
+        defaultModelId: normal.id,
+        defaultFastModelId: fast.id,
+        defaultSmartModelId: normal.id,
+      };
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: trio,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject(trio);
+      await vi.waitFor(async () => {
+        const [audit] = await db
+          .select()
+          .from(schema.auditLogsTable)
+          .where(eq(schema.auditLogsTable.action, "organization.updated"));
+        expect(audit?.before).toMatchObject({ defaultFastModelId: null });
+        expect(audit?.after).toMatchObject({
+          defaultFastModelId: fast.id,
+          defaultSmartModelId: normal.id,
+        });
+      });
+    });
+
+    test("accepts tiers on other providers than the default key's", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal } = await setupKey(makeLlmProviderApiKey);
+      const otherProvider = await ModelModel.create({
+        externalId: "openai/trio-test-fast",
+        provider: "openai",
+        modelId: "trio-test-fast",
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        lastSyncedAt: new Date(),
+      });
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: {
+          defaultLlmApiKeyId: key.id,
+          defaultModelId: normal.id,
+          defaultFastModelId: otherProvider.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        defaultFastModelId: otherProvider.id,
+      });
+    });
+
+    test("rejects a tier that cannot call tools", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { key, normal, noTools } = await setupKey(makeLlmProviderApiKey);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: {
+          defaultLlmApiKeyId: key.id,
+          defaultModelId: normal.id,
+          defaultSmartModelId: noTools.id,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    test("accepts tiers without a default key", async ({
+      makeLlmProviderApiKey,
+    }) => {
+      const { fast } = await setupKey(makeLlmProviderApiKey);
+
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultFastModelId: fast.id },
+      });
+
+      expect(response.statusCode).toBe(200);
+    });
+
+    test("rejects a tier that does not exist", async () => {
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/organization/agent-settings",
+        payload: { defaultSmartModelId: crypto.randomUUID() },
+      });
+
+      expect(response.statusCode).toBe(400);
     });
   });
 

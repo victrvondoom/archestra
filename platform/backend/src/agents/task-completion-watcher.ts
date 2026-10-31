@@ -11,6 +11,7 @@ export async function watchTaskCompletion(params: {
   taskId: string;
   target: AgentRunCompletionTarget;
   agentName: string;
+  beforeDelivery?: () => Promise<void>;
 }): Promise<void> {
   const deadline = Date.now() + 2 * 60 * 60 * 1000;
   try {
@@ -24,6 +25,7 @@ export async function watchTaskCompletion(params: {
         output: await artifactText(params.taskId),
       });
       if (notification) {
+        await params.beforeDelivery?.();
         const execution = await AgentRunModel.findByTaskId(params.taskId);
         const claimedExecution = execution
           ? await AgentRunModel.claimCompletionNotification(params.taskId)
@@ -154,7 +156,7 @@ async function traceCompletionDelivery(params: {
         await params.callback();
         span.setStatus({ code: SpanStatusCode.OK });
       } catch (error) {
-        setSpanError(span, error);
+        setSpanError({ span, error });
         throw error;
       } finally {
         span.end();

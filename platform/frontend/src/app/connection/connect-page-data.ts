@@ -367,7 +367,8 @@ export function useConnectPageData({
         description: p.description,
         source: p.sourceRepo,
       }));
-  const pluginsFor = (client: ConnectClient) => offeredPlugins(client, windows);
+  const pluginsFor = (client: ConnectClient) =>
+    client.id === "pi" ? [] : offeredPlugins(client, windows);
 
   const keptPlugins = (
     client: ConnectClient,
@@ -384,9 +385,11 @@ export function useConnectPageData({
   const hasClientOrder = !!org?.connectionClientOrder?.length;
   const featuredClients = hasClientOrder
     ? clients.filter((client) => client.id !== "generic")
-    : INSTALLER_CLIENT_IDS.map((id) => clients.find((c) => c.id === id)).filter(
-        (c): c is ConnectClient => !!c,
-      );
+    : INSTALLER_CLIENT_IDS.flatMap((id) =>
+        id === "codex" ? [id, "chatgpt"] : [id],
+      )
+        .map((id) => clients.find((c) => c.id === id))
+        .filter((c): c is ConnectClient => !!c);
 
   const skills = skillPage?.data ?? [];
   const totalSkills = skillPage?.pagination.total ?? 0;
@@ -476,7 +479,10 @@ export function useConnectPageData({
     skills: skillsAvailable,
     proxy: proxyAvailable && client.proxy.kind !== "unsupported",
     // Plugins come with the installer; other agents set themselves up.
-    plugins: !usesGenericInstructions(client) && pluginsFor(client).length > 0,
+    plugins:
+      client.id !== "chatgpt" &&
+      !usesGenericInstructions(client) &&
+      pluginsFor(client).length > 0,
   });
 
   const [origin, setOrigin] = useState("");
@@ -560,6 +566,7 @@ export function useConnectPageData({
       // Keeping none of the plugins is leaving plugins out.
       const exclude = CONNECT_SETUP_PARTS.filter(
         (part) =>
+          (client.id === "pi" && part === "plugins") ||
           !choices[part] ||
           (part === "plugins" && offered.length > 0 && kept.length === 0),
       );

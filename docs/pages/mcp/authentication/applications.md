@@ -3,7 +3,7 @@ title: Gateway Access for Apps
 sidebarTitle: Apps and Services
 description: Let your own app or service call an MCP Gateway with an OAuth client
 order: 2
-lastUpdated: 2026-10-15
+lastUpdated: 2026-10-29
 ---
 
 <!-- Renaming/deleting this file? Add a redirect in docs/redirects.json. -->
@@ -33,6 +33,8 @@ For LLM Proxy access, enable **LLM Proxy** on the same client and select provide
 
 No person signs in, so the app uses the gateway's shared accounts. Give its tools a shared service account in [Choose Its Tools](/docs/mcp/gateway#choose-its-tools).
 
+For [knowledge search](/docs/knowledge#permissions), an app without a service-account binding can search assigned sources published to everyone. A bound app uses the service account’s knowledge permissions. This applies to both MCP and A2A.
+
 1. Create an OAuth client. Under **What can it access?**, select **MCP Gateway** for tools, **A2A** for agent calls, or both. Pick **As itself**. On **Access**, select the gateways and agents it may reach and optionally open **Advanced** to select a service account.
 2. Save the client ID and secret in your secret store. The secret shows only once.
 3. Get a token. This example calls MCP; use `scope=a2a` for agent calls:
@@ -47,7 +49,7 @@ No person signs in, so the app uses the gateway's shared accounts. Give its tool
 
 4. Call the gateway with `Authorization: Bearer <access_token>`. Get a new token when it expires.
 
-Reuse each token until it expires. If the token endpoint returns HTTP `429`, wait for its `Retry-After` delay before requesting another token. See [authentication rate limits](/docs/reference/configuration#ARCHESTRA_AUTH_RATE_LIMIT_DISABLED).
+Reuse each token until it expires. If the token endpoint returns HTTP `429`, wait for its `Retry-After` delay before requesting another token. See [authentication rate limits](/docs/admin/deployment/configuration#ARCHESTRA_AUTH_RATE_LIMIT_DISABLED).
 
 <span id="oauth-authorization-code-on-behalf-of-users"></span>
 

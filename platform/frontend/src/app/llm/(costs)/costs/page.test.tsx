@@ -28,6 +28,13 @@ import OrganizationCostsPage from "./page";
 vi.mock("next/navigation");
 vi.mock("@/lib/hooks/use-app-name");
 vi.mock("@/lib/auth/auth.query");
+vi.mock("@/lib/config/config.query", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/config/config.query")>()),
+  useFeature: () => false,
+}));
+vi.mock("@/lib/integration-overrides", () => ({
+  useModelProviderCatalog: () => ({ label: (provider: string) => provider }),
+}));
 vi.mock("sonner");
 const origin = "http://localhost:9000";
 const server = setupServer();
@@ -60,6 +67,8 @@ const model = (name = "example/model-a", cost = 8.25) => ({
   inputTokens: 1000,
   outputTokens: 200,
   cacheReadTokens: 4000,
+  cacheWriteTokens: 0,
+  totalTokens: 5200,
   cost,
   percentage: 100,
   timeSeries: [],
@@ -71,6 +80,12 @@ function show() {
       <OrganizationCostsPage />
     </QueryClientProvider>,
   );
+}
+async function view(name: string) {
+  fireEvent.keyDown(screen.getByRole("button", { name: /^View / }), {
+    key: "Enter",
+  });
+  fireEvent.click(await screen.findByRole("menuitem", { name }));
 }
 async function group(name: string) {
   fireEvent.keyDown(screen.getByRole("button", { name: /^by / }), {
@@ -211,6 +226,66 @@ beforeEach(() => {
 });
 
 describe("OrganizationCostsPage", () => {
+  it("explores cache reads and writes by model without another summary panel", async () => {
+    models = [
+      model(),
+      {
+        ...model("example/model-b"),
+        cacheReadTokens: 6000,
+        cacheWriteTokens: 500,
+      },
+    ];
+    show();
+    await view("Cache reads by model");
+    const explorer = screen.getByRole("region", { name: "Cost explorer" });
+    expect(await within(explorer).findByText("10,000")).toBeVisible();
+    expect(
+      within(explorer).getByRole("button", { name: "Show Cache reads" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Prompt caching" }),
+    ).not.toBeInTheDocument();
+    await metric("Cache writes");
+    expect(within(explorer).getAllByText("500").length).toBeGreaterThan(0);
+    expect(
+      requests.some((url) => url.pathname === "/api/statistics/costs"),
+    ).toBe(true);
+  });
+  it.each([
+    [3.75, "$3.75"],
+    [-1.25, "-$1.25"],
+    [0, "$0.00"],
+    [0.000125, "$0.000125"],
+  ])("explores net cache savings over time, preserving %s", async (net, formatted) => {
+    savings = {
+      ...savings,
+      totalCacheSavings: net,
+      totalSavings: 999,
+      timeSeries: [
+        {
+          timestamp: "2026-01-01T00:00:00Z",
+          cacheSavings: net,
+          actualCost: 8.25,
+        },
+      ],
+    };
+    show();
+    await metric("Net cache savings");
+    const explorer = screen.getByRole("region", { name: "Cost explorer" });
+    await waitFor(() =>
+      expect(within(explorer).getAllByText(formatted).length).toBeGreaterThan(
+        0,
+      ),
+    );
+    expect(
+      within(explorer).getByRole("button", { name: "by Time" }),
+    ).toBeVisible();
+    expect(
+      within(explorer).getByText(/subscription usage is excluded/),
+    ).toBeVisible();
+    expect(within(explorer).queryByText("$999.00")).not.toBeInTheDocument();
+  });
+
   it("holds placeholders rather than zeros until statistics arrive", async () => {
     pending = true;
     const { container } = show();
@@ -249,8 +324,12 @@ describe("OrganizationCostsPage", () => {
       screen.getByText("Usage at API rates, not a bill"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Active people 1/ }),
-    ).toBeInTheDocument();
+      screen.getByText("Active people").parentElement?.parentElement,
+    ).toHaveTextContent(/^Active people1/);
+    // The totals only summarize; the explorer's controls pick what it shows.
+    expect(
+      screen.queryByRole("button", { name: /API spend/ }),
+    ).not.toBeInTheDocument();
   });
   it("uses the selected custom timeframe for all requested data", async () => {
     const timeframe =
@@ -286,6 +365,8 @@ describe("OrganizationCostsPage", () => {
         inputTokens: 900,
         outputTokens: 100,
         cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 1000,
         billedCost: 0,
         subscriptionCost: 12.5,
         models: [
@@ -294,14 +375,25 @@ describe("OrganizationCostsPage", () => {
             requests: 40,
             inputTokens: 880,
             outputTokens: 100,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 980,
           },
-          { model: "gpt-5", requests: 2, inputTokens: 20, outputTokens: 0 },
+          {
+            model: "gpt-5",
+            requests: 2,
+            inputTokens: 20,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 20,
+          },
         ],
       },
     ];
     show();
     await screen.findAllByText("$8.25");
-    fireEvent.click(screen.getByRole("button", { name: "Who is using it" }));
+    await view("Who is using it");
     await within(await screen.findByRole("table")).findByText("Example User A");
     await split("Model");
     fireEvent.click(
@@ -391,7 +483,7 @@ describe("OrganizationCostsPage", () => {
     ];
     show();
     await screen.findAllByText("$8.25");
-    fireEvent.click(screen.getByRole("button", { name: "Who is using it" }));
+    await view("Who is using it");
     const identity = await within(await screen.findByRole("table")).findByText(
       "Example User C with a long identity",
     );
@@ -559,7 +651,7 @@ describe("OrganizationCostsPage", () => {
     ];
     show();
     await screen.findAllByText("$8.25");
-    fireEvent.click(screen.getByRole("button", { name: "Skills by reach" }));
+    await view("Skills by reach");
     expect(
       await within(await screen.findByRole("table")).findByText(
         "PDF Extraction",

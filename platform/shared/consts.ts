@@ -211,8 +211,6 @@ export const WEBSITE_URL = "https://archestra.ai";
 export const GITHUB_REPO_URL = "https://github.com/archestra-ai/archestra";
 export const GITHUB_REPO_NEW_ISSUE_URL = `${GITHUB_REPO_URL}/issues/new`;
 export const COMMUNITY_SLACK_URL = `${WEBSITE_URL}/join-slack`;
-/** Typeform behind the "Share feedback" pop-up. */
-export const FEEDBACK_TYPEFORM_URL = "https://form.typeform.com/to/qVvzSmEn";
 
 export const MCP_CATALOG_API_BASE_URL =
   process.env.ARCHESTRA_MCP_CATALOG_API_BASE_URL ||
@@ -280,6 +278,13 @@ export const COPILOT_PROVIDER_ENV_KEYS = {
  * guard entry — its connect is reversed from the Disconnect panel instead.
  */
 export const STARTUP_GUARD_INSTALL = {
+  pi: {
+    scriptRelpath: ".archestra/pi/startup.sh",
+    psScriptRelpath: ".archestra/pi/startup.ps1",
+    skipRelpath: ".archestra/pi/startup.skip",
+    markerStart: "# >>> archestra pi guard >>>",
+    markerEnd: "# <<< archestra pi guard <<<",
+  },
   "claude-code": {
     scriptRelpath: ".archestra/claude-startup-guard.sh",
     // Windows (PowerShell) guard; forward slashes — PowerShell accepts them.
@@ -294,6 +299,13 @@ export const STARTUP_GUARD_INSTALL = {
     skipRelpath: ".archestra/codex-startup-guard.skip",
     markerStart: "# >>> archestra codex guard >>>",
     markerEnd: "# <<< archestra codex guard <<<",
+  },
+  "kimi-code": {
+    scriptRelpath: ".archestra/kimi-code-startup-guard.sh",
+    psScriptRelpath: ".archestra/kimi-code-startup-guard.ps1",
+    skipRelpath: ".archestra/kimi-code-startup-guard.skip",
+    markerStart: "# >>> archestra kimi-code guard >>>",
+    markerEnd: "# <<< archestra kimi-code guard <<<",
   },
   "copilot-cli": {
     scriptRelpath: ".archestra/copilot-startup-guard.sh",
@@ -318,29 +330,30 @@ export type StartupGuardClientId = keyof typeof STARTUP_GUARD_INSTALL;
  * Monotonic format version of the installed startup guard. It is NOT the
  * platform release version — it is a plain counter that increments by one
  * whenever the generated guard's behavior or install layout changes in a way
- * that warrants asking users to re-run connect.
+ * that warrants refreshing the installed startup check.
  *
  * The connect setup stamps this number into the guard it installs; the public
  * `/v1/health` endpoint reports the running instance's current value. On every
- * launch the guard flags an update ONLY when the instance reports a STRICTLY
+ * launch the guard refreshes ONLY when the instance reports a STRICTLY
  * GREATER number than the one it was stamped with. Comparing a monotonic
  * counter — rather than release strings — is what keeps a rollback or an older
  * instance silent: a guard from a newer deploy simply sees an equal-or-lower
- * number and says nothing. Bump this by exactly one when, and only when, a
- * guard change should prompt a re-connect.
+ * number and says nothing. Bump this by exactly one when a guard change
+ * should refresh installed generated checks. User settings and permissions
+ * are never replayed by this update.
  *
  * Preview installs already used version 2. Version 3 repairs their PowerShell
  * permission cleanup; reusing version 2 would not prompt those users to reconnect.
  */
-export const STARTUP_GUARD_FORMAT_VERSION = 5;
+export const STARTUP_GUARD_FORMAT_VERSION = 9;
 
 /**
  * The managed instructions a deployment uses until an admin edits them. It
- * names the deployment's own Cloud runtime, so users of Claude Code or Codex
- * don't mistake it for their client vendor's.
+ * names the deployment's own Remote Agents, so users of Claude Code or Codex
+ * don't mistake them for their client vendor's.
  */
 export function defaultRuntimeHandoffInstructions(appName: string): string {
-  return `In your first reply, briefly answer the user, then add: "By the way, say 'move this to ${appName} Cloud runtime' to continue this session in the cloud." Say this only once per session. When asked, use the Agent Runtime Handoff skill and create a runtime agent if needed.`;
+  return `In your first reply, briefly answer the user, then add: "By the way, say 'move this to ${appName} Remote Agents' to continue this session in the cloud." Say this only once per session. When asked, use the Remote Agents Handoff skill and create a remote agent if needed.`;
 }
 
 /**
@@ -452,6 +465,22 @@ export const PROVIDER_BASE_URL_HEADER = "X-Archestra-Provider-Base-Url";
  */
 export const CHAT_API_KEY_ID_HEADER = "X-Archestra-Chat-Api-Key-Id";
 
+/**
+ * Header used to pass the model pool a chat was set to from chat → LLM proxy.
+ * In-process calls are pooled only when they carry it; like
+ * CHAT_API_KEY_ID_HEADER, it is only honored with the in-process proof.
+ */
+export const MODEL_POOL_ID_HEADER = "X-Archestra-Model-Pool-Id";
+
+/**
+ * Header marking a chat or agent call that runs on its agent's own selection,
+ * with no pool or explicit subagent tier. When that agent inherits the
+ * organization default and the call names the default model, the proxy routes
+ * the session across the organization's model trio. Like
+ * MODEL_POOL_ID_HEADER, it is only honored with the in-process proof.
+ */
+export const AUTO_ROUTABLE_HEADER = "X-Archestra-Auto-Routable";
+
 export const DEFAULT_VAULT_TOKEN = "dev-root-token";
 
 export const TimeInMs = {
@@ -502,3 +531,8 @@ export function isEditableTextFile(params: {
  */
 export const AGENT_OPTIONS_MAX_IDS = 200;
 export const AGENT_OPTIONS_MAX_PAGE_SIZE = 1000;
+
+/** Highest spending limit one auto-routing backfill may be given, in USD. */
+export const AUTO_ROUTING_BACKFILL_MAX_COST_USD = 1000;
+/** Scorer calls a backfill has in flight: how many per-call costs it may overshoot its spending limit by. */
+export const AUTO_ROUTING_BACKFILL_SCORER_CALLS = 4;

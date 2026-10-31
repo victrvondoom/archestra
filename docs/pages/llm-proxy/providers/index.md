@@ -2,7 +2,7 @@
 title: Model Providers
 description: Connect provider API keys and personal subscriptions for Chat and the LLM Proxy
 order: 2
-lastUpdated: 2026-10-09
+lastUpdated: 2026-10-30
 ---
 
 <!-- Renaming/deleting this file? Add a redirect in docs/redirects.json. -->
@@ -26,7 +26,7 @@ Paste a key, and Archestra tests it and loads the provider's models.
 
 The new key appears in the **Provider API keys** table as **Configured**, and its models appear under **Models**. To choose who can use it, edit the key and add people or teams under its permissions.
 
-You can also set a key through an environment variable, `ARCHESTRA_CHAT_<PROVIDER>_API_KEY` (for example [`ARCHESTRA_CHAT_OPENAI_API_KEY`](/docs/reference/configuration#ARCHESTRA_CHAT_OPENAI_API_KEY)). It is the fallback when no stored key applies.
+You can also set a key through an environment variable, `ARCHESTRA_CHAT_<PROVIDER>_API_KEY` (for example [`ARCHESTRA_CHAT_OPENAI_API_KEY`](/docs/admin/deployment/configuration#ARCHESTRA_CHAT_OPENAI_API_KEY)). It is the fallback when no stored key applies.
 
 <span id="turning-providers-off"></span>
 
@@ -40,8 +40,7 @@ Already pay for ChatGPT, GitHub Copilot, Microsoft 365 Copilot, or SuperGrok? Us
 
 These credentials belong to one person and cannot be shared. An agent that uses one always runs on the chatting user's own subscription. A user who has not connected sees a sign-in prompt in chat. If the vendor rejects the sign-in later, click **Connect** again; the credential keeps its model and agent selections.
 
-- **ChatGPT**: first turn on **Enable device code authorization for Codex** in ChatGPT under **Settings → Security**. It is off by default, and ChatGPT blocks the sign-in until you turn it on.
-- **SuperGrok**: unavailable when [Bring Your Own Secrets](/docs/admin/security) uses a read-only external Vault, because Archestra cannot store the rotating sign-in token there. Use an xAI API key instead.
+- **ChatGPT**: first turn on **Enable device code authorization for Codex** in ChatGPT under **Settings → Security**. It is off by default, and ChatGPT blocks the sign-in until you turn it on. If the backend's outbound traffic is restricted, also allow [its hosts](#chatgpt-subscription-egress).
 - **GitHub Copilot** and **Microsoft 365 Copilot** have their own pages: [GitHub Copilot](/docs/llm-proxy/providers/github-copilot), [Microsoft 365 Copilot](/docs/llm-proxy/providers/microsoft-365-copilot).
 
 ChatGPT and SuperGrok use bills $0 in Costs. GitHub Copilot and Microsoft 365 Copilot use counts as metered. See [Subscription vs Metered Cost](/docs/llm-proxy/costs-and-limits#subscription-vs-metered-cost).
@@ -82,11 +81,12 @@ Each provider has its own proxy URL, `https://<archestra-host>/v1/<path>`, with 
 | Cerebras | `cerebras` | Chat Completions | Yes | |
 | Cohere | `cohere` | Chat | Yes | |
 | DeepSeek | `deepseek` | Chat Completions | Yes | |
-| [GitHub Copilot](/docs/llm-proxy/providers/github-copilot) | `github-copilot` | Chat Completions, Responses | Yes | Personal sign-in only |
+| [GitHub Copilot](/docs/llm-proxy/providers/github-copilot) | `github-copilot` | Chat Completions, Responses | Yes | Personal sign-in or organization GitHub App |
 | [Google Gemini](/docs/llm-proxy/providers/gemini) | `gemini` | Generate Content, Embeddings | Yes | Google AI Studio or Vertex AI |
 | Groq | `groq` | Chat Completions | Yes | |
 | Jev | `jev` | Decisions | No | Scores content, such as a tool call. It does not chat. See [Jev](#jev). |
-| Kimi (Moonshot AI) | `kimi` | Chat Completions | No | China endpoint: set [`ARCHESTRA_KIMI_BASE_URL`](/docs/reference/configuration#ARCHESTRA_KIMI_BASE_URL) to `https://api.moonshot.cn/v1` |
+| Kimi (Moonshot AI) | `kimi` | Chat Completions | Yes, Chat Completions only | Kimi API Platform keys. China endpoint: set [`ARCHESTRA_KIMI_BASE_URL`](/docs/admin/deployment/configuration#ARCHESTRA_KIMI_BASE_URL) to `https://api.moonshot.cn/v1` |
+| Kimi Code | `kimi-code` | Chat Completions | Yes, Chat Completions only | Kimi Code membership keys (`sk-kimi-...`), which use the plan's quota. China endpoint: set the key's Base URL to `https://api.kimi.com/coding/v1` |
 | [Microsoft 365 Copilot](/docs/llm-proxy/providers/microsoft-365-copilot) | `microsoft-365-copilot` | Chat Completions | No | Personal sign-in only, no tools |
 | MiniMax | `minimax` | Chat Completions | Yes | Text only |
 | Mistral AI | `mistral` | Chat Completions, Embeddings | Yes | |
@@ -95,10 +95,10 @@ Each provider has its own proxy URL, `https://<archestra-host>/v1/<path>`, with 
 | [OpenAI-compatible servers](/docs/llm-proxy/providers/openai-compatible) | `vllm` | Chat Completions, Embeddings | Yes | vLLM, llama.cpp, LM Studio, SGLang, and others |
 | OpenRouter | `openrouter` | Chat Completions, Embeddings | Yes | See [OpenRouter Free Models](#openrouter-free-models) |
 | Perplexity | `perplexity` | Chat Completions, Responses | Yes | `sonar` models take no tools; vendor-prefixed models such as `anthropic/claude-opus-5` do |
-| xAI (Grok) | `xai` | Chat Completions | Yes | SuperGrok subscription through **Connect** |
+| xAI (Grok) | `xai` | Chat Completions, Responses | Yes | SuperGrok subscription through **Connect** |
 | Zhipu AI | `zhipuai` | Chat Completions, Embeddings | Yes | |
 
-Each provider's default endpoint can be changed with its `ARCHESTRA_<PROVIDER>_BASE_URL` variable, listed under [LLM Provider Configuration](/docs/reference/configuration#llm-providers).
+Each provider's default endpoint can be changed with its `ARCHESTRA_<PROVIDER>_BASE_URL` variable, listed under [LLM Provider Configuration](/docs/admin/deployment/configuration#llm-providers).
 
 ### OpenRouter Free Models
 
@@ -108,7 +108,20 @@ OpenRouter's `:free` model variants cost nothing, though they still need an Open
 
 [Jev](https://typesafe.ai) is TypeSafe's decision model. It scores content, such as a tool call, and does not chat. Send requests to `https://<archestra-host>/v1/jev/decisions` with `Authorization: Bearer <your-api-key>`.
 
-To use Jev through OpenRouter, set the key's base URL to `https://openrouter.ai/api/alpha/decisions`. To change the default endpoint, set [`ARCHESTRA_JEV_BASE_URL`](/docs/reference/configuration#ARCHESTRA_JEV_BASE_URL).
+To use Jev through OpenRouter, set the key's base URL to `https://openrouter.ai/api/alpha/decisions`. To change the default endpoint, set [`ARCHESTRA_JEV_BASE_URL`](/docs/admin/deployment/configuration#ARCHESTRA_JEV_BASE_URL).
+
+### ChatGPT Subscription Egress
+
+If you restrict the backend's outbound traffic, allow HTTPS (port 443) to these hosts. Without them, ChatGPT sign-in and chats fail. Allowing `api.openai.com` does not cover them.
+
+| Host | Used for | Setting |
+| --- | --- | --- |
+| `auth.openai.com` | Sign-in and token refresh | [`ARCHESTRA_OPENAI_CODEX_ISSUER`](/docs/admin/deployment/configuration#ARCHESTRA_OPENAI_CODEX_ISSUER) |
+| `chatgpt.com` | Chat requests and model lists, at `/backend-api/codex` | [`ARCHESTRA_OPENAI_CODEX_API_BASE_URL`](/docs/admin/deployment/configuration#ARCHESTRA_OPENAI_CODEX_API_BASE_URL) |
+
+- Allow them by hostname, not IP address. Both are served from a CDN, so their addresses are shared and can change.
+- If you change either setting, allow the host and port it points to instead.
+- People who sign in also need browser access to the sign-in host to enter the code.
 
 <span id="model-context-and-output-limits"></span>
 
@@ -122,5 +135,9 @@ Archestra fills in each model's prices, context window, and input types for you.
 | **Context window** | When chat compacts a long conversation. |
 | **Max output tokens** | How long one answer can be. Without it, a turn asks for 8,192 tokens, which can cut a long answer short. |
 | **Modalities** | Which files chat sends to the model, and which models you can pick for [embedding](/docs/knowledge/settings#embedding-model) and [OCR](/docs/knowledge/settings#document-ocr). A file the model cannot read goes to the conversation's **Files** panel instead. |
+
+For an OpenAI connection to a gateway, model refreshes import its published output-token limits. Limits stay with each connection, so gateways can use the same model name with different limits. These connection limits are applied to requests but are not shown on the **Models** page, which shows the shared model values and manual overrides.
+
+A manual **Max output tokens** value can lower a connection's budget but cannot exceed its published limit. If no limit is available, set **Max output tokens** yourself.
 
 To change one, go to **Models**, edit the model, and open its **Pricing**, **Limits**, or **Modalities** tab. Your values stay through model refreshes. Clear a field to use the synced value again.
